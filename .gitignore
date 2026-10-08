@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# Frontend build output
+dist/
+coverage/
+
+# Rust / Tauri build output
+target/
+src-tauri/gen/schemas/
+
+# Local data (strate's SQLite store lives in the app data dir; never in-repo)
+*.db
+*.db-shm
+*.db-wal
+
+# Raw transcripts: fixtures are scrubbed or synthetic only (public repo)
+*.raw.jsonl
+
+# Logs / OS / editor
+*.log
+pnpm-debug.log*
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+.idea/
