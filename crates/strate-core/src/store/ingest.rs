@@ -6,7 +6,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
-use super::Result;
+use super::{Result, group};
 use crate::discovery::{AgentRef, Graph, Link, Unresolved, scalar_text};
 use crate::tail::{Batch, TailEvent};
 
@@ -51,7 +51,8 @@ fn owner_of(path: &Path) -> Owner {
     }
 }
 
-/// Stores a batch's events and its checkpoint.
+/// Stores a batch's events and its checkpoint, then regroups the batch's
+/// session.
 pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
     let owner = owner_of(&batch.path);
     let file = text_of(&batch.path);
@@ -75,6 +76,7 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
             TailEvent::Malformed { .. } | TailEvent::Error { .. } => {}
         }
     }
+    group::sessions(conn, [owner.session_id.as_str()])?;
     if let Some(c) = batch.checkpoint {
         conn.prepare_cached(
             "INSERT INTO offsets (path, byte_offset, volume, file_index) VALUES (?1, ?2, ?3, ?4)
@@ -166,11 +168,15 @@ fn record(
 ) -> Result<()> {
     let text = |key: &str| value.get(key).and_then(Value::as_str);
     let kind = text("type");
+    let custom_title = match kind {
+        Some("custom-title") => text("customTitle"),
+        _ => None,
+    };
     let inserted =
         conn.prepare_cached(
             "INSERT OR IGNORE INTO events (session_id, agent_id, type, subtype, uuid, parent_uuid,
-                 request_id, timestamp, file, byte_offset, raw)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 request_id, timestamp, file, byte_offset, raw, cwd, git_branch, custom_title)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )?
         .execute(params![
             owner.session_id,
@@ -184,9 +190,20 @@ fn record(
             file,
             offset as i64,
             value.to_string(),
+            text("cwd"),
+            text("gitBranch"),
+            custom_title,
         ])? > 0;
     if !inserted {
         return Ok(());
+    }
+    if owner.agent_id.is_none()
+        && let Some(root) = text("session_id")
+    {
+        conn.prepare_cached(
+            "UPDATE sessions SET process_root = coalesce(process_root, ?2) WHERE session_id = ?1",
+        )?
+        .execute(params![owner.session_id, root])?;
     }
 
     let (model, effort) = if kind == Some("assistant") {
@@ -198,9 +215,8 @@ fn record(
         (None, None)
     };
     let name = match kind {
-        Some("custom-title") => text("customTitle"),
         Some("agent-name") => text("agentName"),
-        _ => None,
+        _ => custom_title,
     };
     let update = [text("cwd"), text("gitBranch"), text("version"), model, name];
     if update.iter().any(Option::is_some) || effort.is_some() {

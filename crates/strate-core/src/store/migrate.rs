@@ -2,7 +2,10 @@ use rusqlite::Connection;
 
 /// Append-only: never edit a shipped entry, add the next one. Entry `i`
 /// takes a db from `user_version` `i` to `i + 1`.
-pub(super) const MIGRATIONS: &[&str] = &[include_str!("0001_init.sql")];
+pub(super) const MIGRATIONS: &[&str] = &[
+    include_str!("0001_init.sql"),
+    include_str!("0002_workstreams.sql"),
+];
 
 /// Applies every migration past the db's `user_version`, each in its own
 /// transaction together with its version bump. A db already at the latest
