@@ -9,12 +9,13 @@ use crossbeam_channel::{Receiver, Sender, select, tick};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::reader::{Limits, Stopped, tail_file};
-use super::{Batch, OffsetStore};
+use super::{Batch, Offsets};
 use crate::discovery::{is_transcript, transcript_paths};
 
-pub(super) struct Worker<S> {
+pub(super) struct Worker {
     pub root: PathBuf,
-    pub store: S,
+    /// Per transcript, the checkpoint of the last batch handed to the channel.
+    pub offsets: Offsets,
     pub limits: Limits,
     pub rescan_every: Duration,
     pub bytes_read: Arc<AtomicU64>,
@@ -29,12 +30,10 @@ pub(super) struct Worker<S> {
     pub seen: HashMap<PathBuf, u64>,
 }
 
-impl<S: OffsetStore> Worker<S> {
-    /// Runs until stopped or the consumer hangs up, then hands back the
-    /// store.
-    pub fn run(mut self) -> S {
+impl Worker {
+    /// Runs until stopped or the consumer hangs up.
+    pub fn run(mut self) {
         let _stopped = self.serve();
-        self.store
     }
 
     fn serve(&mut self) -> Result<(), Stopped> {
@@ -93,7 +92,7 @@ impl<S: OffsetStore> Worker<S> {
         let (out, stop) = (&self.out, &self.stop);
         let read_to = tail_file(
             &shared,
-            &mut self.store,
+            &mut self.offsets,
             &self.limits,
             &self.bytes_read,
             &mut |batch| {

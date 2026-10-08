@@ -14,7 +14,7 @@ use serde_json::Value;
 
 pub use config_dir::resolve_config_dir;
 pub(crate) use jsonl::parse_line;
-pub(crate) use scan::{is_transcript, transcript_paths};
+pub(crate) use scan::{is_transcript, scalar_text, transcript_paths};
 
 /// Everything discovered under one config dir.
 #[derive(Debug, Clone, PartialEq, Default)]

@@ -63,6 +63,13 @@ ENV_B="\"isSidechain\":false,\"timestamp\":\"2026-09-20T09:00:00.000Z\",\"userTy
 {
   echo "{\"parentUuid\":null,$ENV_B,\"uuid\":\"u-b001\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Lorem ipsum.\"}}"
   echo "{\"parentUuid\":\"u-b001\",$ENV_B,\"uuid\":\"u-b002\",\"type\":\"assistant\",\"requestId\":\"req_b1\",\"message\":{\"role\":\"assistant\",\"id\":\"msg_b1\",\"model\":\"claude-opus-5-5\",\"content\":[{\"type\":\"text\",\"text\":\"Lorem.\"},$(tool_use toolu_02AAAAAAAAAAAAAAAAAAAAAA Task Explore)],$USAGE}}"
+  # two /rename runs (each writes custom-title + agent-name); the latest name wins
+  echo "{\"type\":\"custom-title\",\"customTitle\":\"demo-repo-6\",\"sessionId\":\"$SB\"}"
+  echo "{\"type\":\"agent-name\",\"agentName\":\"demo-repo-6\",\"sessionId\":\"$SB\"}"
+  echo "{\"type\":\"pr-link\",\"sessionId\":\"$SB\",\"prNumber\":7,\"prUrl\":\"https://github.com/example/demo-repo/pull/7\",\"prRepository\":\"example/demo-repo\",\"timestamp\":\"2026-09-20T09:05:00.000Z\"}"
+  echo "{\"type\":\"custom-title\",\"customTitle\":\"demo-repo-7\",\"sessionId\":\"$SB\"}"
+  echo "{\"type\":\"agent-name\",\"agentName\":\"demo-repo-7\",\"sessionId\":\"$SB\"}"
+  echo "{\"parentUuid\":\"u-b002\",$ENV_B,\"uuid\":\"u-b003\",\"type\":\"assistant\",\"requestId\":\"req_b2\",\"effort\":\"medium\",\"message\":{\"role\":\"assistant\",\"id\":\"msg_b2\",\"model\":\"claude-opus-5-5\",\"content\":[{\"type\":\"text\",\"text\":\"Dolor.\"}],$USAGE}}"
 } > "$F/projects/$LONG/$SB.jsonl"
 DB="$F/projects/$LONG/$SB/subagents"
 sub "$DB" a2000000000000001 /work/.worktrees/demo-repo-7 "$SB" 2.1.263
