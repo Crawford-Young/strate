@@ -6,6 +6,8 @@ Stack and rationale: ADR-0001 (`docs/apps/strate/specs/2026-10-08-adr-0001-stack
 
 `bun run typecheck`, `bun run lint`, `bun run test` (100% coverage), `bun run build`, `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `bun run tauri build --debug --no-bundle`. Run `bun run build` before cargo (`generate_context!` needs `dist/`).
 
+Every `strate-core` wave is also checked against the real `~/.claude` with a probe: a throwaway crate in the session scratchpad with a path dependency on the worktree's `strate-core`. It prints counts only and is never committed. Fixtures encode assumptions, and the probe has confirmed or corrected the design in every wave.
+
 ## Rules
 
 - Package manager and runtime is Bun (1.4.2, pinned in `packageManager`). Never npm, yarn or pnpm. `bunfig.toml` sets `[run] bun = true`, so every script and bin runs on the Bun runtime; no Node needed.

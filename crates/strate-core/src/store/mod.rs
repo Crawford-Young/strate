@@ -9,6 +9,7 @@
 //! batch is re-delivered, and re-ingesting it writes no duplicates (events
 //! are unique on `uuid`, else on file + byte offset).
 
+mod group;
 mod ingest;
 mod migrate;
 
@@ -59,8 +60,14 @@ impl Store {
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", true)?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         migrate::migrate(&mut conn, migrate::MIGRATIONS)?;
-        Ok(Self { conn })
+        let mut store = Self { conn };
+        // A v1 store holds events but no workstream grouping yet.
+        if version == 1 {
+            store.regroup_all()?;
+        }
+        Ok(store)
     }
 
     /// A read-only connection to the db at `path`. Under WAL it queries
@@ -102,7 +109,8 @@ impl Store {
         Ok(Ingest { tx })
     }
 
-    /// Stores one batch and its checkpoint in one transaction.
+    /// Stores one batch and its checkpoint in one transaction, regrouping
+    /// the batch's session there too (see [`Ingest::batch`]).
     pub fn ingest(&mut self, batch: &Batch) -> Result<()> {
         let tx = self.transaction()?;
         tx.batch(batch)?;
@@ -160,6 +168,62 @@ impl Store {
         }
     }
 
+    /// Rebuilds the workstream grouping of every stored session from the
+    /// stored events, in one transaction. Ingest keeps grouping current on
+    /// its own, so this is only for a rebuild; it is idempotent and leaves
+    /// manual merges alone.
+    pub fn regroup_all(&mut self) -> Result<()> {
+        let tx = self.transaction()?;
+        group::all(&tx.tx)?;
+        tx.commit()
+    }
+
+    /// Makes workstream `from` read as `into` (and as whatever `into` is
+    /// merged into) in `workstream_roots` and `event_workstreams`. The merge
+    /// is a pointer on `from`, so it survives regrouping and re-ingest, and
+    /// a merged workstream is kept even while no segment uses it. Fails,
+    /// changing nothing, when `from` is unknown or the merge would form a
+    /// cycle.
+    pub fn merge_workstream(&mut self, from: i64, into: i64) -> Result<()> {
+        let tx = self.transaction()?;
+        let cycle: bool = tx.tx.query_row(
+            "WITH RECURSIVE up (id) AS (
+                 SELECT ?1 UNION SELECT w.merged_into FROM workstreams AS w
+                 JOIN up ON w.id = up.id WHERE w.merged_into IS NOT NULL
+             )
+             SELECT EXISTS (SELECT 1 FROM up WHERE id = ?2)",
+            params![into, from],
+            |r| r.get(0),
+        )?;
+        if cycle {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                Some(format!("workstream {from} into {into} would form a cycle")),
+            ));
+        }
+        let changed = tx.tx.execute(
+            "UPDATE workstreams SET merged_into = ?2 WHERE id = ?1",
+            params![from, into],
+        )?;
+        match changed {
+            0 => Err(rusqlite::Error::QueryReturnedNoRows),
+            _ => tx.commit(),
+        }
+    }
+
+    /// Undoes [`Store::merge_workstream`] on `id`; workstreams merged into
+    /// `id` stay merged into it. Fails when `id` is unknown.
+    pub fn unmerge_workstream(&mut self, id: i64) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE workstreams SET merged_into = NULL WHERE id = ?1",
+            [id],
+        )?;
+        match changed {
+            0 => Err(rusqlite::Error::QueryReturnedNoRows),
+            _ => Ok(()),
+        }
+    }
+
     /// The agent's effective gear: its own row, else its orchestrator's,
     /// else the built-in nudge 80 / hard stop 95.
     pub fn gear(&self, session_id: &str, agent_id: Option<&str>) -> Result<Gear> {
@@ -186,7 +250,12 @@ impl Store {
 }
 
 impl Ingest<'_> {
-    /// Writes a batch's events and checkpoint into this transaction.
+    /// Writes a batch's events and checkpoint into this transaction, then
+    /// regroups the batch's session: its name segments and workstream, its
+    /// subagents' segments, and its process root's continuation edges.
+    /// Grouping is a function of the stored events, so batches in any order
+    /// converge to a cold build. A subagent that only a graph has added gets
+    /// its segment at its session's next batch.
     pub fn batch(&self, batch: &Batch) -> Result<()> {
         ingest::batch(&self.tx, batch)
     }
@@ -223,6 +292,40 @@ mod tests {
         // NORMAL is 1.
         assert_eq!(pragma("synchronous"), "Integer(1)");
         assert_eq!(pragma("foreign_keys"), "Integer(1)");
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn opening_a_v1_store_backfills_and_groups_its_events() {
+        let dir = test_dir("store-v1-upgrade");
+        let db = dir.join("strate.db");
+        let mut v1 = Connection::open(&db).expect("v1 db");
+        migrate::migrate(&mut v1, &migrate::MIGRATIONS[..1]).expect("v1");
+        v1.execute_batch(
+            r#"INSERT INTO sessions (session_id, path) VALUES ('s1', '/p/s1.jsonl');
+               INSERT INTO agents (session_id, kind) VALUES ('s1', 'orchestrator');
+               INSERT INTO events (session_id, type, uuid, timestamp, file, byte_offset, raw)
+               VALUES ('s1', 'user', 'u1', '2026-10-02T10:00:00.000Z', '/p/s1.jsonl', 0,
+                       '{"type":"user","cwd":"/work/x","gitBranch":"main","session_id":"root"}'),
+                      ('s1', 'custom-title', NULL, NULL, '/p/s1.jsonl', 90,
+                       '{"type":"custom-title","customTitle":"demo-1"}');"#,
+        )
+        .expect("v1 rows");
+        drop(v1);
+
+        let store = Store::open(&db).expect("upgrade");
+        let row: (String, String, String) = store
+            .conn
+            .query_row(
+                "SELECT w.name, s.process_root, e.cwd FROM sessions AS s
+                 JOIN workstreams AS w ON w.id = s.workstream_id
+                 JOIN events AS e ON e.uuid = 'u1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .expect("grouped");
+        assert_eq!(row, ("demo-1".into(), "root".into(), "/work/x".into()));
         drop(store);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
