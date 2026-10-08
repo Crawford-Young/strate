@@ -2,6 +2,16 @@ use std::io::{self, BufRead};
 
 use serde_json::Value;
 
+/// Parses one JSONL line. `None` for a blank line; an error for anything
+/// that is not one JSON value (malformed, truncated, non-UTF-8).
+pub(crate) fn parse_line(line: &[u8]) -> Option<serde_json::Result<Value>> {
+    if line.iter().all(u8::is_ascii_whitespace) {
+        None
+    } else {
+        Some(serde_json::from_slice(line))
+    }
+}
+
 /// Streams JSONL records to `on_record`, one parsed value per non-blank
 /// line. Lines that fail to parse (malformed, truncated, non-UTF-8) are
 /// skipped and returned as 1-based line numbers; they never abort the read.
@@ -18,12 +28,10 @@ pub(crate) fn for_each_record(
             return Ok(bad);
         }
         line_no += 1;
-        if line.iter().all(u8::is_ascii_whitespace) {
-            continue;
-        }
-        match serde_json::from_slice(&line) {
-            Ok(value) => on_record(value),
-            Err(_) => bad.push(line_no),
+        match parse_line(&line) {
+            None => {}
+            Some(Ok(value)) => on_record(value),
+            Some(Err(_)) => bad.push(line_no),
         }
     }
 }
@@ -36,6 +44,16 @@ mod tests {
         let mut records = Vec::new();
         let bad = for_each_record(input, |v| records.push(v)).expect("in-memory read");
         (records, bad)
+    }
+
+    #[test]
+    fn parse_line_classifies_blank_valid_and_malformed() {
+        assert!(parse_line(b"  \r\n").is_none());
+        let value = parse_line(b"{\"a\":1}\r\n")
+            .expect("not blank")
+            .expect("valid");
+        assert_eq!(value["a"], 1);
+        assert!(parse_line(b"{\"a\":\n").expect("not blank").is_err());
     }
 
     #[test]

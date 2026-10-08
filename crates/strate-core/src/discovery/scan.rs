@@ -25,6 +25,49 @@ pub(super) fn discover(root: &Path) -> io::Result<Graph> {
     Ok(g)
 }
 
+/// Every transcript (session or subagent `.jsonl`) under `root/projects`,
+/// sorted, found by listing dirs only: no file is opened.
+pub(crate) fn transcript_paths(root: &Path) -> Vec<PathBuf> {
+    let mut ignored = Vec::new();
+    let mut out = Vec::new();
+    for project in sorted_entries(&root.join("projects"), &mut ignored) {
+        for entry in sorted_entries(&project, &mut ignored) {
+            if entry.is_dir() {
+                out.extend(sorted_entries(&entry.join("subagents"), &mut ignored));
+            } else {
+                out.push(entry);
+            }
+        }
+    }
+    out.retain(|p| is_transcript(root, p) && p.is_file());
+    out.sort();
+    out
+}
+
+/// Whether `path` sits where a transcript lives under `root/projects`:
+/// `<project>/<sessionId>.jsonl` or
+/// `<project>/<sessionId>/subagents/agent-<agentId>.jsonl`.
+pub(crate) fn is_transcript(root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root.join("projects")) else {
+        return false;
+    };
+    let parts: Vec<&str> = rel
+        .components()
+        .map(|c| c.as_os_str().to_str().unwrap_or_default())
+        .collect();
+    match parts.as_slice() {
+        [_, file] => file.ends_with(".jsonl"),
+        [_, _, "subagents", file] => agent_id_of(file).is_some(),
+        _ => false,
+    }
+}
+
+/// `agent-<agentId>.jsonl` -> `agentId`.
+fn agent_id_of(file: &str) -> Option<&str> {
+    file.strip_prefix("agent-")
+        .and_then(|rest| rest.strip_suffix(".jsonl"))
+}
+
 /// Entries of `dir`, sorted. A missing dir is simply empty; any other read
 /// failure becomes a warning.
 fn sorted_entries(dir: &Path, warnings: &mut Vec<Warning>) -> Vec<PathBuf> {
@@ -104,10 +147,7 @@ fn scan_session(project: &Path, dir_name: &str, session_id: &str, g: &mut Graph)
     let mut pending = Vec::new();
     for path in sorted_entries(&project.join(session_id).join("subagents"), &mut g.warnings) {
         let file = name_of(&path);
-        let Some(agent_id) = file
-            .strip_prefix("agent-")
-            .and_then(|rest| rest.strip_suffix(".jsonl"))
-        else {
+        let Some(agent_id) = agent_id_of(&file) else {
             continue;
         };
         let owner = AgentRef::Subagent {
@@ -299,6 +339,60 @@ mod tests {
             session_id: "s".to_string(),
             agent_id: agent_id.to_string(),
         }
+    }
+
+    fn fixture_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude-home")
+    }
+
+    #[test]
+    fn transcript_paths_lists_every_session_and_subagent_jsonl() {
+        let root = fixture_root();
+        let got = transcript_paths(&root);
+        let g = discover(&root).expect("fixture root");
+        let mut expected: Vec<PathBuf> = g
+            .sessions
+            .iter()
+            .map(|s| s.path.clone())
+            .chain(g.subagents.iter().map(|s| s.path.clone()))
+            .collect();
+        expected.sort();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn transcript_paths_of_a_root_without_projects_is_empty() {
+        assert!(transcript_paths(&fixture_root().join("teams")).is_empty());
+    }
+
+    #[test]
+    fn is_transcript_accepts_only_the_transcript_layout() {
+        let root = Path::new("/cfg");
+        let yes = [
+            "projects/-work-x/s1.jsonl",
+            "projects/-work-x/s1/subagents/agent-a1.jsonl",
+        ];
+        let no = [
+            ".credentials.json",
+            "sessions/123.json",
+            "projects/s1.jsonl",
+            "projects/-work-x/s1.json",
+            "projects/-work-x/s1/subagents/agent-a1.meta.json",
+            "projects/-work-x/s1/subagents/other.jsonl",
+            "projects/-work-x/s1/tool-results/agent-a1.jsonl",
+            "projects/-work-x/s1/subagents/deeper/agent-a1.jsonl",
+            "teams/session-0/config.json",
+        ];
+        for rel in yes {
+            assert!(is_transcript(root, &root.join(rel)), "{rel}");
+        }
+        for rel in no {
+            assert!(!is_transcript(root, &root.join(rel)), "{rel}");
+        }
+        assert!(!is_transcript(
+            root,
+            Path::new("/elsewhere/projects/p/s.jsonl")
+        ));
     }
 
     #[test]
