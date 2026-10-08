@@ -11,24 +11,24 @@ The design spec and ADR-0001 (stack decision) live in the private planning-docs 
 - Windows 11 with WebView2 (preinstalled on Windows 11)
 - Rust stable, MSVC toolchain (`rust-toolchain.toml` pins the channel and components)
 - Visual Studio Build Tools with the "Desktop development with C++" workload
-- Node 22.22.1+ (see `engines` in `package.json`) and pnpm 11 (`corepack enable`)
+- Bun 1.4.2+ (see `packageManager` in `package.json`); it is both package manager and runtime, no separate Node install needed
 
 ## Commands
 
 ```sh
-pnpm install
-pnpm tauri dev        # run the app (Vite dev server on strict port 1420)
+bun install
+bun run tauri dev       # run the app (Vite dev server on strict port 1420)
 ```
 
 Gates (CI runs the same on `windows-latest`):
 
 ```sh
-pnpm typecheck
-pnpm lint
-pnpm test             # Vitest, 100% coverage thresholds
-pnpm build            # must run before cargo: Tauri embeds dist/
+bun run typecheck
+bun run lint
+bun run test             # Vitest, 100% coverage thresholds
+bun run build            # must run before cargo: Tauri embeds dist/
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-pnpm tauri build --debug --no-bundle   # proves the app compiles
+bun run tauri build --debug --no-bundle   # proves the app compiles
 ```

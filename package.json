@@ -3,9 +3,9 @@
   "private": true,
   "version": "0.0.1",
   "type": "module",
-  "packageManager": "pnpm@11.25.0",
+  "packageManager": "bun@1.4.2",
   "engines": {
-    "node": "^22.22.1 || ^24.0.0 || >=26.0.0"
+    "bun": ">=1.4.2"
   },
   "scripts": {
     "dev": "vite",
@@ -17,6 +17,7 @@
     "test": "vitest run --coverage",
     "prepare": "husky"
   },
+  "trustedDependencies": [],
   "lint-staged": {
     "*.{ts,tsx}": [
       "eslint --fix",
