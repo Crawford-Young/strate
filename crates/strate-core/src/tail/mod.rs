@@ -1,14 +1,17 @@
 //! Incremental tail of every transcript under a config dir.
 //!
 //! [`Tailer::start`] returns at once. A worker thread catches each
-//! transcript up from its stored [`Checkpoint`], then follows appends via
+//! transcript up from its starting [`Checkpoint`], then follows appends via
 //! `notify` on `<root>/projects`, delivering parsed lines in bounded
-//! [`Batch`]es over a bounded channel. Only the transcript layout from
-//! [`crate::discovery`] is opened; `.credentials.json` and `sessions/`
-//! never are.
+//! [`Batch`]es over a bounded channel. The tailer persists nothing: each
+//! batch carries the checkpoint it ends at, and the consumer stores events
+//! and checkpoint in one transaction (see [`crate::store`]), so a crash
+//! between the two keeps neither and a restart re-delivers the batch. Only
+//! the transcript layout from [`crate::discovery`] is opened;
+//! `.credentials.json` and `sessions/` never are.
 
+mod checkpoint;
 mod reader;
-mod store;
 mod worker;
 
 use std::collections::HashMap;
@@ -26,12 +29,20 @@ use serde_json::Value;
 use reader::Limits;
 use worker::Worker;
 
+pub use checkpoint::{Checkpoint, FileIdentity, Offsets};
 pub use crossbeam_channel::Receiver;
-pub use store::{Checkpoint, FileIdentity, FileOffsetStore, MemoryOffsetStore, OffsetStore};
 
 /// One delivery: at most [`TailOptions::batch_records`] events, all from
-/// the same file, in file order.
-pub type Batch = Vec<TailEvent>;
+/// `path`, in file order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Batch {
+    pub path: Arc<Path>,
+    pub events: Vec<TailEvent>,
+    /// Where `path` resumes once these events are stored; store both in one
+    /// transaction. `None` on a batch that only reports a
+    /// [`TailEvent::Error`] and moves no offset.
+    pub checkpoint: Option<Checkpoint>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TailEvent {
@@ -53,7 +64,7 @@ pub enum TailEvent {
         path: Arc<Path>,
         reason: ResetReason,
     },
-    /// The file could not be read, or its checkpoint could not be stored.
+    /// The file could not be read.
     Error { path: Arc<Path>, message: String },
 }
 
@@ -91,20 +102,23 @@ impl Default for TailOptions {
 }
 
 /// A running tail. Dropping it stops the worker, as [`Tailer::stop`] does.
-pub struct Tailer<S: OffsetStore + Send + 'static> {
+pub struct Tailer {
     stop: Option<Sender<()>>,
-    worker: Option<JoinHandle<S>>,
+    worker: Option<JoinHandle<()>>,
     bytes_read: Arc<AtomicU64>,
 }
 
-impl<S: OffsetStore + Send + 'static> Tailer<S> {
+impl Tailer {
     /// Starts tailing `root` (a Claude Code config dir) on a worker thread
     /// and returns at once with the receiving end of the batch channel.
-    /// Fails only when the root path or the file watcher cannot be set up;
-    /// a `projects/` dir that does not exist yet is picked up when it does.
+    /// Each transcript resumes from its entry in `offsets` (the store's
+    /// committed checkpoints), else from 0; after that the worker tracks
+    /// what it has delivered in memory. Fails only when the root path or the
+    /// file watcher cannot be set up; a `projects/` dir that does not exist
+    /// yet is picked up when it does.
     pub fn start(
         root: impl Into<PathBuf>,
-        store: S,
+        offsets: Offsets,
         options: TailOptions,
     ) -> io::Result<(Self, Receiver<Batch>)> {
         // notify reports absolute paths; match them.
@@ -119,7 +133,7 @@ impl<S: OffsetStore + Send + 'static> Tailer<S> {
         let bytes_read = Arc::new(AtomicU64::new(0));
         let worker = Worker {
             root,
-            store,
+            offsets,
             limits: Limits {
                 chunk_bytes: options.chunk_bytes,
                 batch_records: options.batch_records,
@@ -149,20 +163,20 @@ impl<S: OffsetStore + Send + 'static> Tailer<S> {
         self.bytes_read.load(Ordering::Relaxed)
     }
 
-    /// Stops the worker and hands back the store. Returns promptly even
-    /// when the channel is full; batches already queued stay receivable.
-    pub fn stop(mut self) -> S {
+    /// Stops the worker. Returns promptly even when the channel is full;
+    /// batches already queued stay receivable.
+    pub fn stop(mut self) {
         self.stop.take();
         let worker = self.worker.take().expect("worker runs until stop");
-        worker.join().unwrap_or_else(|panic| resume_unwind(panic))
+        worker.join().unwrap_or_else(|panic| resume_unwind(panic));
     }
 }
 
-impl<S: OffsetStore + Send + 'static> Drop for Tailer<S> {
+impl Drop for Tailer {
     fn drop(&mut self) {
         self.stop.take();
         if let Some(worker) = self.worker.take() {
-            let _store = worker.join();
+            let _panicked = worker.join();
         }
     }
 }

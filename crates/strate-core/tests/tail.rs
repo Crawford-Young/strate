@@ -8,10 +8,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use strate_core::tail::{
-    Batch, FileOffsetStore, MemoryOffsetStore, OffsetStore, Receiver, ResetReason, TailEvent,
-    TailOptions, Tailer,
-};
+use strate_core::store::Store;
+use strate_core::tail::{Batch, Offsets, Receiver, ResetReason, TailEvent, TailOptions, Tailer};
 
 const PATIENCE: Duration = Duration::from_secs(10);
 
@@ -34,7 +32,7 @@ impl Root {
     }
 
     fn store_file(&self) -> PathBuf {
-        self.base.join("state/offsets.json")
+        self.base.join("state/strate.db")
     }
 
     /// Writes `text` to `rel` under the root, creating parent dirs.
@@ -76,13 +74,22 @@ fn notify_only() -> TailOptions {
     }
 }
 
-fn collect_until(rx: &Receiver<Batch>, done: impl Fn(&[TailEvent]) -> bool) -> Vec<TailEvent> {
+/// Receives batches until `done` holds for the events so far, handing each
+/// batch to `on_batch` first.
+fn collect_until(
+    rx: &Receiver<Batch>,
+    mut on_batch: impl FnMut(&Batch),
+    done: impl Fn(&[TailEvent]) -> bool,
+) -> Vec<TailEvent> {
     let deadline = Instant::now() + PATIENCE;
     let mut events = Vec::new();
     while !done(&events) {
         let left = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left) {
-            Ok(batch) => events.extend(batch),
+            Ok(batch) => {
+                on_batch(&batch);
+                events.extend(batch.events);
+            }
             Err(e) => panic!("{e}; got so far: {events:?}"),
         }
     }
@@ -115,40 +122,55 @@ fn restart_reads_only_the_appended_bytes() {
     let indexed =
         fs::metadata(&session).expect("meta").len() + fs::metadata(&subagent).expect("meta").len();
 
-    let store = FileOffsetStore::open(root.store_file()).expect("store");
-    let (tailer, rx) = Tailer::start(root.path(), store, notify_only()).expect("start");
-    let events = collect_until(&rx, |e| record_count(e) == 5);
+    // The consumer stores each batch's events and checkpoint together; the
+    // restart resumes from the store's committed offsets.
+    let mut store = Store::open(root.store_file()).expect("store");
+    let offsets = store.offsets().expect("offsets");
+    let (tailer, rx) = Tailer::start(root.path(), offsets, notify_only()).expect("start");
+    let ingest = |store: &mut Store, b: &Batch| store.ingest(b).expect("ingest");
+    let events = collect_until(&rx, |b| ingest(&mut store, b), |e| record_count(e) == 5);
     assert_eq!(ns(&events, &session), vec![0, 1, 2]);
     assert_eq!(ns(&events, &subagent), vec![10, 11]);
     assert_eq!(tailer.bytes_read(), indexed);
     drop(tailer);
     drop(rx);
+    drop(store);
 
     let appended = lines(3..5);
     append(&session, &appended);
 
-    let store = FileOffsetStore::open(root.store_file()).expect("reopen store");
-    let (tailer, rx) = Tailer::start(root.path(), store, notify_only()).expect("restart");
-    let events = collect_until(&rx, |e| record_count(e) == 2);
+    let mut store = Store::open(root.store_file()).expect("reopen store");
+    let offsets = store.offsets().expect("offsets");
+    let (tailer, rx) = Tailer::start(root.path(), offsets, notify_only()).expect("restart");
+    let events = collect_until(&rx, |b| ingest(&mut store, b), |e| record_count(e) == 2);
     assert_eq!(ns(&events, &session), vec![3, 4]);
     assert_eq!(tailer.bytes_read(), appended.len() as u64);
     tailer.stop();
-    let late: Vec<TailEvent> = rx.try_iter().flatten().collect();
+    let late: Vec<Batch> = rx.try_iter().collect();
     assert!(late.is_empty(), "nothing else emitted: {late:?}");
+}
+
+/// Folds each batch's checkpoint into `offsets`, as a consumer would store it.
+fn track(offsets: &mut Offsets) -> impl FnMut(&Batch) + '_ {
+    |b| {
+        if let Some(c) = b.checkpoint {
+            offsets.insert(b.path.to_path_buf(), c);
+        }
+    }
 }
 
 #[test]
 fn live_appends_and_new_transcripts_arrive_via_notify() {
     let root = Root::new("live");
     let session = root.write(SESSION, &lines(0..1));
-    let (tailer, rx) =
-        Tailer::start(root.path(), MemoryOffsetStore::default(), notify_only()).expect("start");
-    collect_until(&rx, |e| record_count(e) == 1);
+    let (tailer, rx) = Tailer::start(root.path(), Offsets::new(), notify_only()).expect("start");
+    let mut offsets = Offsets::new();
+    collect_until(&rx, track(&mut offsets), |e| record_count(e) == 1);
 
     // A line written in two appends, as Claude Code does mid-line.
     append(&session, "{\"n\":");
     append(&session, "1}\n");
-    let events = collect_until(&rx, |e| record_count(e) == 1);
+    let events = collect_until(&rx, track(&mut offsets), |e| record_count(e) == 1);
     assert_eq!(ns(&events, &session), vec![1]);
     let TailEvent::Record { offset, .. } = &events[0] else {
         panic!("a record: {events:?}");
@@ -156,26 +178,26 @@ fn live_appends_and_new_transcripts_arrive_via_notify() {
     assert_eq!(*offset, 8);
 
     let subagent = root.write(SUBAGENT, &lines(20..22));
-    let events = collect_until(&rx, |e| record_count(e) == 2);
+    let events = collect_until(&rx, track(&mut offsets), |e| record_count(e) == 2);
     assert_eq!(ns(&events, &subagent), vec![20, 21]);
 
-    let store = tailer.stop();
+    tailer.stop();
     // Two 9-byte lines (`{"n":20}\n`).
-    assert_eq!(store.get(&subagent).map(|c| c.offset), Some(18));
+    assert_eq!(offsets.get(&subagent).map(|c| c.offset), Some(18));
 }
 
 #[test]
 fn truncation_between_runs_is_surfaced_and_re_read() {
     let root = Root::new("truncate");
     let session = root.write(SESSION, &lines(0..3));
-    let (tailer, rx) =
-        Tailer::start(root.path(), MemoryOffsetStore::default(), notify_only()).expect("start");
-    collect_until(&rx, |e| record_count(e) == 3);
-    let store = tailer.stop();
+    let (tailer, rx) = Tailer::start(root.path(), Offsets::new(), notify_only()).expect("start");
+    let mut offsets = Offsets::new();
+    collect_until(&rx, track(&mut offsets), |e| record_count(e) == 3);
+    tailer.stop();
 
     fs::write(&session, lines(7..8)).expect("truncate");
-    let (_tailer, rx) = Tailer::start(root.path(), store, notify_only()).expect("restart");
-    let events = collect_until(&rx, |e| record_count(e) == 1);
+    let (_tailer, rx) = Tailer::start(root.path(), offsets, notify_only()).expect("restart");
+    let events = collect_until(&rx, |_| {}, |e| record_count(e) == 1);
     assert_eq!(
         events[0],
         TailEvent::Reset {
@@ -193,14 +215,13 @@ fn projects_dir_created_after_start_is_found_by_the_rescan() {
         rescan_every: Duration::from_millis(50),
         ..TailOptions::default()
     };
-    let (_tailer, rx) =
-        Tailer::start(root.path(), MemoryOffsetStore::default(), options).expect("start");
+    let (_tailer, rx) = Tailer::start(root.path(), Offsets::new(), options).expect("start");
     let session = root.write(SESSION, &lines(0..2));
-    let events = collect_until(&rx, |e| record_count(e) == 2);
+    let events = collect_until(&rx, |_| {}, |e| record_count(e) == 2);
     assert_eq!(ns(&events, &session), vec![0, 1]);
 
     append(&session, &lines(2..3));
-    let events = collect_until(&rx, |e| record_count(e) == 1);
+    let events = collect_until(&rx, |_| {}, |e| record_count(e) == 1);
     assert_eq!(ns(&events, &session), vec![2]);
 }
 
@@ -222,17 +243,16 @@ fn only_transcripts_are_read_never_credentials_or_sessions() {
         .map(|p| fs::metadata(p).expect("meta").len())
         .sum();
 
-    let (tailer, rx) =
-        Tailer::start(&root, MemoryOffsetStore::default(), notify_only()).expect("start");
+    let (tailer, rx) = Tailer::start(&root, Offsets::new(), notify_only()).expect("start");
     let deadline = Instant::now() + PATIENCE;
     let mut events = Vec::new();
     while tailer.bytes_read() < total && Instant::now() < deadline {
         if let Ok(batch) = rx.recv_timeout(Duration::from_millis(50)) {
-            events.extend(batch);
+            events.extend(batch.events);
         }
     }
     tailer.stop();
-    events.extend(rx.try_iter().flatten());
+    events.extend(rx.try_iter().flat_map(|b| b.events));
 
     assert!(!events.is_empty());
     for e in &events {
@@ -264,8 +284,7 @@ fn stop_returns_even_while_the_consumer_is_not_reading() {
         channel_batches: 1,
         ..notify_only()
     };
-    let (tailer, rx) =
-        Tailer::start(root.path(), MemoryOffsetStore::default(), options).expect("start");
+    let (tailer, rx) = Tailer::start(root.path(), Offsets::new(), options).expect("start");
     let deadline = Instant::now() + PATIENCE;
     while rx.is_empty() && Instant::now() < deadline {
         thread::yield_now();
@@ -313,8 +332,7 @@ fn fifty_megabytes_ingest_in_the_background_with_bounded_buffering() {
     );
 
     let started = Instant::now();
-    let (tailer, rx) =
-        Tailer::start(root.path(), MemoryOffsetStore::default(), notify_only()).expect("start");
+    let (tailer, rx) = Tailer::start(root.path(), Offsets::new(), notify_only()).expect("start");
     assert!(
         started.elapsed() < Duration::from_millis(500),
         "start() blocked for {:?}",
@@ -339,7 +357,7 @@ fn fifty_megabytes_ingest_in_the_background_with_bounded_buffering() {
         );
         match rx.try_recv() {
             Ok(batch) => {
-                for e in batch {
+                for e in batch.events {
                     let TailEvent::Record { value, .. } = e else {
                         panic!("unexpected {e:?}");
                     };

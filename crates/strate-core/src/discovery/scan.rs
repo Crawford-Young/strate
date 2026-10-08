@@ -251,7 +251,7 @@ fn read_meta(
 
 /// `effort`'s type is unverified: keep strings as-is and render other
 /// scalars as text rather than dropping them.
-fn scalar_text(value: &Value) -> Option<String> {
+pub(crate) fn scalar_text(value: &Value) -> Option<String> {
     match value {
         Value::String(s) => Some(s.clone()),
         Value::Number(_) | Value::Bool(_) => Some(value.to_string()),

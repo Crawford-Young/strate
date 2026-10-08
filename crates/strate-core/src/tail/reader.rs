@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{Batch, Checkpoint, FileIdentity, OffsetStore, ResetReason, TailEvent};
+use super::{Batch, Checkpoint, FileIdentity, Offsets, ResetReason, TailEvent};
 use crate::discovery::parse_line;
 
 /// The consumer is gone or the tailer is stopping.
@@ -16,24 +16,28 @@ pub(super) struct Limits {
     pub batch_records: usize,
 }
 
-/// Reads `path` from its stored checkpoint to EOF in `chunk_bytes` reads,
-/// handing complete lines to `send` in batches of at most `batch_records`
-/// events. The checkpoint advances only after `send` accepts a batch, and
-/// only through the last complete line: a partial trailing line is left
-/// for the next call. Returns the position read up to, or `None` when the
-/// file is gone or unreadable.
+/// Reads `path` from its checkpoint in `offsets` to EOF in `chunk_bytes`
+/// reads, handing complete lines to `send` in batches of at most
+/// `batch_records` events. Each batch carries the checkpoint it ends at;
+/// `offsets` advances to it only after `send` accepts the batch, and only
+/// through the last complete line: a partial trailing line is left for the
+/// next call. Nothing is persisted here: the consumer stores a batch's
+/// events and checkpoint together. Returns the position read up to, or
+/// `None` when the file is gone or unreadable.
 pub(super) fn tail_file(
     path: &Arc<Path>,
-    store: &mut dyn OffsetStore,
+    offsets: &mut Offsets,
     limits: &Limits,
     bytes_read: &AtomicU64,
     send: &mut dyn FnMut(Batch) -> Result<(), Stopped>,
 ) -> Result<Option<u64>, Stopped> {
-    let error = |message: String| {
-        vec![TailEvent::Error {
+    let error = |message: String| Batch {
+        path: path.clone(),
+        events: vec![TailEvent::Error {
             path: path.clone(),
             message,
-        }]
+        }],
+        checkpoint: None,
     };
     let opened = File::open(path).and_then(|file| {
         let len = file.metadata()?.len();
@@ -47,24 +51,24 @@ pub(super) fn tail_file(
 
     let mut tail = Tail {
         path,
-        store,
+        offsets,
         identity,
-        batch: Vec::new(),
+        events: Vec::new(),
         committed: 0,
-        stored: None,
+        delivered: None,
     };
-    let reset = match tail.store.get(path) {
+    let reset = match tail.offsets.get(&**path) {
         Some(c) if c.identity != identity => Some(ResetReason::Replaced),
         Some(c) if len < c.offset => Some(ResetReason::Truncated),
         Some(c) => {
             tail.committed = c.offset;
-            tail.stored = Some(c.offset);
+            tail.delivered = Some(c.offset);
             None
         }
         None => None,
     };
     if let Some(reason) = reset {
-        tail.batch.push(TailEvent::Reset {
+        tail.events.push(TailEvent::Reset {
             path: path.clone(),
             reason,
         });
@@ -84,7 +88,7 @@ pub(super) fn tail_file(
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                tail.batch.extend(error(e.to_string()));
+                tail.events.extend(error(e.to_string()).events);
                 break;
             }
         };
@@ -100,7 +104,7 @@ pub(super) fn tail_file(
             tail.push_line(line);
             carry.clear();
             rest = &rest[i + 1..];
-            if tail.batch.len() >= limits.batch_records {
+            if tail.events.len() >= limits.batch_records {
                 tail.flush(send)?;
             }
         }
@@ -114,13 +118,13 @@ pub(super) fn tail_file(
 /// One file's pass: events not yet sent and the offset they end at.
 struct Tail<'a> {
     path: &'a Arc<Path>,
-    store: &'a mut dyn OffsetStore,
+    offsets: &'a mut Offsets,
     identity: FileIdentity,
-    batch: Batch,
+    events: Vec<TailEvent>,
     /// End of the last complete line read.
     committed: u64,
-    /// Offset last written to the store during this pass.
-    stored: Option<u64>,
+    /// Offset the last accepted batch ended at.
+    delivered: Option<u64>,
 }
 
 impl Tail<'_> {
@@ -130,12 +134,12 @@ impl Tail<'_> {
         let path = self.path.clone();
         match parse_line(line) {
             None => {}
-            Some(Ok(value)) => self.batch.push(TailEvent::Record {
+            Some(Ok(value)) => self.events.push(TailEvent::Record {
                 path,
                 offset,
                 value,
             }),
-            Some(Err(e)) => self.batch.push(TailEvent::Malformed {
+            Some(Err(e)) => self.events.push(TailEvent::Malformed {
                 path,
                 offset,
                 error: e.to_string(),
@@ -143,28 +147,25 @@ impl Tail<'_> {
         }
     }
 
-    /// Sends pending events, then commits the offset they end at.
+    /// Sends pending events with the checkpoint they end at, then records
+    /// that checkpoint as delivered. A pass that moved the offset without
+    /// producing events (blank lines) still sends its checkpoint.
     fn flush(&mut self, send: &mut dyn FnMut(Batch) -> Result<(), Stopped>) -> Result<(), Stopped> {
-        if !self.batch.is_empty() {
-            send(std::mem::take(&mut self.batch))?;
-        }
-        if self.stored == Some(self.committed) {
+        if self.events.is_empty() && self.delivered == Some(self.committed) {
             return Ok(());
         }
         let checkpoint = Checkpoint {
             offset: self.committed,
             identity: self.identity,
         };
-        match self.store.set(self.path, checkpoint) {
-            Ok(()) => {
-                self.stored = Some(self.committed);
-                Ok(())
-            }
-            Err(e) => send(vec![TailEvent::Error {
-                path: self.path.clone(),
-                message: format!("offset not stored: {e}"),
-            }]),
-        }
+        send(Batch {
+            path: self.path.clone(),
+            events: std::mem::take(&mut self.events),
+            checkpoint: Some(checkpoint),
+        })?;
+        self.offsets.insert(self.path.to_path_buf(), checkpoint);
+        self.delivered = Some(self.committed);
+        Ok(())
     }
 }
 
@@ -176,7 +177,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
-    use crate::tail::{MemoryOffsetStore, ResetReason, TailEvent, test_dir};
+    use crate::tail::{ResetReason, TailEvent, test_dir};
 
     const LIMITS: Limits = Limits {
         chunk_bytes: 64 * 1024,
@@ -186,7 +187,7 @@ mod tests {
     struct Harness {
         dir: PathBuf,
         path: Arc<Path>,
-        store: MemoryOffsetStore,
+        offsets: Offsets,
         bytes_read: AtomicU64,
     }
 
@@ -198,7 +199,7 @@ mod tests {
             Self {
                 dir,
                 path,
-                store: MemoryOffsetStore::default(),
+                offsets: Offsets::new(),
                 bytes_read: AtomicU64::new(0),
             }
         }
@@ -217,7 +218,7 @@ mod tests {
             let mut batches = Vec::new();
             let pos = tail_file(
                 &self.path,
-                &mut self.store,
+                &mut self.offsets,
                 limits,
                 &self.bytes_read,
                 &mut |b| {
@@ -231,7 +232,7 @@ mod tests {
         }
 
         fn offset(&self) -> Option<u64> {
-            self.store.get(&self.path).map(|c| c.offset)
+            self.offsets.get(&*self.path).map(|c| c.offset)
         }
     }
 
@@ -245,13 +246,20 @@ mod tests {
     fn records(batches: &[Batch]) -> Vec<(u64, i64)> {
         batches
             .iter()
-            .flatten()
+            .flat_map(|b| &b.events)
             .filter_map(|e| match e {
                 TailEvent::Record { offset, value, .. } => {
                     Some((*offset, value["n"].as_i64().expect("n")))
                 }
                 _ => None,
             })
+            .collect()
+    }
+
+    fn checkpoint_offsets(batches: &[Batch]) -> Vec<Option<u64>> {
+        batches
+            .iter()
+            .map(|b| b.checkpoint.map(|c| c.offset))
             .collect()
     }
 
@@ -265,10 +273,46 @@ mod tests {
         assert_eq!(pos, Some(17));
         assert_eq!(read, 17);
         assert_eq!(h.offset(), Some(17));
-        let TailEvent::Record { path, .. } = &batches[0][0] else {
+        assert_eq!(batches[0].path, h.path);
+        let TailEvent::Record { path, .. } = &batches[0].events[0] else {
             panic!("first event is a record: {batches:?}");
         };
         assert_eq!(path, &h.path);
+    }
+
+    #[test]
+    fn each_batch_carries_the_checkpoint_it_ends_at() {
+        let lines: String = (0..10).map(|n| format!("{{\"n\":{n}}}\n")).collect();
+        let mut h = Harness::new("reader-batch-checkpoint", &lines);
+        let limits = Limits {
+            chunk_bytes: 64,
+            batch_records: 3,
+        };
+        let (batches, _, _) = h.pass(&limits);
+        // Eight bytes per line; batches of 3, 3, 3, 1 lines.
+        assert_eq!(
+            checkpoint_offsets(&batches),
+            vec![Some(24), Some(48), Some(72), Some(80)]
+        );
+        let identity = FileIdentity::of(&h.path).expect("identity");
+        assert!(
+            batches
+                .iter()
+                .all(|b| b.checkpoint.map(|c| c.identity) == Some(identity)),
+            "{batches:?}"
+        );
+    }
+
+    #[test]
+    fn blank_lines_alone_still_deliver_their_checkpoint() {
+        let mut h = Harness::new("reader-blank", "{\"n\":1}\n");
+        h.pass(&LIMITS);
+        h.append("\n\n");
+        let (batches, _, _) = h.pass(&LIMITS);
+        assert_eq!(batches.len(), 1, "{batches:?}");
+        assert!(batches[0].events.is_empty());
+        assert_eq!(checkpoint_offsets(&batches), vec![Some(10)]);
+        assert_eq!(h.offset(), Some(10));
     }
 
     #[test]
@@ -277,11 +321,12 @@ mod tests {
         let (batches, pos, _) = h.pass(&LIMITS);
         assert_eq!(records(&batches), vec![(0, 1)]);
         assert_eq!(h.offset(), Some(8), "commit stops at the last newline");
+        assert_eq!(checkpoint_offsets(&batches), vec![Some(8)]);
         assert_eq!(pos, Some(22), "the 14 held bytes were read");
         assert!(
             batches
                 .iter()
-                .flatten()
+                .flat_map(|b| &b.events)
                 .all(|e| matches!(e, TailEvent::Record { .. })),
             "a partial line is not malformed: {batches:?}"
         );
@@ -314,7 +359,7 @@ mod tests {
         fs::write(&h.path, "{\"n\":9}\n").expect("truncate in place");
         let (batches, _, _) = h.pass(&LIMITS);
         assert_eq!(
-            batches[0][0],
+            batches[0].events[0],
             TailEvent::Reset {
                 path: h.path.clone(),
                 reason: ResetReason::Truncated,
@@ -334,7 +379,7 @@ mod tests {
         fs::rename(&tmp, &h.path).expect("replace");
         let (batches, _, _) = h.pass(&LIMITS);
         assert_eq!(
-            batches[0][0],
+            batches[0].events[0],
             TailEvent::Reset {
                 path: h.path.clone(),
                 reason: ResetReason::Replaced,
@@ -352,7 +397,8 @@ mod tests {
         fs::rename(&tmp, &h.path).expect("replace");
         let (batches, _, _) = h.pass(&LIMITS);
         assert_eq!(batches.len(), 1, "{batches:?}");
-        assert!(matches!(batches[0][..], [TailEvent::Reset { .. }]));
+        assert!(matches!(batches[0].events[..], [TailEvent::Reset { .. }]));
+        assert_eq!(checkpoint_offsets(&batches), vec![Some(0)]);
         assert_eq!(h.offset(), Some(0));
     }
 
@@ -363,7 +409,7 @@ mod tests {
         assert_eq!(records(&batches), vec![(0, 1), (15, 3)]);
         let malformed: Vec<u64> = batches
             .iter()
-            .flatten()
+            .flat_map(|b| &b.events)
             .filter_map(|e| match e {
                 TailEvent::Malformed { offset, .. } => Some(*offset),
                 _ => None,
@@ -382,7 +428,7 @@ mod tests {
             batch_records: 3,
         };
         let (batches, _, read) = h.pass(&tiny);
-        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        let sizes: Vec<usize> = batches.iter().map(|b| b.events.len()).collect();
         assert_eq!(sizes, vec![3, 3, 3, 1]);
         let expected: Vec<(u64, i64)> = (0..10).map(|n| (n * 8, n as i64)).collect();
         assert_eq!(records(&batches), expected);
@@ -399,12 +445,12 @@ mod tests {
             batch_records: 2,
         };
         let mut accepted = 0;
-        let got = tail_file(&h.path, &mut h.store, &limits, &h.bytes_read, &mut |_| {
+        let got = tail_file(&h.path, &mut h.offsets, &limits, &h.bytes_read, &mut |_| {
             accepted += 1;
             if accepted == 1 { Ok(()) } else { Err(Stopped) }
         });
         assert_eq!(got, Err(Stopped));
-        assert_eq!(h.offset(), Some(16), "first batch committed, second not");
+        assert_eq!(h.offset(), Some(16), "first batch delivered, second not");
     }
 
     #[test]
