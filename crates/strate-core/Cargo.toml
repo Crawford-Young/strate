@@ -1,0 +1,10 @@
+[package]
+name = "strate-core"
+version = "0.1.0"
+description = "Claude Code transcript discovery and graph model for strate"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde_json = "1.0.151"
