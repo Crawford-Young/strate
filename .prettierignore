@@ -1,6 +1,5 @@
 dist
 coverage
 target
-pnpm-lock.yaml
 src-tauri/gen
 src-tauri/icons

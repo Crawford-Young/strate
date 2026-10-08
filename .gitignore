@@ -24,7 +24,6 @@ src-tauri/gen/schemas/
 
 # Logs / OS / editor
 *.log
-pnpm-debug.log*
 .DS_Store
 Thumbs.db
 .vscode/*
