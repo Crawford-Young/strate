@@ -1,0 +1,6 @@
+@import 'tailwindcss';
+@config '../tailwind.config.ts';
+@source '../node_modules/@crawfordyoung/ui/src/**/*.{ts,tsx}';
+@source '../node_modules/@crawfordyoung/ui/dist/index.mjs';
+
+@import '@crawfordyoung/ui/styles.css';
