@@ -1,0 +1,1 @@
+{"agentType":"reviewer","color":"blue","description":"Adipiscing task","model":"claude-sonnet-5","name":"demo-reviewer","permissionMode":"default","planModeRequired":false,"requestNonInteractive":false,"requestShape":"teammate","spawnDepth":0,"taskKind":"lorem","teamName":"demo-team"}

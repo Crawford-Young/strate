@@ -3,3 +3,4 @@ coverage
 target
 src-tauri/gen
 src-tauri/icons
+crates/strate-core/tests/fixtures

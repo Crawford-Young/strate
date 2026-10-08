@@ -32,3 +32,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 bun run tauri build --debug --no-bundle   # proves the app compiles
 ```
+
+## Crates
+
+- `src-tauri/`: the Tauri app shell.
+- `crates/strate-core/`: the app-independent core. `discovery` resolves the Claude Code config dir (`CLAUDE_CONFIG_DIR`, else `~/.claude`) and enumerates `projects/` and `teams/` into a graph of session, subagent and team nodes. Each subagent links to its parent by dispatch (`toolUseId`), to its team as a teammate, or is kept as unresolved. It never opens `.credentials.json` or `sessions/`. Its tests run against a synthetic fixture in `crates/strate-core/tests/fixtures/claude-home/`, which `tests/fixtures/generate.sh` regenerates.

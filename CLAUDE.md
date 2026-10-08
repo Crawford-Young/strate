@@ -15,7 +15,7 @@ Stack and rationale: ADR-0001 (`docs/apps/strate/specs/2026-10-08-adr-0001-stack
 
 ## Traps
 
-- This repo is PUBLIC. Transcript fixtures are scrubbed or synthetic, never raw `~/.claude` content.
+- This repo is PUBLIC. Transcript fixtures are scrubbed or synthetic, never raw `~/.claude` content. `crates/strate-core/tests/fixtures/` is synthetic: real field names, placeholder values only (lorem text, `/work/...` cwds), and no real paths, prompts, emails or keys. Change it by editing `generate.sh` and re-running it, not by pasting real transcripts.
 - The agent registry is `claude agents --json`, never `sessions/<pid>.json`.
 - Layout is the user's call: Harness left, console right, terminal bottom, Audit the only full-screen view. Don't assume otherwise; ask.
 - UI comes from `@crawfordyoung/ui`; new pieces land in the library first.
