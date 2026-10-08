@@ -1,0 +1,16 @@
+[package]
+name = "strate"
+version = "0.1.0"
+description = "Real-time view of Claude Code orchestration"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "strate_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7.1", features = [] }
+
+[dependencies]
+tauri = { version = "2.12.1", features = [] }
