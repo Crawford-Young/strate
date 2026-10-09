@@ -9,7 +9,7 @@ use crossbeam_channel::{Receiver, Sender, select, tick};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::reader::{Limits, Stopped, tail_file};
-use super::{Batch, Offsets};
+use super::{Batch, Offsets, TailEvent};
 use crate::discovery::{is_transcript, transcript_paths};
 
 pub(super) struct Worker {
@@ -38,6 +38,11 @@ impl Worker {
 
     fn serve(&mut self) -> Result<(), Stopped> {
         self.rescan()?;
+        self.send(Batch {
+            path: self.root.as_path().into(),
+            events: vec![TailEvent::CaughtUp],
+            checkpoint: None,
+        })?;
         let ticker = tick(self.rescan_every);
         loop {
             select! {
@@ -85,6 +90,13 @@ impl Worker {
             }
         }
         Ok(())
+    }
+
+    fn send(&self, batch: Batch) -> Result<(), Stopped> {
+        select! {
+            send(self.out, batch) -> sent => sent.map_err(|_| Stopped),
+            recv(self.stop) -> _ => Err(Stopped),
+        }
     }
 
     fn tail(&mut self, path: &Path) -> Result<(), Stopped> {

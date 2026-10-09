@@ -14,6 +14,7 @@ mod group;
 mod ingest;
 mod live;
 mod migrate;
+pub mod views;
 
 use std::path::Path;
 
