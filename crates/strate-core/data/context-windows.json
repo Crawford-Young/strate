@@ -1,0 +1,13 @@
+{
+  "$comment": "strate's context window per model, in tokens. No transcript record carries a window size, so context % divides the latest request's depth by this. A dated snapshot (claude-haiku-4-5-20251001) resolves to its base id; a model missing here gets no context %. Re-verify when a model ships.",
+  "verified": "2026-10-06",
+  "source": "Anthropic Models API, max_input_tokens",
+  "models": {
+    "claude-fable-5-1": 1000000,
+    "claude-opus-5-5": 1000000,
+    "claude-opus-5": 1000000,
+    "claude-sonnet-5-5": 1000000,
+    "claude-sonnet-5": 1000000,
+    "claude-haiku-4-5": 200000
+  }
+}

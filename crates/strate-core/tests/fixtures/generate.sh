@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13). Field names come from
+# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14). Field names come from
 # the "~/.claude format, as observed" comment on strate #10; every value is a placeholder.
 set -eu
 cd "$(dirname "$0")/.."
@@ -148,3 +148,73 @@ at $E1 /work/demo-repo main -
   at $E1 /work/demo-repo/packages/core feat/9-lorem -; reply 08:00:05; user 08:01:00; reply 08:01:05; } > "$W/projects/-work-demo-repo-packages-core/$E1.jsonl"
 at $E2 /work/demo-repo/packages/core feat/9-lorem -
 { user 08:30:00; reply 08:30:05; } > "$W/projects/-work-demo-repo-packages-core/$E2.jsonl"
+
+# ---- cost-home: cost and time (#14), checked against audit.mjs ----
+# After a change here, regenerate the golden from claude-config's audit.mjs (see audit-golden.mjs).
+K=fixtures/cost-home
+K1=5e55f0f0-0000-4000-8000-0000000000f1
+K2=5e55f0f0-0000-4000-8000-0000000000f2
+rm -rf "$K"
+mkdir -p "$K/projects/-work-cost-repo/$K1/subagents" "$K/projects/-work-cost-other"
+TEXT='{"type":"text","text":"Lorem."}'
+THINK='{"type":"thinking","thinking":"Lorem ipsum."}'
+kat() { # sessionId cwd sidechain-fields: the envelope of the records that follow
+  KS=$1; KC=$2; KSIDE=$3
+}
+kenv() { # HH:MM:SS uuid
+  KE="\"parentUuid\":null,$KSIDE,\"timestamp\":\"2026-10-03T$1.000Z\",\"userType\":\"external\",\"entrypoint\":\"cli\",\"cwd\":\"$KC\",\"sessionId\":\"$KS\",\"version\":\"2.1.294\",\"gitBranch\":\"main\",\"uuid\":\"$2\""
+}
+kprompt() { # HH:MM:SS uuid: a typed prompt
+  kenv "$1" "$2"; echo "{$KE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Lorem ipsum dolor.\"},\"origin\":{\"kind\":\"human\"}}"
+}
+kresult() { # HH:MM:SS uuid toolUseId
+  kenv "$1" "$2"; echo "{$KE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"$3\",\"content\":\"Lorem.\"}]}}"
+}
+kreply() { # HH:MM:SS uuid requestId model usage content-block
+  kenv "$1" "$2"; echo "{$KE,\"type\":\"assistant\",\"requestId\":\"$3\",\"message\":{\"role\":\"assistant\",\"id\":\"msg_$3\",\"model\":\"$4\",\"content\":[$6],\"usage\":$5}}"
+}
+ku() { # input cacheCreation cacheRead output [5m 1h] [webSearchRequests]: message.usage
+  U="{\"input_tokens\":$1,\"cache_creation_input_tokens\":$2,\"cache_read_input_tokens\":$3,\"output_tokens\":$4"
+  if [ -n "${5:-}" ]; then U="$U,\"cache_creation\":{\"ephemeral_5m_input_tokens\":$5,\"ephemeral_1h_input_tokens\":$6}"; fi
+  if [ -n "${7:-}" ]; then U="$U,\"server_tool_use\":{\"web_search_requests\":$7}"; fi
+  echo "$U,\"service_tier\":\"standard\"}"
+}
+ktool() { # id name input
+  echo "{\"type\":\"tool_use\",\"id\":\"$1\",\"name\":\"$2\",\"input\":$3}"
+}
+# K1, claude-opus-5-5, 10:00:00..10:30:06: an AskUserQuestion wait, a subagent,
+# a 22.6-min idle gap, then a <synthetic> record and a replayed uuid.
+kat $K1 /work/cost-repo '"isSidechain":false'
+{ kprompt 10:00:00 k-01
+  echo "{\"type\":\"custom-title\",\"customTitle\":\"cost-repo-14\",\"sessionId\":\"$K1\"}"
+  # streaming partials of one request: output grows 10 -> 40; only the last counts
+  kreply 10:00:05 k-02 req_c1 claude-opus-5-5 "$(ku 100 500 10000 10 500 0)" "$THINK"
+  kreply 10:00:08 k-03 req_c1 claude-opus-5-5 "$(ku 100 500 10000 40 500 0)" "$(ktool toolu_c1 AskUserQuestion '{"questions":[{"question":"Lorem?"}]}')"
+  kresult 10:02:08 k-04 toolu_c1
+  # 5m and 1h cache tiers, two web searches, an Agent dispatch
+  kreply 10:02:10 k-05 req_c2 claude-opus-5-5 "$(ku 50 300 20000 60 100 200 2)" "$(ktool toolu_c2 Agent '{"subagent_type":"implementer","description":"Lorem","prompt":"Lorem ipsum."}')"
+  kresult 10:05:15 k-06 toolu_c2
+  # a cache write with no tier split: all 5m
+  REPLAYED=$(kreply 10:05:20 k-07 req_c3 claude-opus-5-5 "$(ku 20 400 30000 30)" "$TEXT"); echo "$REPLAYED"
+  kprompt 10:07:20 k-08
+  kreply 10:07:25 k-09 req_c5 claude-opus-5-5 "$(ku 10 0 40000 25 0 0)" "$TEXT"
+  kprompt 10:30:00 k-10
+  kreply 10:30:04 k-11 req_c4 claude-opus-5-5 "$(ku 6 50000 150000 80 0 50000)" "$TEXT"
+  kenv 10:30:06 k-12
+  echo "{$KE,\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"id\":\"msg_syn1\",\"model\":\"<synthetic>\",\"content\":[$TEXT],\"usage\":$(ku 0 0 0 0)}}"
+  echo "$REPLAYED"
+} > "$K/projects/-work-cost-repo/$K1.jsonl"
+kat $K1 /work/cost-repo '"isSidechain":true,"agentId":"a4000000000000001"'
+{ kenv 10:02:12 ks-1; echo "{$KE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Lorem ipsum.\"}}"
+  kreply 10:03:12 ks-2 req_s1 claude-sonnet-5-5 "$(ku 30 200 5000 20 200 0)" "$(ktool toolu_s1 Bash '{"command":"cargo test"}')"
+  kresult 10:04:12 ks-3 toolu_s1
+  kreply 10:05:12 ks-4 req_s2 claude-sonnet-5-5 "$(ku 10 0 8000 15 0 0)" "$TEXT"
+} > "$K/projects/-work-cost-repo/$K1/subagents/agent-a4000000000000001.jsonl"
+echo '{"agentType":"implementer","description":"Lorem task","toolUseId":"toolu_c2","spawnDepth":1,"requestShape":"agent","requestNonInteractive":true,"model":"claude-sonnet-5-5"}' > "$K/projects/-work-cost-repo/$K1/subagents/agent-a4000000000000001.meta.json"
+# K2, 09:00:00..09:01:02: an unpriced model, then a dated haiku snapshot.
+kat $K2 /work/cost-other '"isSidechain":false'
+{ kprompt 09:00:00 k-21
+  kreply 09:00:03 k-22 req_d1 claude-lorem-1 "$(ku 40 0 1000 12)" "$TEXT"
+  kprompt 09:01:00 k-23
+  kreply 09:01:02 k-24 req_d2 claude-haiku-4-5-20251001 "$(ku 8 2000 48000 22 2000 0)" "$TEXT"
+} > "$K/projects/-work-cost-other/$K2.jsonl"

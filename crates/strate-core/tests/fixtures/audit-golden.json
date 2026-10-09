@@ -1,0 +1,67 @@
+{
+  "pricesVerified": "2026-10-08",
+  "totals": {
+    "requests": 9,
+    "usd": 0.491692,
+    "tokens": {
+      "input": 274,
+      "output": 304,
+      "cacheRead": 312000,
+      "cacheWrite5m": 3200,
+      "cacheWrite1h": 50200
+    }
+  },
+  "unpriced": {
+    "claude-lorem-1": {
+      "requests": 1,
+      "tokens": 1052
+    }
+  },
+  "sessions": [
+    {
+      "sessionId": "5e55f0f0-0000-4000-8000-0000000000f1",
+      "requests": 7,
+      "usd": 0.484274,
+      "subagentUsd": 0.00223
+    },
+    {
+      "sessionId": "5e55f0f0-0000-4000-8000-0000000000f2",
+      "requests": 2,
+      "usd": 0.007418,
+      "subagentUsd": 0
+    }
+  ],
+  "time": {
+    "idleGapMin": 10,
+    "sessions": [
+      {
+        "sessionId": "5e55f0f0-0000-4000-8000-0000000000f1",
+        "wallMs": 1806000,
+        "activeMs": 451000,
+        "idleMs": 1355000,
+        "modelMs": 26000,
+        "toolsMs": 185000,
+        "userMs": 240000,
+        "otherMs": 0
+      },
+      {
+        "sessionId": "5e55f0f0-0000-4000-8000-0000000000f2",
+        "wallMs": 62000,
+        "activeMs": 62000,
+        "idleMs": 0,
+        "modelMs": 5000,
+        "toolsMs": 0,
+        "userMs": 57000,
+        "otherMs": 0
+      }
+    ],
+    "agentRuns": [
+      {
+        "id": "a4000000000000001",
+        "sessionId": "5e55f0f0-0000-4000-8000-0000000000f1",
+        "wallMs": 180000,
+        "usd": 0.00223
+      }
+    ]
+  }
+}

@@ -1,12 +1,14 @@
 //! Writes tail batches and discovery graphs into the schema. Every function
 //! runs inside the caller's transaction.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
-use super::{Result, group};
+use super::{Result, account, group};
+use crate::cost::SYNTHETIC;
 use crate::discovery::{AgentRef, Graph, Link, Unresolved, scalar_text};
 use crate::tail::{Batch, TailEvent};
 
@@ -52,11 +54,12 @@ fn owner_of(path: &Path) -> Owner {
 }
 
 /// Stores a batch's events and its checkpoint, then regroups the batch's
-/// session.
+/// session and recomputes the rollups it touches.
 pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
     let owner = owner_of(&batch.path);
     let file = text_of(&batch.path);
     let mut agent = None;
+    let mut requests = BTreeSet::new();
     for event in &batch.events {
         match event {
             TailEvent::Record { offset, value, .. } => {
@@ -64,7 +67,7 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
                     Some(id) => id,
                     None => *agent.insert(ensure_owner(conn, &owner, &file)?),
                 };
-                record(conn, &owner, id, &file, *offset, value)?;
+                requests.extend(record(conn, &owner, id, &file, *offset, value)?);
             }
             // The file was rewritten: its uuid-less events would block the
             // new content at the same offsets. Events with a uuid stay and
@@ -77,6 +80,8 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
         }
     }
     group::sessions(conn, [owner.session_id.as_str()])?;
+    let touched = account::touched(conn, &owner.session_id, &requests)?;
+    account::rollup(conn, touched.iter().map(String::as_str))?;
     if let Some(c) = batch.checkpoint {
         conn.prepare_cached(
             "INSERT INTO offsets (path, byte_offset, volume, file_index) VALUES (?1, ?2, ?3, ?4)
@@ -157,7 +162,8 @@ fn agent_row(conn: &Connection, session_id: &str, agent_id: Option<&str>) -> Res
 }
 
 /// Stores one record; a record not seen before also updates its agent
-/// (latest wins) and any GitHub link it carries.
+/// (latest wins) and any GitHub link it carries. Returns the request key of
+/// a request record it stored.
 fn record(
     conn: &Connection,
     owner: &Owner,
@@ -165,18 +171,22 @@ fn record(
     file: &str,
     offset: u64,
     value: &Value,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let text = |key: &str| value.get(key).and_then(Value::as_str);
     let kind = text("type");
     let custom_title = match kind {
         Some("custom-title") => text("customTitle"),
         _ => None,
     };
+    let acct = account::fields(value);
     let inserted =
         conn.prepare_cached(
             "INSERT OR IGNORE INTO events (session_id, agent_id, type, subtype, uuid, parent_uuid,
-                 request_id, timestamp, file, byte_offset, raw, cwd, git_branch, custom_title)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 request_id, timestamp, file, byte_offset, raw, cwd, git_branch, custom_title,
+                 request_key, model, usage, output_tokens, cost_usd, tool_uses, tool_results,
+                 prompt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                 ?18, ?19, ?20, ?21, ?22)",
         )?
         .execute(params![
             owner.session_id,
@@ -193,9 +203,17 @@ fn record(
             text("cwd"),
             text("gitBranch"),
             custom_title,
+            acct.request_key,
+            acct.model,
+            acct.usage,
+            acct.output_tokens,
+            acct.cost_usd,
+            acct.tool_uses,
+            acct.tool_results,
+            acct.prompt,
         ])? > 0;
     if !inserted {
-        return Ok(());
+        return Ok(None);
     }
     if owner.agent_id.is_none()
         && let Some(root) = text("session_id")
@@ -208,7 +226,11 @@ fn record(
 
     let (model, effort) = if kind == Some("assistant") {
         (
-            value.pointer("/message/model").and_then(Value::as_str),
+            // `<synthetic>` records are made up locally: never the agent's model.
+            value
+                .pointer("/message/model")
+                .and_then(Value::as_str)
+                .filter(|m| *m != SYNTHETIC),
             value.get("effort").and_then(scalar_text),
         )
     } else {
@@ -249,7 +271,7 @@ fn record(
             text("timestamp"),
         ])?;
     }
-    Ok(())
+    Ok(acct.usage.and(acct.request_key))
 }
 
 /// Stores the sessions, agents and edges of a discovery graph. Only adds

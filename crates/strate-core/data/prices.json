@@ -1,0 +1,14 @@
+{
+  "$comment": "First-party API $/MTok for audit.mjs. Re-verify against the source when a model ships or audit.mjs warns: an unpriced model, or a cost-state cross-check Δ over 5%.",
+  "verified": "2026-10-08",
+  "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+  "webSearchPer1k": 10,
+  "models": {
+    "claude-fable-5-1": { "input": 10, "output": 50, "cacheWrite5m": 12.5, "cacheWrite1h": 20, "cacheRead": 0.25 },
+    "claude-opus-5-5": { "input": 4, "output": 20, "cacheWrite5m": 5, "cacheWrite1h": 8, "cacheRead": 0.2 },
+    "claude-opus-5": { "input": 5, "output": 25, "cacheWrite5m": 6.25, "cacheWrite1h": 10, "cacheRead": 0.5 },
+    "claude-sonnet-5-5": { "input": 2, "output": 10, "cacheWrite5m": 2.5, "cacheWrite1h": 4, "cacheRead": 0.1 },
+    "claude-sonnet-5": { "input": 2, "output": 10, "cacheWrite5m": 2.5, "cacheWrite1h": 4, "cacheRead": 0.2 },
+    "claude-haiku-4-5": { "input": 1, "output": 5, "cacheWrite5m": 1.25, "cacheWrite1h": 2, "cacheRead": 0.1 }
+  }
+}

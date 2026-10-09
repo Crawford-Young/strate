@@ -9,6 +9,7 @@
 //! batch is re-delivered, and re-ingesting it writes no duplicates (events
 //! are unique on `uuid`, else on file + byte offset).
 
+mod account;
 mod group;
 mod ingest;
 mod migrate;
@@ -67,6 +68,10 @@ impl Store {
         if version == 1 {
             store.regroup_all()?;
         }
+        // A store from before v3, or priced with another price list.
+        let tx = store.transaction()?;
+        account::refresh(&tx.tx)?;
+        tx.commit()?;
         Ok(store)
     }
 
@@ -253,9 +258,11 @@ impl Ingest<'_> {
     /// Writes a batch's events and checkpoint into this transaction, then
     /// regroups the batch's session: its name segments and workstream, its
     /// subagents' segments, and its process root's continuation edges.
-    /// Grouping is a function of the stored events, so batches in any order
-    /// converge to a cold build. A subagent that only a graph has added gets
-    /// its segment at its session's next batch.
+    /// Then it recomputes the cost, time and context rollups of that
+    /// session and of any session sharing one of the batch's requests.
+    /// Grouping and rollups are functions of the stored events, so batches
+    /// in any order converge to a cold build. A subagent that only a graph
+    /// has added gets its segment at its session's next batch.
     pub fn batch(&self, batch: &Batch) -> Result<()> {
         ingest::batch(&self.tx, batch)
     }
@@ -326,6 +333,68 @@ mod tests {
             )
             .expect("grouped");
         assert_eq!(row, ("demo-1".into(), "root".into(), "/work/x".into()));
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn opening_a_v2_store_accounts_it_and_a_new_price_list_reaccounts() {
+        let dir = test_dir("store-v2-upgrade");
+        let db = dir.join("strate.db");
+        let mut v2 = Connection::open(&db).expect("v2 db");
+        migrate::migrate(&mut v2, &migrate::MIGRATIONS[..2]).expect("v2");
+        v2.execute_batch(
+            r#"INSERT INTO sessions (session_id, path) VALUES ('s1', '/p/s1.jsonl');
+               INSERT INTO agents (session_id, kind) VALUES ('s1', 'orchestrator');
+               INSERT INTO events (session_id, type, uuid, timestamp, file, byte_offset, raw)
+               VALUES ('s1', 'user', 'u1', '2026-10-03T10:00:00.000Z', '/p/s1.jsonl', 0,
+                       '{"type":"user","message":{"content":"Lorem."}}'),
+                      ('s1', 'assistant', 'u2', '2026-10-03T10:00:30.000Z', '/p/s1.jsonl', 50,
+                       '{"type":"assistant","requestId":"req_1","message":{"model":"claude-haiku-4-5",
+                         "usage":{"input_tokens":1000,"output_tokens":200}}}');"#,
+        )
+        .expect("v2 rows");
+        drop(v2);
+
+        let rollup = |store: &Store| -> (f64, i64, i64) {
+            store
+                .conn
+                .query_row(
+                    "SELECT s.cost_usd, s.run_ms, a.context_tokens FROM sessions AS s
+                     JOIN agents AS a ON a.session_id = s.session_id",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .expect("rollup")
+        };
+        let store = Store::open(&db).expect("upgrade");
+        // haiku: (1000 * 1 + 200 * 5) / 1e6 = $0.002; records 30 s apart;
+        // depth 1000 input.
+        let (usd, run_ms, depth) = rollup(&store);
+        assert!((usd - 0.002).abs() < 1e-12, "{usd}");
+        assert_eq!((run_ms, depth), (30_000, 1000));
+
+        // Priced with another list: open re-accounts.
+        store
+            .conn
+            .execute_batch(
+                "UPDATE meta SET value = 'stale' WHERE key = 'prices';
+                 UPDATE events SET cost_usd = 99 WHERE cost_usd IS NOT NULL;
+                 UPDATE sessions SET cost_usd = 99;",
+            )
+            .expect("stale");
+        drop(store);
+        let store = Store::open(&db).expect("reopen");
+        assert!((rollup(&store).0 - 0.002).abs() < 1e-12);
+
+        // At the current list, open leaves the rollups alone.
+        store
+            .conn
+            .execute("UPDATE sessions SET cost_usd = 99", [])
+            .expect("marker");
+        drop(store);
+        let store = Store::open(&db).expect("reopen");
+        assert_eq!(rollup(&store).0, 99.0);
         drop(store);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
