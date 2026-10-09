@@ -30,3 +30,32 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  # crates/strate-core/data/prices.json is vendored byte-for-byte from claude-config.
+  prices-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: Crawford-Young/claude-config
+          ref: main
+          path: claude-config
+      - run: cmp crates/strate-core/data/prices.json claude-config/scripts/prices.json
+
+  # cargo test compares strate to the committed audit.mjs golden; this re-runs
+  # audit.mjs live so its drift surfaces. Node runs nothing else.
+  audit-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: Crawford-Young/claude-config
+          ref: main
+          path: claude-config
+      - uses: actions/setup-node@v7
+        with:
+          node-version: lts/*
+      - run: node claude-config/scripts/audit.mjs --root crates/strate-core/tests/fixtures/cost-home/projects --json > audit.json
+      - run: node crates/strate-core/tests/fixtures/audit-golden.mjs --check crates/strate-core/tests/fixtures/audit-golden.json audit.json
