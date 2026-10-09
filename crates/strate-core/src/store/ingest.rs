@@ -122,7 +122,7 @@ fn ensure_owner(conn: &Connection, owner: &Owner, file: &str) -> Result<i64> {
 }
 
 /// A session is a stub until its own transcript (`path`) has been seen.
-fn upsert_session(
+pub(super) fn upsert_session(
     conn: &Connection,
     session_id: &str,
     project_dir: Option<&str>,
@@ -139,7 +139,7 @@ fn upsert_session(
     Ok(())
 }
 
-fn ensure_agent(
+pub(super) fn ensure_agent(
     conn: &Connection,
     session_id: &str,
     agent_id: Option<&str>,
@@ -214,6 +214,16 @@ fn record(
         ])? > 0;
     if !inserted {
         return Ok(None);
+    }
+    // A record written after a PermissionRequest hook: the agent moved on.
+    if let Some(timestamp) = text("timestamp") {
+        conn.prepare_cached(
+            "UPDATE agents SET hook_waiting_for = NULL,
+                 hook_state = CASE WHEN agent_id IS NULL THEN NULL ELSE 'running' END
+             WHERE id = ?1 AND hook_state = 'needs_you'
+               AND unixepoch(?2, 'subsec') * 1000 > hook_at_ms",
+        )?
+        .execute(params![agent, timestamp])?;
     }
     if owner.agent_id.is_none()
         && let Some(root) = text("session_id")
