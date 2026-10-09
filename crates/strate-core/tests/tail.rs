@@ -75,7 +75,8 @@ fn notify_only() -> TailOptions {
 }
 
 /// Receives batches until `done` holds for the events so far, handing each
-/// batch to `on_batch` first.
+/// batch to `on_batch` first. [`TailEvent::CaughtUp`] is left out of the
+/// events (`caught_up_follows_the_initial_scan_once` covers it).
 fn collect_until(
     rx: &Receiver<Batch>,
     mut on_batch: impl FnMut(&Batch),
@@ -88,7 +89,12 @@ fn collect_until(
         match rx.recv_timeout(left) {
             Ok(batch) => {
                 on_batch(&batch);
-                events.extend(batch.events);
+                events.extend(
+                    batch
+                        .events
+                        .into_iter()
+                        .filter(|e| !matches!(e, TailEvent::CaughtUp)),
+                );
             }
             Err(e) => panic!("{e}; got so far: {events:?}"),
         }
@@ -146,8 +152,58 @@ fn restart_reads_only_the_appended_bytes() {
     assert_eq!(ns(&events, &session), vec![3, 4]);
     assert_eq!(tailer.bytes_read(), appended.len() as u64);
     tailer.stop();
-    let late: Vec<Batch> = rx.try_iter().collect();
+    let late: Vec<Batch> = rx
+        .try_iter()
+        .filter(|b| b.events != [TailEvent::CaughtUp])
+        .collect();
     assert!(late.is_empty(), "nothing else emitted: {late:?}");
+}
+
+#[test]
+fn caught_up_follows_the_initial_scan_once() {
+    let root = Root::new("caught-up");
+    let session = root.write(SESSION, &lines(0..3));
+    root.write(SUBAGENT, &lines(10..12));
+    let (tailer, rx) = Tailer::start(root.path(), Offsets::new(), notify_only()).expect("start");
+
+    // Every record of the initial scan comes first, then one batch holding
+    // only CaughtUp: from the root, moving no offset.
+    let deadline = Instant::now() + PATIENCE;
+    let mut records = 0;
+    let caught_up = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let batch = rx.recv_timeout(left).expect("CaughtUp within patience");
+        if batch.events.contains(&TailEvent::CaughtUp) {
+            break batch;
+        }
+        records += record_count(&batch.events);
+    };
+    assert_eq!(records, 5);
+    assert_eq!(caught_up.events, vec![TailEvent::CaughtUp]);
+    assert_eq!(
+        *caught_up.path,
+        *std::path::absolute(root.path()).expect("absolute")
+    );
+    assert_eq!(caught_up.checkpoint, None);
+
+    // Later appends and rescans never repeat it.
+    append(&session, &lines(3..4));
+    let mut later = Vec::new();
+    while record_count(&later) < 1 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        later.extend(rx.recv_timeout(left).expect("the append").events);
+    }
+    tailer.stop();
+    later.extend(rx.try_iter().flat_map(|b| b.events));
+    assert!(!later.contains(&TailEvent::CaughtUp), "{later:?}");
+}
+
+#[test]
+fn caught_up_arrives_for_a_root_with_no_projects_yet() {
+    let root = Root::new("caught-up-empty");
+    let (_tailer, rx) = Tailer::start(root.path(), Offsets::new(), notify_only()).expect("start");
+    let batch = rx.recv_timeout(PATIENCE).expect("a batch");
+    assert_eq!(batch.events, vec![TailEvent::CaughtUp]);
 }
 
 /// Folds each batch's checkpoint into `offsets`, as a consumer would store it.
@@ -259,7 +315,10 @@ fn only_transcripts_are_read_never_credentials_or_sessions() {
         let (TailEvent::Record { path, .. }
         | TailEvent::Malformed { path, .. }
         | TailEvent::Reset { path, .. }
-        | TailEvent::Error { path, .. }) = e;
+        | TailEvent::Error { path, .. }) = e
+        else {
+            continue;
+        };
         assert!(transcripts.iter().any(|t| **path == *t), "{e:?}");
     }
 }

@@ -76,7 +76,7 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
                 conn.prepare_cached("DELETE FROM events WHERE file = ?1 AND uuid IS NULL")?
                     .execute([&file])?;
             }
-            TailEvent::Malformed { .. } | TailEvent::Error { .. } => {}
+            TailEvent::Malformed { .. } | TailEvent::Error { .. } | TailEvent::CaughtUp => {}
         }
     }
     group::sessions(conn, [owner.session_id.as_str()])?;

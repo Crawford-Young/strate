@@ -66,6 +66,11 @@ pub enum TailEvent {
     },
     /// The file could not be read.
     Error { path: Arc<Path>, message: String },
+    /// The initial scan is done: every transcript was read up to its size
+    /// when the scan reached it. Sent once per [`Tailer`], alone in a batch
+    /// whose `path` is the root and whose checkpoint is `None`; later
+    /// batches are live appends.
+    CaughtUp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
