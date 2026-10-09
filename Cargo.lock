@@ -3047,6 +3047,7 @@ dependencies = [
  "file-id",
  "notify",
  "rusqlite",
+ "serde",
  "serde_json",
 ]
 

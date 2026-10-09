@@ -12,6 +12,7 @@
 mod account;
 mod group;
 mod ingest;
+mod live;
 mod migrate;
 
 use std::path::Path;
@@ -20,6 +21,8 @@ use rusqlite::types::Type;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
 
 use crate::discovery::Graph;
+use crate::hooks::Hook;
+use crate::registry::RegistryEvent;
 use crate::tail::{Batch, Checkpoint, FileIdentity, Offsets};
 
 pub type Result<T> = rusqlite::Result<T>;
@@ -171,6 +174,27 @@ impl Store {
             0 => Err(rusqlite::Error::QueryReturnedNoRows),
             _ => Ok(()),
         }
+    }
+
+    /// Applies registry poll events in one transaction: each entry's row in
+    /// `registry` (a session it names gets a stub session and orchestrator
+    /// until its transcript arrives), and the orchestrator's
+    /// `registry_name` and `registry_state`. Error events change nothing.
+    pub fn apply_registry(&mut self, events: &[RegistryEvent]) -> Result<()> {
+        let tx = self.transaction()?;
+        for event in events {
+            live::registry(&tx.tx, event)?;
+        }
+        tx.commit()
+    }
+
+    /// Applies one hook event: creates the session, orchestrator and agent
+    /// rows it names when missing (merging with later discovery and tail
+    /// ingest), and sets the agent's `hook_state`.
+    pub fn apply_hook(&mut self, hook: &Hook) -> Result<()> {
+        let tx = self.transaction()?;
+        live::hook(&tx.tx, hook)?;
+        tx.commit()
     }
 
     /// Rebuilds the workstream grouping of every stored session from the

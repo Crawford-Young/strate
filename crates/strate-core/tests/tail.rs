@@ -379,3 +379,35 @@ fn fifty_megabytes_ingest_in_the_background_with_bounded_buffering() {
         "the consumer never had to wait, so never proved it was free"
     );
 }
+
+#[test]
+fn a_new_subagent_transcript_arrives_within_a_second_with_default_options() {
+    let root = Root::new("subagent-latency");
+    root.write(SESSION, &lines(0..1));
+    let (tailer, rx) =
+        Tailer::start(root.path(), Offsets::new(), TailOptions::default()).expect("start");
+    collect_until(&rx, |_| {}, |e| record_count(e) == 1);
+
+    // Each in a fresh session dir, so `subagents/` itself is new each time.
+    for n in 0..3 {
+        let dir = format!("projects/-work-demo/s-late-{n}/subagents");
+        let started = Instant::now();
+        root.write(
+            &format!("{dir}/agent-a{n}.meta.json"),
+            r#"{"agentType":"implementer","description":"Lorem ipsum","toolUseId":"toolu_x"}"#,
+        );
+        let transcript = root.write(&format!("{dir}/agent-a{n}.jsonl"), &lines(0..1));
+        let batch = loop {
+            let left = Duration::from_secs(1).saturating_sub(started.elapsed());
+            let batch = rx
+                .recv_timeout(left)
+                .unwrap_or_else(|e| panic!("subagent {n}: no batch within 1 s ({e})"));
+            if *batch.path == *transcript {
+                break batch;
+            }
+        };
+        assert_eq!(ns(&batch.events, &transcript), vec![0]);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+    tailer.stop();
+}
