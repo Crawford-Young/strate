@@ -8,6 +8,7 @@ pub mod discovery;
 pub mod github;
 pub mod hooks;
 pub mod names;
+mod proc;
 pub mod registry;
 pub mod store;
 pub mod tail;

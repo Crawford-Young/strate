@@ -10,15 +10,17 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io::{self, Read};
+use std::io;
 use std::panic::resume_unwind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender, bounded, select, tick};
 use serde::Deserialize;
+
+use crate::proc::{self, run};
 
 /// One entry of `claude agents --json --all`. Every entry has `cwd`, `kind`
 /// and `startedAt`; a background session adds `id` and `state`, a live one
@@ -185,56 +187,13 @@ pub fn resolve_claude(
 const RUN_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn command(program: &Path) -> Command {
-    let mut command = Command::new(program);
-    command
-        .args(["agents", "--json", "--all"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW: no console flashes up once a second.
-        command.creation_flags(0x0800_0000);
-    }
-    command
+    proc::command(program, ["agents", "--json", "--all"], Stdio::null())
 }
 
 /// A [`Runner`] that spawns `program agents --json --all`, killing a run
 /// that outlasts 10 s. A non-zero exit is an error.
 pub fn cli_runner(program: PathBuf) -> Runner {
     Box::new(move || run(command(&program), RUN_TIMEOUT))
-}
-
-fn run(mut command: Command, timeout: Duration) -> io::Result<Vec<u8>> {
-    let mut child = command.spawn()?;
-    let mut stdout = child.stdout.take().expect("stdout is piped");
-    // Drained on its own thread so a full pipe cannot stall the child.
-    let reader = thread::spawn(move || {
-        let mut out = Vec::new();
-        stdout.read_to_end(&mut out).map(|_| out)
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("no answer within {timeout:?}"),
-            ));
-        }
-        thread::sleep(Duration::from_millis(5));
-    };
-    let out = reader.join().unwrap_or_else(|panic| resume_unwind(panic))?;
-    if status.success() {
-        Ok(out)
-    } else {
-        Err(io::Error::other(format!("exited with {status}")))
-    }
 }
 
 /// A running poller. Dropping it stops the worker, as
@@ -364,6 +323,8 @@ fn diff(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
 
     #[test]

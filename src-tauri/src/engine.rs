@@ -1,6 +1,6 @@
 //! The ingest engine: one background thread that owns the [`Store`] writer
-//! and feeds it from the tailer, the registry poller and, when opted in,
-//! the hook receiver.
+//! and feeds it from the tailer, the registry poller, on-request GitHub
+//! fetches and, when opted in, the hook receiver.
 //!
 //! rusqlite connections are not `Sync`, so the writer never leaves this
 //! thread; commands read through their own read-only connection, which WAL
@@ -16,11 +16,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender, bounded, never, select};
 use serde::Serialize;
 use strate_core::discovery::{Link, discover};
+use strate_core::github::{self, Fetched, Target};
 use strate_core::hooks::{Hook, HookOptions, HookReceiver};
 use strate_core::registry::{PollOptions, RegistryEvent, RegistryPoller, Runner};
 use strate_core::store::Store;
@@ -40,6 +41,9 @@ pub struct Config {
     pub db: PathBuf,
     /// Runs `claude agents --json --all`; `None` leaves the registry off.
     pub registry: Option<Runner>,
+    /// Runs `gh` for [`Refresher::request`]; `None` leaves GitHub off and
+    /// drops requests.
+    pub github: Option<github::Runner>,
     pub poll: PollOptions,
     /// `Some` starts the hook receiver (opt-in).
     pub hooks: Option<HookOptions>,
@@ -87,7 +91,23 @@ pub struct Engine {
     stop: Option<Sender<()>>,
     worker: Option<JoinHandle<()>>,
     progress: Arc<Progress>,
+    refresher: Refresher,
     hook_addr: Option<SocketAddr>,
+}
+
+/// Asks the engine to refresh the GitHub cache. Cheap to clone and safe to
+/// call from any thread.
+#[derive(Debug, Clone)]
+pub struct Refresher(Sender<()>);
+
+impl Refresher {
+    /// Requests a refresh and returns at once. A request made while one is
+    /// pending or running coalesces into it; one made after the engine
+    /// stopped is dropped. Nothing here can fail: GitHub trouble is stored
+    /// per repo, never raised.
+    pub fn request(&self) {
+        let _coalesced_or_stopped = self.0.try_send(());
+    }
 }
 
 impl Engine {
@@ -115,15 +135,26 @@ impl Engine {
             }
             None => (None, never()),
         };
+        let (fetcher, fetched) = match config.github {
+            Some(runner) => {
+                let (jobs, fetched) = spawn_fetcher(runner)?;
+                (Some(jobs), fetched)
+            }
+            None => (None, never()),
+        };
+        let (request, refresh) = bounded(1);
         let hook_addr = receiver.as_ref().map(HookReceiver::local_addr);
         let progress = Arc::new(Progress::default());
         let (stop, stop_rx) = bounded(0);
         let ingest = Ingest {
             root,
+            db: config.db,
             store,
             progress: progress.clone(),
             notify: Throttle::new(config.debounce),
             discovery: Discovery::new(config.rediscover_after),
+            fetcher,
+            fetching: false,
             on_change,
         };
         let sources = Sources {
@@ -133,6 +164,8 @@ impl Engine {
             batches,
             registry,
             hooks,
+            refresh,
+            fetched,
             stop: stop_rx,
         };
         let worker = thread::Builder::new()
@@ -142,12 +175,18 @@ impl Engine {
             stop: Some(stop),
             worker: Some(worker),
             progress,
+            refresher: Refresher(request),
             hook_addr,
         })
     }
 
     pub fn progress(&self) -> Arc<Progress> {
         self.progress.clone()
+    }
+
+    /// The handle that requests a GitHub refresh.
+    pub fn refresher(&self) -> Refresher {
+        self.refresher.clone()
     }
 
     /// Where the hook receiver listens; `None` when it is off.
@@ -180,7 +219,37 @@ struct Sources {
     batches: Receiver<Batch>,
     registry: Receiver<RegistryEvent>,
     hooks: Receiver<Hook>,
+    refresh: Receiver<()>,
+    fetched: Receiver<Vec<Fetched>>,
     stop: Receiver<()>,
+}
+
+/// The fetch thread's ends: jobs in, fetched repos out.
+type Fetcher = (Sender<Vec<Target>>, Receiver<Vec<Fetched>>);
+
+/// Runs `runner` on its own thread, so a slow `gh` never holds up the
+/// engine thread. Jobs go in one at a time (the engine sends none while one
+/// is out). The thread ends when the engine drops the jobs channel, after
+/// the fetch in flight; it is not joined, so stopping never waits on `gh`.
+fn spawn_fetcher(mut runner: github::Runner) -> io::Result<Fetcher> {
+    let (jobs, queue) = bounded::<Vec<Target>>(1);
+    let (done, fetched) = bounded(1);
+    thread::Builder::new()
+        .name("strate-github".into())
+        .spawn(move || {
+            for targets in queue {
+                if done.send(github::fetch_all(&mut runner, &targets)).is_err() {
+                    break;
+                }
+            }
+        })?;
+    Ok((jobs, fetched))
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 impl Sources {
@@ -286,19 +355,26 @@ impl Discovery {
 
 struct Ingest<F> {
     root: PathBuf,
+    db: PathBuf,
     store: Store,
     progress: Arc<Progress>,
     notify: Throttle,
     discovery: Discovery,
+    /// Feeds the GitHub fetch thread; `None` with GitHub off.
+    fetcher: Option<Sender<Vec<Target>>>,
+    /// A fetch is out: requests coalesce into it.
+    fetching: bool,
     on_change: F,
 }
 
 impl<F: FnMut()> Ingest<F> {
     fn run(mut self, sources: Sources) {
-        let (mut batches, mut registry, mut hooks) = (
+        let (mut batches, mut registry, mut hooks, mut refresh, mut fetched) = (
             sources.batches.clone(),
             sources.registry.clone(),
             sources.hooks.clone(),
+            sources.refresh.clone(),
+            sources.fetched.clone(),
         );
         loop {
             let now = Instant::now();
@@ -323,6 +399,17 @@ impl<F: FnMut()> Ingest<F> {
                 recv(hooks) -> hook => match hook {
                     Ok(hook) => self.hook(&hook),
                     Err(_) => hooks = never(),
+                },
+                recv(refresh) -> request => match request {
+                    Ok(()) => self.refresh(),
+                    Err(_) => refresh = never(),
+                },
+                recv(fetched) -> done => match done {
+                    Ok(fetched) => self.fetched(&fetched),
+                    Err(_) => {
+                        self.fetching = false;
+                        fetched = never();
+                    }
                 },
                 default(wait) => {}
             }
@@ -373,6 +460,34 @@ impl<F: FnMut()> Ingest<F> {
         match self.store.apply_hook(hook) {
             Ok(()) => self.notify.mark(),
             Err(e) => eprintln!("strate: hook update failed: {e}"),
+        }
+    }
+
+    /// Hands the fetch thread the repos of the stored windows, unless it is
+    /// busy (the request coalesces) or GitHub is off.
+    fn refresh(&mut self) {
+        let Some(fetcher) = &self.fetcher else {
+            return;
+        };
+        if self.fetching {
+            return;
+        }
+        let targets = Store::open_reader(&self.db)
+            .and_then(|reader| github::window_slugs(&reader))
+            .and_then(|slugs| github::targets(&self.store, &slugs));
+        match targets {
+            Ok(targets) if targets.is_empty() => {}
+            Ok(targets) => self.fetching = fetcher.send(targets).is_ok(),
+            Err(e) => eprintln!("strate: reading the repos to fetch failed: {e}"),
+        }
+    }
+
+    /// Stores a finished fetch: new rows, or the error per failed repo.
+    fn fetched(&mut self, fetched: &[Fetched]) {
+        self.fetching = false;
+        match github::store_fetched(&mut self.store, fetched, now_ms()) {
+            Ok(()) => self.notify.mark(),
+            Err(e) => eprintln!("strate: storing GitHub failed: {e}"),
         }
     }
 

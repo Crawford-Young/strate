@@ -7,10 +7,12 @@
 //! sends the same variable). strate never edits Claude Code's settings.
 
 use std::ffi::OsString;
+use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use strate_core::discovery::resolve_config_dir;
+use strate_core::github::{self, resolve_gh};
 use strate_core::hooks::HookOptions;
 use strate_core::registry::{PollOptions, cli_runner, resolve_claude};
 use strate_core::tail::TailOptions;
@@ -31,6 +33,8 @@ pub struct Settings {
     pub root: PathBuf,
     /// The `claude` binary; `None` leaves the registry off.
     pub claude: Option<PathBuf>,
+    /// The `gh` binary; `None` makes every refresh record a per-repo error.
+    pub gh: Option<PathBuf>,
     /// `Some` when the hook receiver is opted in.
     pub hooks: Option<HookOptions>,
 }
@@ -45,6 +49,7 @@ impl Settings {
         Ok(Self {
             root,
             claude: resolve_claude(None, env("PATH"), home),
+            gh: resolve_gh(env("PATH")),
             hooks: hook_options(env(HOOK_PORT), env(HOOK_TOKEN))?,
         })
     }
@@ -55,6 +60,7 @@ impl Settings {
             root: self.root,
             db,
             registry: self.claude.map(cli_runner),
+            github: Some(self.gh.map_or_else(missing_gh, github::cli_runner)),
             poll: PollOptions::default(),
             hooks: self.hooks,
             tail: TailOptions::default(),
@@ -62,6 +68,17 @@ impl Settings {
             rediscover_after: REDISCOVER_AFTER,
         }
     }
+}
+
+/// The runner when `gh` is not installed: every call fails, so a refresh
+/// records the error per repo instead of silently doing nothing.
+fn missing_gh() -> github::Runner {
+    Box::new(|_| {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "gh not found on PATH",
+        ))
+    })
 }
 
 fn hook_options(
@@ -154,12 +171,18 @@ mod tests {
         let settings = Settings {
             root: PathBuf::from("/cfg"),
             claude: None,
+            gh: None,
             hooks: None,
         };
         let config = settings.engine(PathBuf::from("/data/strate.db"));
         assert_eq!(config.debounce, Duration::from_millis(250));
         assert_eq!(config.poll.every, Duration::from_secs(1));
         assert!(config.registry.is_none());
+        let mut gh = config
+            .github
+            .expect("always on, so a refresh records its error");
+        let err = gh(&[]).expect_err("no gh");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert_eq!(config.db, PathBuf::from("/data/strate.db"));
     }
 }

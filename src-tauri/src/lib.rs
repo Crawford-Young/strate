@@ -22,6 +22,8 @@ pub fn run() {
             commands::workstream_costs,
             commands::needs_you,
             commands::live_graph,
+            commands::audit_rollup,
+            commands::audit_refresh,
         ])
         .setup(|app| {
             let data = app.path().app_data_dir()?;
@@ -34,6 +36,7 @@ pub fn run() {
                 let _gone = handle.emit(STORE_CHANGED, ());
             })?;
             app.manage(engine.progress());
+            app.manage(engine.refresher());
             app.manage(Reader::open(&db)?);
             app.manage(Running(Mutex::new(Some(engine))));
             Ok(())
