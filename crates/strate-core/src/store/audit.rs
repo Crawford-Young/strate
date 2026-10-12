@@ -20,11 +20,13 @@
 //! timeline, so they are additive from Session up. An Agent node shows its
 //! own active and waiting time, which is not summed into its session, since
 //! its agents run in parallel. Elapsed and epic progress are per level.
+//! Cells with no activity, requests or subagent run (a window sitting open
+//! overnight) are left out, so they put no node on a day.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use super::Result;
@@ -59,8 +61,8 @@ pub struct AuditFilter {
 #[serde(rename_all = "snake_case")]
 pub enum NodeKind {
     Root,
-    /// A value of the group-by: a day, `<repo>#<pr>`, an agent type or a
-    /// model (`""`: none).
+    /// A value of the group-by: a day, `<repo>#<pr>` (the PR's own repo), an
+    /// agent type or a model (`""`: none).
     Group,
     Repo,
     Unlinked,
@@ -135,15 +137,19 @@ pub struct AuditNode {
     pub children: Vec<AuditNode>,
 }
 
-/// The closed issues and merged PRs with work in the filter, over the
-/// hierarchy whatever the group-by.
+/// The issues closed as completed and the merged PRs with work in the
+/// filter, whatever the group-by.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Headline {
     pub issues_closed: i64,
+    /// Over each issue's whole life, first window ever to close, even when
+    /// the filter holds only part of it.
     pub median_elapsed_ms: Option<i64>,
-    /// Their $ over their count.
+    /// Their $ in the filter over their count.
     pub usd_per_closed_issue: Option<f64>,
+    /// Their $ in the filter over their count; a PR closing several issues
+    /// counts once.
     pub usd_per_merged_pr: Option<f64>,
     /// Cloud sessions are not in the store (#29), so their spend is missing.
     pub cloud_uncounted: bool,
@@ -154,6 +160,16 @@ pub struct Headline {
 pub struct Audit {
     pub root: AuditNode,
     pub headline: Headline,
+    /// The repos whose GitHub data is missing or stale: their issues show
+    /// no title, epic or PR.
+    pub github_errors: Vec<GithubError>,
+}
+
+/// A repo (slug) whose latest GitHub refresh failed, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GithubError {
+    pub repo: String,
+    pub error: String,
 }
 
 /// The rollup tree and headline for `filter`. Fails on a day that is not
@@ -161,27 +177,33 @@ pub struct Audit {
 pub fn audit(conn: &Connection, filter: &AuditFilter) -> Result<Audit> {
     let gh = Gh::load(conn)?;
     let cells = Cells::load(conn, &gh, filter)?;
-    let hierarchy = |atom: &Atom| path(atom, &cells.windows.list[atom.window], &gh, &cells.agents);
-    let mut tally = Tally::default();
     let mut tree = Node::root();
     for atom in &cells.atoms {
-        tree.insert(hierarchy(atom), &atom.share);
-    }
-    let mut root = tree.finish(&mut tally).0;
-    if filter.group_by != GroupBy::Hierarchy {
-        let mut tree = Node::root();
-        for atom in &cells.atoms {
-            let window = &cells.windows.list[atom.window];
-            let mut steps = vec![group(filter.group_by, atom, window, &cells.agents)];
-            steps.extend(hierarchy(atom));
-            tree.insert(steps, &atom.share);
+        let window = &cells.windows.list[atom.window];
+        let mut steps = Vec::with_capacity(7);
+        if filter.group_by != GroupBy::Hierarchy {
+            steps.push(group(filter.group_by, atom, window, &gh, &cells.agents));
         }
-        root = tree.finish(&mut Tally::default()).0;
+        steps.extend(path(atom, window, &gh, &cells.agents));
+        tree.insert(steps, &atom.share);
     }
     Ok(Audit {
-        root,
-        headline: tally.headline(),
+        root: tree.finish().0,
+        headline: headline(conn, &gh, &cells)?,
+        github_errors: github_errors(conn)?,
     })
+}
+
+/// Every repo whose latest GitHub refresh failed, whatever the filter.
+fn github_errors(conn: &Connection) -> Result<Vec<GithubError>> {
+    conn.prepare_cached("SELECT slug, error FROM gh_repos WHERE error IS NOT NULL ORDER BY slug")?
+        .query_map([], |r| {
+            Ok(GithubError {
+                repo: r.get(0)?,
+                error: r.get(1)?,
+            })
+        })?
+        .collect()
 }
 
 /// The cells in a filter, with the windows and subagents they belong to.
@@ -193,21 +215,32 @@ struct Cells {
 
 impl Cells {
     /// Cells come in day order, the orchestrator's first, so a window or
-    /// subagent counts on its first cell in the filter.
+    /// subagent counts on its first cell in the filter. Idle-only cells are
+    /// left out: they add nothing, and would show a window on a day it only
+    /// sat open.
     fn load(conn: &Connection, gh: &Gh, filter: &AuditFilter) -> Result<Self> {
         let (from, to) = (day(&filter.from)?, day(&filter.to)?);
         let mut out = Self {
             atoms: Vec::new(),
-            windows: Windows::default(),
-            agents: HashMap::new(),
+            windows: Windows {
+                named: Named::load_all(conn, from, to)?,
+                ..Windows::default()
+            },
+            agents: Agent::load_all(conn, from, to)?,
         };
         let mut seen_windows: HashSet<usize> = HashSet::new();
         let mut seen_agents: HashSet<(String, String)> = HashSet::new();
+        // A cell with a NULL day (a request with no usable timestamp) is in
+        // no range: `day BETWEEN` is never true for NULL.
         let mut stmt = conn.prepare_cached(
             "SELECT session_id, agent_id, segment_id, day, model, wall_ms, active_ms, wait_ms,
                  cost_usd, unpriced, input_tokens, output_tokens, cache_read_tokens,
                  cache_write_tokens
              FROM audit_cells WHERE day BETWEEN ?1 AND ?2
+                 AND NOT (active_ms = 0 AND wait_ms = 0 AND cost_usd IS NULL AND unpriced = 0
+                     AND input_tokens + output_tokens + cache_read_tokens
+                         + cache_write_tokens = 0
+                     AND (agent_id IS NULL OR wall_ms = 0))
              ORDER BY day, agent_id IS NOT NULL, agent_id, session_id, segment_id, model, id",
         )?;
         let mut rows = stmt.query([from, to])?;
@@ -234,12 +267,10 @@ impl Cells {
                 None => share.line = share.own,
                 Some(agent_id) => {
                     let key = (session_id.clone(), agent_id.clone());
-                    let agent = match out.agents.entry(key.clone()) {
-                        Entry::Occupied(found) => found.into_mut(),
-                        Entry::Vacant(slot) => {
-                            slot.insert(Agent::load(conn, &session_id, agent_id)?)
-                        }
-                    };
+                    let agent = out
+                        .agents
+                        .entry(key.clone())
+                        .or_insert_with(|| Agent::unknown(agent_id));
                     share.agent_ms = r.get(5)?;
                     share.approximate = agent.background;
                     share.agents = seen_agents.insert(key).into();
@@ -305,11 +336,16 @@ struct GhIssue {
     title: String,
     /// `Some` once closed; the time is `None` if GitHub gave none.
     closed: Option<Option<i64>>,
+    /// Closed as completed (`stateReason`), not as not planned or a
+    /// duplicate: only these count in the headline.
+    completed: bool,
     parent: Option<i64>,
     progress: Option<Progress>,
 }
 
 struct GhPr {
+    /// The PR's own repo slug, from its URL; else the issue's.
+    repo: String,
     number: i64,
     state: String,
     merged_at: Option<i64>,
@@ -321,7 +357,8 @@ impl Gh {
         let at = |s: Option<String>| s.as_deref().and_then(parse_timestamp);
         let issues = conn
             .prepare_cached(
-                "SELECT repo, number, title, state, closed_at, parent, sub_total, sub_completed
+                "SELECT repo, number, title, state, closed_at, parent, sub_total, sub_completed,
+                     state_reason
                  FROM gh_issues",
             )?
             .query_map([], |r| {
@@ -334,6 +371,7 @@ impl Gh {
                     GhIssue {
                         title: r.get(2)?,
                         closed: (state == "CLOSED").then(|| at(closed_at)),
+                        completed: r.get::<_, Option<String>>(8)?.as_deref() == Some("COMPLETED"),
                         parent: r.get(5)?,
                         progress: (total > 0).then_some(Progress { completed, total }),
                     },
@@ -346,13 +384,16 @@ impl Gh {
              ORDER BY repo, issue, number",
         )?;
         for row in stmt.query_map([], |r| {
+            let issue_repo: String = r.get(0)?;
+            let url: String = r.get(5)?;
             Ok((
-                (r.get(0)?, r.get(1)?),
+                (issue_repo.clone(), r.get(1)?),
                 GhPr {
+                    repo: url_repo(&url).map_or(issue_repo, str::to_string),
                     number: r.get(2)?,
                     state: r.get(3)?,
                     merged_at: at(r.get(4)?),
-                    url: r.get(5)?,
+                    url,
                 },
             ))
         })? {
@@ -360,6 +401,23 @@ impl Gh {
             prs.entry(key).or_default().push(pr);
         }
         Ok(Self { issues, prs })
+    }
+
+    /// PR `number` among those closing `repo`#`issue`.
+    fn pr(&self, repo: &str, issue: i64, number: i64) -> Option<&GhPr> {
+        self.prs
+            .get(&(repo.to_string(), issue))?
+            .iter()
+            .find(|p| p.number == number)
+    }
+}
+
+/// The repo name in a `https://github.com/<owner>/<name>/pull/<n>` URL.
+fn url_repo(url: &str) -> Option<&str> {
+    let path = url.strip_prefix("https://")?;
+    match path.split('/').collect::<Vec<_>>()[..] {
+        [_host, _owner, name, "pull", _number] => Some(name),
+        _ => None,
     }
 }
 
@@ -393,6 +451,8 @@ struct Windows {
     list: Vec<Window>,
     index: HashMap<(String, Option<i64>), usize>,
     sessions: HashMap<String, Session>,
+    /// The filter's segments by id, read in one query.
+    named: HashMap<i64, Named>,
 }
 
 impl Windows {
@@ -413,7 +473,15 @@ impl Windows {
             Entry::Occupied(found) => found.into_mut(),
             Entry::Vacant(slot) => slot.insert(Session::load(conn, session_id)?),
         };
-        let named = Named::load(conn, session_id, segment)?;
+        // With no window, the session's id and start.
+        let named = segment
+            .and_then(|id| self.named.remove(&id))
+            .unwrap_or_else(|| Named {
+                name: session_id.to_string(),
+                fallback: true,
+                start: session.start,
+                next: None,
+            });
         let parsed = if named.fallback {
             None
         } else {
@@ -440,6 +508,8 @@ impl Windows {
 struct Session {
     /// Its `github_links`, newest first.
     links: Vec<PrLink>,
+    /// Its first record.
+    start: Option<i64>,
     /// Its last activity: the latest record its timeline counts.
     last: Option<i64>,
 }
@@ -467,22 +537,24 @@ impl Session {
                 })
             })?
             .collect::<Result<_>>()?;
-        let last: Option<String> = conn
+        let (start, last): (Option<String>, Option<String>) = conn
             .prepare_cached(
-                "SELECT max(timestamp) FROM events
-                 WHERE session_id = ?1 AND timestamp IS NOT NULL
-                   AND ifnull(type, '') NOT IN ('custom-title', 'ai-title', 'cost-state')",
+                "SELECT (SELECT started_at FROM sessions WHERE session_id = ?1),
+                     (SELECT max(timestamp) FROM events
+                      WHERE session_id = ?1 AND timestamp IS NOT NULL
+                        AND ifnull(type, '') NOT IN ('custom-title', 'ai-title', 'cost-state'))",
             )?
-            .query_row([session_id], |r| r.get(0))?;
+            .query_row([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(Self {
             links,
+            start: start.as_deref().and_then(parse_timestamp),
             last: last.as_deref().and_then(parse_timestamp),
         })
     }
 }
 
 /// A window's name (merge-resolved) and where it starts and the next one
-/// starts; with no window, the session's id and start.
+/// starts.
 struct Named {
     name: String,
     /// A cwd/branch fallback, not a name the user set.
@@ -492,45 +564,36 @@ struct Named {
 }
 
 impl Named {
-    fn load(conn: &Connection, session_id: &str, segment: Option<i64>) -> Result<Self> {
+    /// Every segment of the sessions with cells on days `from..=to`, by id,
+    /// in one query (one pass over the recursive `workstream_roots`).
+    fn load_all(conn: &Connection, from: &str, to: &str) -> Result<HashMap<i64, Self>> {
         let at = |s: Option<String>| s.as_deref().and_then(parse_timestamp);
-        let found = match segment {
-            Some(id) => conn
-                .prepare_cached(
-                    "SELECT w.name, w.fallback, g.started_at,
-                         (SELECT n.started_at FROM segments AS n
-                          WHERE n.session_id = g.session_id AND n.start_offset > g.start_offset
-                          ORDER BY n.start_offset LIMIT 1)
-                     FROM segments AS g
-                     JOIN workstream_roots AS r ON r.id = g.workstream_id
-                     JOIN workstreams AS w ON w.id = r.root
-                     WHERE g.id = ?1",
-                )?
-                .query_row([id], |r| {
-                    Ok(Self {
-                        name: r.get(0)?,
-                        fallback: r.get(1)?,
-                        start: at(r.get(2)?),
-                        next: at(r.get(3)?),
-                    })
-                })
-                .optional()?,
-            None => None,
-        };
-        if let Some(named) = found {
-            return Ok(named);
-        }
-        let start = conn
-            .prepare_cached("SELECT started_at FROM sessions WHERE session_id = ?1")?
-            .query_row([session_id], |r| r.get(0))
-            .optional()?
-            .flatten();
-        Ok(Self {
-            name: session_id.to_string(),
-            fallback: true,
-            start: at(start),
-            next: None,
-        })
+        conn.prepare_cached(
+            "SELECT g.id, w.name, w.fallback, g.started_at, g.next
+             FROM (
+                 SELECT id, workstream_id, started_at,
+                     lead(started_at) OVER (PARTITION BY session_id ORDER BY start_offset)
+                         AS next
+                 FROM segments
+                 WHERE session_id IN (
+                     SELECT session_id FROM audit_cells WHERE day BETWEEN ?1 AND ?2
+                 )
+             ) AS g
+             JOIN workstream_roots AS r ON r.id = g.workstream_id
+             JOIN workstreams AS w ON w.id = r.root",
+        )?
+        .query_map([from, to], |r| {
+            Ok((
+                r.get(0)?,
+                Self {
+                    name: r.get(1)?,
+                    fallback: r.get(2)?,
+                    start: at(r.get(3)?),
+                    next: at(r.get(4)?),
+                },
+            ))
+        })?
+        .collect()
     }
 }
 
@@ -580,41 +643,63 @@ struct Agent {
 }
 
 impl Agent {
-    fn load(conn: &Connection, session_id: &str, agent_id: &str) -> Result<Self> {
-        let found = conn
-            .prepare_cached(
-                "SELECT coalesce(a.registry_name, a.name, a.description, a.agent_type), a.agent_type,
-                     a.run_ms,
-                     EXISTS (SELECT 1 FROM edges AS d
-                         JOIN agents AS p ON p.id = d.parent
-                         JOIN events AS e ON e.session_id = p.session_id
-                             AND e.agent_id IS p.agent_id AND e.tool_uses IS NOT NULL
-                         JOIN json_each(e.raw, '$.message.content') AS b
-                         WHERE d.child = a.id AND d.kind = 'dispatch'
-                           AND instr(e.tool_uses, d.tool_use_id) > 0
-                           AND CASE WHEN b.type = 'object' THEN
-                               json_extract(b.value, '$.id') = d.tool_use_id
-                               AND json_extract(b.value, '$.input.run_in_background') IS 1
-                           END)
-                 FROM agents AS a WHERE a.session_id = ?1 AND a.agent_id = ?2",
-            )?
-            .query_row(params![session_id, agent_id], |r| {
-                Ok(Self {
-                    label: r
-                        .get::<_, Option<String>>(0)?
-                        .unwrap_or_else(|| agent_id.to_string()),
-                    agent_type: r.get(1)?,
-                    run_ms: r.get(2)?,
-                    background: r.get(3)?,
-                })
-            })
-            .optional()?;
-        Ok(found.unwrap_or(Self {
+    /// Every subagent of the sessions with subagent cells on days
+    /// `from..=to`, by (session, agent id), in one query: each parent
+    /// session's tool_use blocks are read once for the background flags.
+    fn load_all(
+        conn: &Connection,
+        from: &str,
+        to: &str,
+    ) -> Result<HashMap<(String, String), Self>> {
+        conn.prepare_cached(
+            "WITH wanted (session_id) AS (
+                 SELECT DISTINCT session_id FROM audit_cells
+                 WHERE day BETWEEN ?1 AND ?2 AND agent_id IS NOT NULL
+             ),
+             dispatch (child, tool_use_id, parent_session) AS (
+                 SELECT d.child, d.tool_use_id, p.session_id FROM edges AS d
+                 JOIN agents AS c ON c.id = d.child
+                 JOIN agents AS p ON p.id = d.parent
+                 WHERE d.kind = 'dispatch' AND c.session_id IN (SELECT session_id FROM wanted)
+             ),
+             background (id) AS (
+                 SELECT json_extract(b.value, '$.id')
+                 FROM events AS e, json_each(e.raw, '$.message.content') AS b
+                 WHERE e.session_id IN (SELECT parent_session FROM dispatch)
+                   AND e.tool_uses IS NOT NULL AND b.type = 'object'
+                   AND json_extract(b.value, '$.input.run_in_background') IS 1
+             )
+             SELECT a.session_id, a.agent_id,
+                 coalesce(a.registry_name, a.name, a.description, a.agent_type), a.agent_type,
+                 a.run_ms,
+                 EXISTS (SELECT 1 FROM dispatch AS d
+                     WHERE d.child = a.id AND d.tool_use_id IN (SELECT id FROM background))
+             FROM agents AS a
+             WHERE a.session_id IN (SELECT session_id FROM wanted) AND a.agent_id IS NOT NULL",
+        )?
+        .query_map([from, to], |r| {
+            let agent_id: String = r.get(1)?;
+            Ok((
+                (r.get(0)?, agent_id.clone()),
+                Self {
+                    label: r.get::<_, Option<String>>(2)?.unwrap_or(agent_id),
+                    agent_type: r.get(3)?,
+                    run_ms: r.get(4)?,
+                    background: r.get(5)?,
+                },
+            ))
+        })?
+        .collect()
+    }
+
+    /// A subagent with cells but no `agents` row.
+    fn unknown(agent_id: &str) -> Self {
+        Self {
             label: agent_id.to_string(),
             agent_type: None,
             run_ms: None,
             background: false,
-        }))
+        }
     }
 }
 
@@ -718,10 +803,7 @@ fn path(
             }
             steps.push(Step::issue(NodeKind::Issue, gh, repo, *issue));
             if let Some(number) = pr {
-                let found = gh
-                    .prs
-                    .get(&(repo.clone(), *issue))
-                    .and_then(|prs| prs.iter().find(|p| p.number == *number));
+                let found = gh.pr(repo, *issue, *number);
                 let mut step = Step::new(
                     NodeKind::Pr,
                     number.to_string(),
@@ -779,6 +861,7 @@ fn group(
     group_by: GroupBy,
     atom: &Atom,
     window: &Window,
+    gh: &Gh,
     agents: &HashMap<(String, String), Agent>,
 ) -> Step {
     let (key, label) = match group_by {
@@ -802,10 +885,16 @@ fn group(
                 None => (String::new(), "Unknown".into()),
             }
         }
+        // Keyed by the PR's own repo, which may not be the issue's.
         GroupBy::Pr => match &window.place {
             Place::Linked {
-                repo, pr: Some(n), ..
-            } => (format!("{repo}#{n}"), format!("{repo} #{n}")),
+                repo,
+                issue,
+                pr: Some(n),
+            } => {
+                let repo = gh.pr(repo, *issue, *n).map_or(repo, |p| &p.repo);
+                (format!("{repo}#{n}"), format!("{repo} #{n}"))
+            }
             _ => (String::new(), "No PR".into()),
         },
     };
@@ -891,9 +980,8 @@ impl Node {
         m.rotations += s.rotations;
     }
 
-    /// The finished node, its span and whether it is open; closed issues
-    /// and merged PRs go on `tally`.
-    fn finish(self, tally: &mut Tally) -> (AuditNode, Option<(i64, i64)>, bool) {
+    /// The finished node, its span and whether it is open.
+    fn finish(self) -> (AuditNode, Option<(i64, i64)>, bool) {
         let Node {
             step,
             mut metrics,
@@ -903,7 +991,7 @@ impl Node {
         children.sort_by(|a, b| {
             (a.step.kind as u8, &a.step.order).cmp(&(b.step.kind as u8, &b.step.order))
         });
-        let finished: Vec<_> = children.into_iter().map(|c| c.finish(tally)).collect();
+        let finished: Vec<_> = children.into_iter().map(Node::finish).collect();
         let start = finished.iter().filter_map(|f| f.1.map(|s| s.0)).min();
         let end = finished.iter().filter_map(|f| f.1.map(|s| s.1)).max();
         let any_open = finished.iter().any(|f| f.2);
@@ -916,13 +1004,6 @@ impl Node {
         metrics.elapsed_ms = step.elapsed.or(span.map(|(s, e)| (e - s).max(0)));
         metrics.open = open;
         metrics.progress = step.progress;
-        if let End::Closed(_) = step.end {
-            match step.kind {
-                NodeKind::Issue => tally.issues.push((metrics.elapsed_ms, metrics.cost_usd)),
-                NodeKind::Pr => tally.merged.push(metrics.cost_usd),
-                _ => {}
-            }
-        }
         let node = AuditNode {
             kind: step.kind,
             key: step.key,
@@ -935,33 +1016,76 @@ impl Node {
     }
 }
 
-/// The closed issues (elapsed, $) and merged PRs ($) of a hierarchy.
-#[derive(Default)]
-struct Tally {
-    issues: Vec<(Option<i64>, f64)>,
-    merged: Vec<f64>,
-}
-
-impl Tally {
-    fn headline(self) -> Headline {
-        let mut elapsed: Vec<i64> = self.issues.iter().filter_map(|i| i.0).collect();
-        elapsed.sort_unstable();
-        let n = elapsed.len();
-        let median = match n {
+/// The headline over the cells in the filter: each issue closed as
+/// completed and each merged PR that has work there, with that work's $.
+/// An issue's elapsed is its whole life, from its first window ever.
+fn headline(conn: &Connection, gh: &Gh, cells: &Cells) -> Result<Headline> {
+    let mut issues: HashMap<(&str, i64), f64> = HashMap::new();
+    let mut merged: HashMap<(&str, i64), f64> = HashMap::new();
+    for atom in &cells.atoms {
+        let Place::Linked { repo, issue, pr } = &cells.windows.list[atom.window].place else {
+            continue;
+        };
+        let usd = atom.share.cost_usd.unwrap_or(0.0);
+        *issues.entry((repo, *issue)).or_default() += usd;
+        // A PR closing several issues counts once, with all their $.
+        if let Some(pr) = pr.and_then(|n| gh.pr(repo, *issue, n))
+            && pr.merged_at.is_some()
+        {
+            *merged.entry((&pr.repo, pr.number)).or_default() += usd;
+        }
+    }
+    let starts = first_windows(conn)?;
+    let mut elapsed = Vec::new();
+    let mut closed = Vec::new();
+    for ((repo, number), usd) in issues {
+        let key = (repo.to_string(), number);
+        // Closed at a known time, as completed.
+        let closed_at = gh.issues.get(&key).filter(|i| i.completed);
+        let Some(at) = closed_at.and_then(|i| i.closed.flatten()) else {
+            continue;
+        };
+        elapsed.extend(starts.get(&key).map(|start| (at - start).max(0)));
+        closed.push(usd);
+    }
+    elapsed.sort_unstable();
+    let n = elapsed.len();
+    let mean =
+        |usd: Vec<f64>| (!usd.is_empty()).then(|| usd.iter().sum::<f64>() / usd.len() as f64);
+    Ok(Headline {
+        issues_closed: closed.len() as i64,
+        median_elapsed_ms: match n {
             0 => None,
             _ if n % 2 == 1 => Some(elapsed[n / 2]),
             _ => Some((elapsed[n / 2 - 1] + elapsed[n / 2]) / 2),
+        },
+        usd_per_closed_issue: mean(closed),
+        usd_per_merged_pr: mean(merged.into_values().collect()),
+        cloud_uncounted: true,
+    })
+}
+
+/// The start of each issue's first user-named window ever, by (repo, issue).
+fn first_windows(conn: &Connection) -> Result<HashMap<(String, i64), i64>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT w.name, g.started_at FROM segments AS g
+         JOIN workstream_roots AS r ON r.id = g.workstream_id
+         JOIN workstreams AS w ON w.id = r.root
+         WHERE NOT w.fallback AND g.started_at IS NOT NULL",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut first: HashMap<(String, i64), i64> = HashMap::new();
+    while let Some(r) = rows.next()? {
+        let (Some(parsed), Some(start)) = (
+            parse_name(&r.get::<_, String>(0)?),
+            parse_timestamp(&r.get::<_, String>(1)?),
+        ) else {
+            continue;
         };
-        let mean = |costs: &[f64]| {
-            (!costs.is_empty()).then(|| costs.iter().sum::<f64>() / costs.len() as f64)
-        };
-        let issue_costs: Vec<f64> = self.issues.iter().map(|i| i.1).collect();
-        Headline {
-            issues_closed: self.issues.len() as i64,
-            median_elapsed_ms: median,
-            usd_per_closed_issue: mean(&issue_costs),
-            usd_per_merged_pr: mean(&self.merged),
-            cloud_uncounted: true,
-        }
+        first
+            .entry((parsed.repo, parsed.issue as i64))
+            .and_modify(|s| *s = (*s).min(start))
+            .or_insert(start);
     }
+    Ok(first)
 }

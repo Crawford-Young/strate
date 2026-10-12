@@ -1,24 +1,22 @@
 //! GitHub issues, epics and PRs through the `gh` CLI, cached in the store.
 //!
-//! [`refresh`] fetches each repo's issues with one paginated
-//! `gh api graphql` query and replaces that repo's cached rows. A failure
-//! (no `gh`, not logged in, rate limit, bad JSON) is recorded on the repo
-//! and leaves the old rows alone; nothing here panics or errors out for it.
+//! [`fetch_all`] fetches each repo's issues with one paginated
+//! `gh api graphql` query, and [`store_fetched`] replaces that repo's cached
+//! rows. A failure (no `gh`, not logged in, rate limit, bad JSON) is
+//! recorded on the repo and leaves the old rows alone; nothing here panics
+//! or errors out for it.
 //! The command runner is injected, so tests never spawn the real CLI.
-//! Epics are issues with sub-issues: [`Issue::sub_total`] and
-//! [`Issue::parent`] carry the tree.
+//! Epics are issues with sub-issues in the same repo: [`Issue::sub_total`]
+//! and [`Issue::parent`] carry the tree.
 
-use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use rusqlite::Connection;
 use serde::Deserialize;
 
-use crate::names::parse_name;
 use crate::proc::{self, run};
 use crate::store::Store;
 
@@ -45,8 +43,13 @@ pub struct Issue {
     pub title: String,
     /// `OPEN` or `CLOSED`.
     pub state: String,
+    /// Why it closed: `COMPLETED`, `NOT_PLANNED` or `DUPLICATE`; `None` while
+    /// open.
+    pub state_reason: Option<String>,
     pub created_at: String,
     pub closed_at: Option<String>,
+    /// The parent issue in the same repo; a parent in another repo is not
+    /// kept, so the issue has no epic.
     pub parent: Option<i64>,
     pub sub_total: i64,
     pub sub_completed: i64,
@@ -58,8 +61,8 @@ const QUERY: &str = "query($owner: String!, $name: String!, $after: String) {
     issues(first: 100, after: $after) {
       pageInfo { hasNextPage endCursor }
       nodes {
-        number title state createdAt closedAt
-        parent { number }
+        number title state stateReason createdAt closedAt
+        parent { number repository { nameWithOwner } }
         subIssuesSummary { total completed }
         closedByPullRequestsReferences(first: 10, includeClosedPrs: true) {
           nodes { number state createdAt mergedAt url }
@@ -116,16 +119,24 @@ struct IssueNode {
     number: i64,
     title: String,
     state: String,
+    state_reason: Option<String>,
     created_at: String,
     closed_at: Option<String>,
-    parent: Option<Number>,
+    parent: Option<Parent>,
     sub_issues_summary: Option<SubIssues>,
     closed_by_pull_requests_references: Option<PrNodes>,
 }
 
 #[derive(Deserialize)]
-struct Number {
+struct Parent {
     number: i64,
+    repository: NameWithOwner,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NameWithOwner {
+    name_with_owner: String,
 }
 
 #[derive(Deserialize)]
@@ -149,13 +160,15 @@ struct PrNode {
     url: String,
 }
 
-impl From<IssueNode> for Issue {
-    fn from(node: IssueNode) -> Self {
-        let issue = node.number;
-        let (sub_total, sub_completed) = node
+impl IssueNode {
+    /// The issue, fetched from `repository` (`owner/name`): a parent in any
+    /// other repo is dropped, so the issue sits under no epic.
+    fn into_issue(self, repository: &str) -> Issue {
+        let issue = self.number;
+        let (sub_total, sub_completed) = self
             .sub_issues_summary
             .map_or((0, 0), |s| (s.total, s.completed));
-        let prs = node
+        let prs = self
             .closed_by_pull_requests_references
             .map_or_else(Vec::new, |refs| refs.nodes)
             .into_iter()
@@ -168,13 +181,21 @@ impl From<IssueNode> for Issue {
                 url: pr.url,
             })
             .collect();
-        Self {
+        Issue {
             number: issue,
-            title: node.title,
-            state: node.state,
-            created_at: node.created_at,
-            closed_at: node.closed_at,
-            parent: node.parent.map(|p| p.number),
+            title: self.title,
+            state: self.state,
+            state_reason: self.state_reason,
+            created_at: self.created_at,
+            closed_at: self.closed_at,
+            parent: self
+                .parent
+                .filter(|p| {
+                    p.repository
+                        .name_with_owner
+                        .eq_ignore_ascii_case(repository)
+                })
+                .map(|p| p.number),
             sub_total,
             sub_completed,
             prs,
@@ -228,7 +249,8 @@ pub fn fetch_repo(runner: &mut Runner, owner: &str, name: &str) -> Result<Vec<Is
             .and_then(|d| d.repository)
             .ok_or_else(|| format!("GitHub: no repository {owner}/{name}"))?
             .issues;
-        issues.extend(page.nodes.into_iter().map(Issue::from));
+        let repository = format!("{owner}/{name}");
+        issues.extend(page.nodes.into_iter().map(|n| n.into_issue(&repository)));
         match page.page_info {
             PageInfo {
                 has_next_page: true,
@@ -277,25 +299,8 @@ pub enum Fetched {
     },
 }
 
-/// The repo slugs of the user-named windows, sorted and unique: the repos
-/// worth fetching. Windows with a fallback name or a name that does not
-/// parse are Unlinked and add none.
-pub fn window_slugs(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT w.name FROM segments AS g
-         JOIN workstream_roots AS r ON r.id = g.workstream_id
-         JOIN workstreams AS w ON w.id = r.root
-         WHERE NOT w.fallback",
-    )?;
-    let names = stmt.query_map([], |r| r.get::<_, String>(0))?;
-    let mut slugs = BTreeSet::new();
-    for name in names {
-        slugs.extend(parse_name(&name?).map(|parsed| parsed.repo));
-    }
-    Ok(slugs.into_iter().collect())
-}
-
-/// `slugs` with the owner hints the store holds.
+/// `slugs` (from [`Store::window_slugs`]) with the owner hints the store
+/// holds.
 pub fn targets(store: &Store, slugs: &[String]) -> rusqlite::Result<Vec<Target>> {
     slugs
         .iter()
@@ -364,7 +369,9 @@ pub fn store_fetched(store: &mut Store, fetched: &[Fetched], now_ms: i64) -> rus
 }
 
 /// Refreshes the cache of every repo slug in `slugs` (see [`fetch_all`]
-/// and [`store_fetched`]) at `now_ms`.
+/// and [`store_fetched`]) at `now_ms`, on the calling thread. A test and
+/// probe helper: the app fetches on its own thread and stores on the
+/// engine's.
 pub fn refresh(
     store: &mut Store,
     runner: &mut Runner,
@@ -392,34 +399,6 @@ mod tests {
             Some(dir.join(name))
         );
         assert_eq!(resolve_gh(None), None);
-        std::fs::remove_dir_all(dir).expect("cleanup");
-    }
-
-    #[test]
-    fn window_slugs_are_the_repos_of_user_named_windows_once_each() {
-        let dir = test_dir("gh-slugs");
-        let db = dir.join("strate.db");
-        drop(Store::open(&db).expect("store"));
-        let conn = rusqlite::Connection::open(&db).expect("raw");
-        conn.execute_batch(
-            "INSERT INTO sessions (session_id, path) VALUES ('s1', '/p/s1.jsonl');
-             INSERT INTO workstreams (id, name, fallback) VALUES
-                 (1, 'demo-9', 0), (2, 'demo-9-s2', 0), (3, 'other-lab-3', 0),
-                 (4, 'plain', 0), (5, 'cwd-5', 1), (6, 'merged-4', 0),
-                 (7, 'unused-8', 0);
-             UPDATE workstreams SET merged_into = 3 WHERE id = 6;
-             INSERT INTO segments (session_id, start_offset, workstream_id) VALUES
-                 ('s1', 0, 1), ('s1', 10, 2), ('s1', 20, 3), ('s1', 30, 4),
-                 ('s1', 40, 5), ('s1', 50, 6);",
-        )
-        .expect("rows");
-        let reader = Store::open_reader(&db).expect("reader");
-        assert_eq!(
-            window_slugs(&reader).expect("slugs"),
-            ["demo", "other-lab"],
-            "a fallback name, an unparsed name and a workstream with no window add none; a merge reads as its root"
-        );
-        drop((conn, reader));
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 

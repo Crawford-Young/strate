@@ -6,6 +6,7 @@
 //! transaction.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Once;
 
 use jiff::tz::TimeZone;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -126,12 +127,19 @@ pub(super) fn rollup<'a>(conn: &Connection, ids: impl IntoIterator<Item = &'a st
 }
 
 /// The machine's IANA zone; UTC when it has none to name (a fixed offset
-/// or a POSIX `TZ`), since meta `tz` stores a name.
+/// or a POSIX `TZ`), since meta `tz` stores a name. The fallback is logged
+/// once per process.
 pub(super) fn system_zone() -> String {
+    static WARNED: Once = Once::new();
     TimeZone::try_system()
         .ok()
         .and_then(|tz| tz.iana_name().map(str::to_string))
-        .unwrap_or_else(|| "UTC".to_string())
+        .unwrap_or_else(|| {
+            WARNED.call_once(|| {
+                eprintln!("strate: the system time zone has no IANA name; audit days are in UTC");
+            });
+            "UTC".to_string()
+        })
 }
 
 /// The zone the stored days are in. Store::open writes meta `tz` before any

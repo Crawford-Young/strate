@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
-use std::panic::resume_unwind;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -101,8 +101,8 @@ pub struct Engine {
 pub struct Refresher(Sender<()>);
 
 impl Refresher {
-    /// Requests a refresh and returns at once. A request made while one is
-    /// pending or running coalesces into it; one made after the engine
+    /// Requests a refresh and returns at once. Requests made while a fetch
+    /// runs coalesce into one more after it; one made after the engine
     /// stopped is dropped. Nothing here can fail: GitHub trouble is stored
     /// per repo, never raised.
     pub fn request(&self) {
@@ -148,13 +148,13 @@ impl Engine {
         let (stop, stop_rx) = bounded(0);
         let ingest = Ingest {
             root,
-            db: config.db,
             store,
             progress: progress.clone(),
             notify: Throttle::new(config.debounce),
             discovery: Discovery::new(config.rediscover_after),
             fetcher,
             fetching: false,
+            pending: false,
             on_change,
         };
         let sources = Sources {
@@ -238,12 +238,27 @@ fn spawn_fetcher(mut runner: github::Runner) -> io::Result<Fetcher> {
         .name("strate-github".into())
         .spawn(move || {
             for targets in queue {
-                if done.send(github::fetch_all(&mut runner, &targets)).is_err() {
+                if done.send(fetch_guarded(&mut runner, &targets)).is_err() {
                     break;
                 }
             }
         })?;
     Ok((jobs, fetched))
+}
+
+/// [`github::fetch_all`], with a panic failing every target instead of
+/// ending the fetch thread.
+fn fetch_guarded(runner: &mut github::Runner, targets: &[Target]) -> Vec<Fetched> {
+    catch_unwind(AssertUnwindSafe(|| github::fetch_all(runner, targets))).unwrap_or_else(|_| {
+        targets
+            .iter()
+            .map(|t| Fetched::Failed {
+                slug: t.slug.clone(),
+                owner: t.owner.clone(),
+                error: "the GitHub fetch panicked".into(),
+            })
+            .collect()
+    })
 }
 
 fn now_ms() -> i64 {
@@ -355,15 +370,18 @@ impl Discovery {
 
 struct Ingest<F> {
     root: PathBuf,
-    db: PathBuf,
     store: Store,
     progress: Arc<Progress>,
     notify: Throttle,
     discovery: Discovery,
-    /// Feeds the GitHub fetch thread; `None` with GitHub off.
+    /// Feeds the GitHub fetch thread; `None` with GitHub off or after the
+    /// thread ended.
     fetcher: Option<Sender<Vec<Target>>>,
-    /// A fetch is out: requests coalesce into it.
+    /// A fetch is out.
     fetching: bool,
+    /// A request came while a fetch was out: one more runs after it, so a
+    /// window named meanwhile is fetched too.
+    pending: bool,
     on_change: F,
 }
 
@@ -407,7 +425,7 @@ impl<F: FnMut()> Ingest<F> {
                 recv(fetched) -> done => match done {
                     Ok(fetched) => self.fetched(&fetched),
                     Err(_) => {
-                        self.fetching = false;
+                        self.fetcher_gone();
                         fetched = never();
                     }
                 },
@@ -463,32 +481,51 @@ impl<F: FnMut()> Ingest<F> {
         }
     }
 
-    /// Hands the fetch thread the repos of the stored windows, unless it is
-    /// busy (the request coalesces) or GitHub is off.
+    /// Hands the fetch thread the repos of the stored windows, unless
+    /// GitHub is off. While a fetch is out, requests coalesce into one more
+    /// after it.
     fn refresh(&mut self) {
         let Some(fetcher) = &self.fetcher else {
             return;
         };
         if self.fetching {
+            self.pending = true;
             return;
         }
-        let targets = Store::open_reader(&self.db)
-            .and_then(|reader| github::window_slugs(&reader))
+        let targets = self
+            .store
+            .window_slugs()
             .and_then(|slugs| github::targets(&self.store, &slugs));
         match targets {
             Ok(targets) if targets.is_empty() => {}
-            Ok(targets) => self.fetching = fetcher.send(targets).is_ok(),
+            Ok(targets) => match fetcher.send(targets) {
+                Ok(()) => self.fetching = true,
+                Err(_) => self.fetcher_gone(),
+            },
             Err(e) => eprintln!("strate: reading the repos to fetch failed: {e}"),
         }
     }
 
-    /// Stores a finished fetch: new rows, or the error per failed repo.
+    /// Stores a finished fetch (new rows, or the error per failed repo),
+    /// then runs the one requested meanwhile.
     fn fetched(&mut self, fetched: &[Fetched]) {
         self.fetching = false;
         match github::store_fetched(&mut self.store, fetched, now_ms()) {
             Ok(()) => self.notify.mark(),
             Err(e) => eprintln!("strate: storing GitHub failed: {e}"),
         }
+        if std::mem::take(&mut self.pending) {
+            self.refresh();
+        }
+    }
+
+    /// The fetch thread ended: GitHub refresh is off from here on.
+    fn fetcher_gone(&mut self) {
+        if self.fetcher.take().is_some() {
+            eprintln!("strate: the GitHub fetch thread ended; GitHub refresh is off");
+        }
+        self.fetching = false;
+        self.pending = false;
     }
 
     fn discover(&mut self, now: Instant) {
@@ -543,6 +580,30 @@ mod tests {
         assert!(!throttle.take(ms(100)));
         assert!(throttle.take(ms(250)));
         assert!(!throttle.take(ms(600)), "the mark was spent");
+    }
+
+    #[test]
+    fn a_panicking_fetch_fails_each_target_instead_of_ending_the_thread() {
+        let mut runner: github::Runner = Box::new(|_| panic!("lorem"));
+        let targets = [
+            Target {
+                slug: "a".into(),
+                owner: Some("o".into()),
+            },
+            Target {
+                slug: "b".into(),
+                owner: None,
+            },
+        ];
+        let failed = |slug: &str, owner: Option<&str>| Fetched::Failed {
+            slug: slug.into(),
+            owner: owner.map(Into::into),
+            error: "the GitHub fetch panicked".into(),
+        };
+        assert_eq!(
+            fetch_guarded(&mut runner, &targets),
+            [failed("a", Some("o")), failed("b", None)]
+        );
     }
 
     #[test]

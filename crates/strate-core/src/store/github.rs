@@ -1,12 +1,13 @@
 //! The GitHub cache: `gh_repos`, `gh_issues` and `gh_prs`, keyed by repo
 //! slug (the repo part of a session name).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{Connection, params};
 
 use super::{Result, Store};
 use crate::github::{Issue, Pr};
+use crate::names::parse_name;
 
 /// One cached repo: `fetched_at` (unix ms) is its last successful refresh,
 /// `error` the failure of the latest one, if it failed.
@@ -20,6 +21,24 @@ pub struct GhRepo {
 }
 
 impl Store {
+    /// The repo slugs of the user-named windows, sorted and unique: the repos
+    /// worth fetching. Windows with a fallback name or a name that does not
+    /// parse are Unlinked and add none.
+    pub fn window_slugs(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT w.name FROM segments AS g
+             JOIN workstream_roots AS r ON r.id = g.workstream_id
+             JOIN workstreams AS w ON w.id = r.root
+             WHERE NOT w.fallback",
+        )?;
+        let names = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        let mut slugs = BTreeSet::new();
+        for name in names {
+            slugs.extend(parse_name(&name?).map(|parsed| parsed.repo));
+        }
+        Ok(slugs.into_iter().collect())
+    }
+
     /// The owner of `slug` as a stored `github_links.pr_repository`
     /// (`owner/name`) names it, newest link first.
     pub fn gh_owner_hint(&self, slug: &str) -> Result<Option<String>> {
@@ -60,8 +79,8 @@ impl Store {
         conn.execute("DELETE FROM gh_issues WHERE repo = ?1", [slug])?;
         let mut insert_issue = conn.prepare(
             "INSERT OR REPLACE INTO gh_issues (repo, number, title, state, created_at,
-                 closed_at, parent, sub_total, sub_completed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 closed_at, parent, sub_total, sub_completed, state_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
         let mut insert_pr = conn.prepare(
             "INSERT OR REPLACE INTO gh_prs (repo, issue, number, state, created_at,
@@ -79,6 +98,7 @@ impl Store {
                 issue.parent,
                 issue.sub_total,
                 issue.sub_completed,
+                issue.state_reason,
             ])?;
             for pr in &issue.prs {
                 insert_pr.execute(params![
@@ -109,7 +129,8 @@ impl Store {
     }
 }
 
-/// Every cached repo, by slug.
+/// Every cached repo, by slug. A test and probe helper: the app reads the
+/// cache through [`crate::store::views::audit`].
 pub fn gh_repos(conn: &Connection) -> Result<Vec<GhRepo>> {
     conn.prepare("SELECT slug, owner, name, fetched_at, error FROM gh_repos ORDER BY slug")?
         .query_map([], |r| {
@@ -124,7 +145,9 @@ pub fn gh_repos(conn: &Connection) -> Result<Vec<GhRepo>> {
         .collect()
 }
 
-/// The cached issues of `slug` by number, each with its closing PRs.
+/// The cached issues of `slug` by number, each with its closing PRs. A test
+/// and probe helper: the app reads the cache through
+/// [`crate::store::views::audit`].
 pub fn gh_issues(conn: &Connection, slug: &str) -> Result<Vec<Issue>> {
     let mut prs: BTreeMap<i64, Vec<Pr>> = BTreeMap::new();
     let mut stmt = conn.prepare(
@@ -145,7 +168,8 @@ pub fn gh_issues(conn: &Connection, slug: &str) -> Result<Vec<Issue>> {
         prs.entry(pr.issue).or_default().push(pr);
     }
     conn.prepare(
-        "SELECT number, title, state, created_at, closed_at, parent, sub_total, sub_completed
+        "SELECT number, title, state, created_at, closed_at, parent, sub_total, sub_completed,
+             state_reason
          FROM gh_issues WHERE repo = ?1 ORDER BY number",
     )?
     .query_map([slug], |r| {
@@ -154,6 +178,7 @@ pub fn gh_issues(conn: &Connection, slug: &str) -> Result<Vec<Issue>> {
             number,
             title: r.get(1)?,
             state: r.get(2)?,
+            state_reason: r.get(8)?,
             created_at: r.get(3)?,
             closed_at: r.get(4)?,
             parent: r.get(5)?,
@@ -163,4 +188,37 @@ pub fn gh_issues(conn: &Connection, slug: &str) -> Result<Vec<Issue>> {
         })
     })?
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tail::test_dir;
+
+    #[test]
+    fn window_slugs_are_the_repos_of_user_named_windows_once_each() {
+        let dir = test_dir("gh-slugs");
+        let store = Store::open(dir.join("strate.db")).expect("store");
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO sessions (session_id, path) VALUES ('s1', '/p/s1.jsonl');
+                 INSERT INTO workstreams (id, name, fallback) VALUES
+                     (1, 'demo-9', 0), (2, 'demo-9-s2', 0), (3, 'other-lab-3', 0),
+                     (4, 'plain', 0), (5, 'cwd-5', 1), (6, 'merged-4', 0),
+                     (7, 'unused-8', 0);
+                 UPDATE workstreams SET merged_into = 3 WHERE id = 6;
+                 INSERT INTO segments (session_id, start_offset, workstream_id) VALUES
+                     ('s1', 0, 1), ('s1', 10, 2), ('s1', 20, 3), ('s1', 30, 4),
+                     ('s1', 40, 5), ('s1', 50, 6);",
+            )
+            .expect("rows");
+        assert_eq!(
+            store.window_slugs().expect("slugs"),
+            ["demo", "other-lab"],
+            "a fallback name, an unparsed name and a workstream with no window add none; a merge reads as its root"
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
 }

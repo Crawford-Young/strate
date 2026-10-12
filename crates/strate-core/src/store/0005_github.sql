@@ -24,7 +24,10 @@ CREATE TABLE gh_issues (
     PRIMARY KEY (repo, number)
 ) STRICT;
 
--- A PR that closes several issues has one row per issue.
+-- A PR that closes several issues has one row per issue. `repo` is the
+-- issue's slug, not the PR's: a PR from another repo is told apart only by
+-- its `url`, and two PRs with one number (from two repos) closing one issue
+-- would share a key, the later replacing the earlier.
 CREATE TABLE gh_prs (
     repo TEXT NOT NULL REFERENCES gh_repos (slug),
     issue INTEGER NOT NULL,

@@ -77,9 +77,9 @@ fn rollup(reader: &Reader, filter: &AuditFilter) -> Result<Audit, String> {
 }
 
 /// Asks the engine to refresh the GitHub cache and returns at once; the
-/// webview refetches on [`STORE_CHANGED`] when it lands. A refresh already
-/// running absorbs the request, and no GitHub failure is an error here (it
-/// is stored per repo).
+/// webview refetches on [`STORE_CHANGED`] when it lands. Requests during a
+/// refresh coalesce into one more after it, and no GitHub failure is an
+/// error here (it is stored per repo).
 #[tauri::command]
 pub fn audit_refresh(refresher: State<'_, Refresher>) {
     refresher.request();

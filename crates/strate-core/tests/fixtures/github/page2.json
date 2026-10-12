@@ -1,4 +1,4 @@
 {"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"CURSOR-2"},"nodes":[
-{"number":26,"title":"Dolor audit","state":"OPEN","createdAt":"2026-10-03T09:00:00Z","closedAt":null,"parent":{"number":4},
+{"number":26,"title":"Dolor audit","state":"OPEN","createdAt":"2026-10-03T09:00:00Z","closedAt":null,"parent":{"number":4,"repository":{"nameWithOwner":"acme/widget"}},
  "subIssuesSummary":null,"closedByPullRequestsReferences":null}
 ]}}}}
