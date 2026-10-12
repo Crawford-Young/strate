@@ -2,7 +2,7 @@
 
 A desktop app for watching and steering Claude Code work in real time, with audit on demand. Strate shows the live agent graph (orchestrators, subagents, teammates) with state, cost, run time and context use, gives every agent its own console, and keeps a terminal docked beside it. History is searchable, but the live view comes first. It is built for one user first and generalized later. Built with Tauri v2, React, Vite and Tailwind, styled entirely with `@crawfordyoung/ui`.
 
-Status: the core is wired into the app (ingest, commands, events), but the UI is still an empty shell; only the dark theme exists for now.
+Status: the core is wired into the app (ingest, commands, events) and the app shell is in. It has one tab per workstream (status dot, total $, needs-you badge; the live orchestrator opens first) and a line over the canvas with running time, $ this session, $ total and needs-you count. The UI refetches on `store-changed` and never polls. Harness (left), console (right) and terminal (bottom) are resizable, collapsible panels; their sizes and open state are saved locally (`strate.layout` in localStorage) and restored on launch. Harness and Terminal start closed and open from their buttons, and the console opens when you select a node. Until the graph canvas lands, the canvas lists the live session's agents as node cards. Panel bodies are placeholders for now. Only the dark theme exists.
 
 The design spec and ADR-0001 (stack decision) live in the private planning-docs repo under `docs/apps/strate/specs/` (`strate-v1-design` and `adr-0001-stack`).
 
