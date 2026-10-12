@@ -20,6 +20,17 @@ vi.mock('./api', () => ({
   onStoreChanged: vi.fn(),
 }))
 
+vi.mock('./elk', async () => {
+  const { default: ELK } = await import('elkjs/lib/elk.bundled.js')
+  const elk = new ELK()
+  return { elk: () => elk }
+})
+
+vi.mock('@xyflow/react', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@xyflow/react')>()),
+  ...(await import('../tests/xyflow-mock')),
+}))
+
 vi.mock('@crawfordyoung/ui', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@crawfordyoung/ui')>()),
   ...(await import('../tests/resizable-mock')),
@@ -68,6 +79,8 @@ function agent(over: Partial<GraphAgent> & Pick<GraphAgent, 'id'>): GraphAgent {
     costUsd: null,
     contextTokens: null,
     contextPct: null,
+    nudgePct: 80,
+    hardStopPct: 95,
     parent: null,
     ...over,
   }
@@ -157,8 +170,16 @@ describe('loading states', () => {
   it('shows an empty state with no workstreams', async () => {
     workstreamsMock.mockResolvedValue([])
     render(<App />)
-    expect(await screen.findByText('No workstreams yet.')).toBeInTheDocument()
+    expect(await screen.findByText('No live sessions.')).toBeInTheDocument()
     expect(screen.queryByRole('tab')).not.toBeInTheDocument()
+  })
+
+  it('shows the same empty state when every session has stopped', async () => {
+    workstreamsMock.mockResolvedValue([finished])
+    render(<App />)
+    expect(await screen.findByText('No live sessions.')).toBeInTheDocument()
+    expect(screen.queryByRole('tab')).not.toBeInTheDocument()
+    expect(liveGraphMock).not.toHaveBeenCalled()
   })
 
   it('reports a store error', async () => {
@@ -171,21 +192,25 @@ describe('loading states', () => {
 })
 
 describe('orchestrator tabs', () => {
-  it('lists one tab per workstream with its total $ and a needs-you badge', async () => {
+  it('lists one tab per live session with its total $ and a needs-you badge', async () => {
     render(<App />)
     await screen.findByRole('tab', { name: /strate-17/ })
-    expect(screen.getAllByRole('tab')).toHaveLength(3)
+    expect(screen.getAllByRole('tab')).toHaveLength(2)
     expect(within(tab(/strate-17/)).getByText('$3.10')).toBeInTheDocument()
     expect(within(tab(/strate-17/)).getByText('needs you')).toBeInTheDocument()
-    expect(within(tab(/docs-cleanup/)).getByText('$1.50')).toBeInTheDocument()
-    expect(within(tab(/docs-cleanup/)).queryByText('needs you')).not.toBeInTheDocument()
+    expect(within(tab(/app@main/)).queryByText('needs you')).not.toBeInTheDocument()
+  })
+
+  it('leaves sessions that are no longer live out of the strip', async () => {
+    render(<App />)
+    await screen.findByRole('tab', { name: /strate-17/ })
+    expect(screen.queryByRole('tab', { name: /docs-cleanup/ })).not.toBeInTheDocument()
   })
 
   it('labels each tab with its state', async () => {
     render(<App />)
     await screen.findByRole('tab', { name: /strate-17/ })
     expect(within(tab(/strate-17/)).getByRole('img', { name: 'needs you' })).toBeInTheDocument()
-    expect(within(tab(/docs-cleanup/)).getByRole('img', { name: 'done' })).toBeInTheDocument()
     expect(within(tab(/app@main/)).getByRole('img', { name: 'working' })).toBeInTheDocument()
   })
 
@@ -206,19 +231,19 @@ describe('orchestrator tabs', () => {
     expect(tab(/strate-17/)).not.toHaveAccessibleName(/unnamed/)
   })
 
-  it('opens on the live orchestrator', async () => {
+  it('opens on the first live session', async () => {
     render(<App />)
     await screen.findByRole('tab', { name: /strate-17/ })
     expect(screen.getByRole('tab', { selected: true })).toHaveAccessibleName(/strate-17/)
     expect(liveGraphMock).toHaveBeenCalledWith(2)
   })
 
-  it('opens on the first tab when nothing is live', async () => {
-    workstreamsMock.mockResolvedValue([finished])
+  it('opens on the first tab', async () => {
+    workstreamsMock.mockResolvedValue([unnamed, shell])
     render(<App />)
-    await screen.findByRole('tab', { name: /docs-cleanup/ })
-    expect(screen.getByRole('tab', { selected: true })).toHaveAccessibleName(/docs-cleanup/)
-    expect(await screen.findByText('No session to draw yet.')).toBeInTheDocument()
+    await screen.findByRole('tab', { name: /app@main/ })
+    expect(screen.getByRole('tab', { selected: true })).toHaveAccessibleName(/app@main/)
+    expect(liveGraphMock).toHaveBeenCalledWith(3)
   })
 
   it('switches the canvas to the picked tab', async () => {
@@ -311,7 +336,19 @@ describe('refetching', () => {
     expect(statusMock).toHaveBeenCalledTimes(2)
   })
 
-  it('falls back to the live tab when the picked one goes away, and forgets the pick', async () => {
+  it('drops the picked tab when its session stops being live', async () => {
+    render(<App />)
+    await screen.findByRole('tab', { name: /strate-17/ })
+    selectTab(/app@main/)
+    await screen.findByRole('button', { name: /app-main/ })
+    workstreamsMock.mockResolvedValue([finished, shell, { ...unnamed, live: false, state: 'done' }])
+    act(() => storeChanged())
+    await screen.findByRole('button', { name: /implementer/ })
+    expect(screen.queryByRole('tab', { name: /app@main/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('tab', { selected: true })).toHaveAccessibleName(/strate-17/)
+  })
+
+  it('falls back to the first tab when the picked one goes away, and forgets the pick', async () => {
     render(<App />)
     await screen.findByRole('tab', { name: /strate-17/ })
     selectTab(/app@main/)
@@ -369,9 +406,12 @@ describe('session line', () => {
 })
 
 describe('canvas', () => {
-  it('lists the live-graph agents as node cards', async () => {
+  it('draws the live graph in tiers, orchestrator on top', async () => {
     render(<App />)
     const orchestrator = await screen.findByRole('button', { name: /strate-17/ })
+    const y = (id: number) => Number(screen.getByTestId(`node-${id}`).dataset.y)
+    expect(y(10)).toBeLessThan(y(11))
+    expect(screen.getByTestId('edge-10-11')).toBeInTheDocument()
     expect(orchestrator).toHaveTextContent('claude-opus-5-5')
     expect(orchestrator).toHaveTextContent('42%')
     const worker = screen.getByRole('button', { name: /implementer/ })

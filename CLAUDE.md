@@ -20,5 +20,5 @@ Every `strate-core` wave is also checked against the real `~/.claude` with a pro
 - The agent registry is `claude agents --json`, never `sessions/<pid>.json`.
 - Layout is the user's call: Harness left, console right, terminal bottom, Audit the only full-screen view. Don't assume otherwise; ask.
 - UI comes from `@crawfordyoung/ui`; new pieces land in the library first.
-- happy-dom has no layout, so the real resizable group never reports a layout or applies `resize`/`collapse`. App tests swap in `tests/resizable-mock.tsx`; check real panel behaviour in `bun run tauri dev`.
+- happy-dom has no layout, so the real resizable group never reports a layout or applies `resize`/`collapse`. App tests swap in `tests/resizable-mock.tsx`, and graph tests swap in `tests/xyflow-mock.tsx` for React Flow (which never measures nodes) plus in-process `elk.bundled.js` for `./elk`; check real panel and graph behaviour in `bun run tauri dev`.
 - Dev server port 1420 is strict (`vite.config.ts` and Tauri `devUrl`); don't let it fall back.

@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use strate_core::discovery::{AgentRef, Graph, Link, SubagentMeta, SubagentNode};
 use strate_core::hooks::{Hook, HookEvent};
 use strate_core::registry::{RegistryEvent, parse_snapshot};
-use strate_core::store::Store;
 use strate_core::store::views::{self, AgentState, GraphAgent, GraphEdge, Workstream};
+use strate_core::store::{Gear, Store};
 use strate_core::tail::{Batch, TailEvent};
 
 /// A temp dir removed on drop.
@@ -366,6 +366,55 @@ fn the_live_graph_is_the_live_session_only_with_states_and_context() {
             },
         ]
     );
+}
+
+#[test]
+fn the_live_graph_carries_each_agents_resolved_context_thresholds() {
+    let temp = Temp::new("live-graph-gear");
+    let (mut store, reader) = temp.open();
+    fill(&mut store);
+    let rows = views::workstreams(&reader).expect("workstreams");
+    let alpha = by_name(&rows, "alpha-1").id;
+    let thresholds = |reader: &Connection| -> Vec<(u8, u8)> {
+        views::live_graph(reader, alpha)
+            .expect("query")
+            .expect("a graph")
+            .agents
+            .iter()
+            .map(|a| (a.nudge_pct, a.hard_stop_pct))
+            .collect()
+    };
+
+    // Orchestrator, a1, a2: the built-in 80 / 95.
+    assert_eq!(thresholds(&reader), [(80, 95); 3]);
+
+    // The orchestrator's row is the session default every agent inherits.
+    let defaults = Gear {
+        nudge_pct: Some(70),
+        hard_stop_pct: Some(90),
+        ..Gear::default()
+    };
+    store
+        .set_gear("s-alpha", None, &defaults)
+        .expect("defaults");
+    assert_eq!(thresholds(&reader), [(70, 90); 3]);
+
+    // a1's own row wins per field; a2 keeps inheriting.
+    let over = Gear {
+        hard_stop_pct: Some(85),
+        ..Gear::default()
+    };
+    store
+        .set_gear("s-alpha", Some("a1"), &over)
+        .expect("override");
+    assert_eq!(thresholds(&reader), [(70, 90), (70, 85), (70, 90)]);
+
+    let graph = views::live_graph(&reader, alpha)
+        .expect("query")
+        .expect("a graph");
+    let json = serde_json::to_value(&graph.agents[1]).expect("json");
+    assert_eq!(json["nudgePct"], 70);
+    assert_eq!(json["hardStopPct"], 85);
 }
 
 #[test]
