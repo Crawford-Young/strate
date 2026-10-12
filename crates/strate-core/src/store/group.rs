@@ -117,12 +117,17 @@ fn workstream(conn: &Connection, name: &str, fallback: bool) -> Result<i64> {
 }
 
 /// Regroups the given sessions, then drops workstreams left empty.
+/// Returns the sessions whose [`Layout`] changed, whose audit cells are
+/// stale.
 pub(super) fn sessions<'a>(
     conn: &Connection,
     ids: impl IntoIterator<Item = &'a str>,
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    let mut changed = Vec::new();
     for id in ids {
-        session(conn, id)?;
+        if session(conn, id)? {
+            changed.push(id.to_string());
+        }
     }
     conn.prepare_cached(
         "DELETE FROM workstreams WHERE merged_into IS NULL
@@ -130,11 +135,11 @@ pub(super) fn sessions<'a>(
              AND NOT EXISTS (SELECT 1 FROM workstreams AS m WHERE m.merged_into = workstreams.id)",
     )?
     .execute([])?;
-    Ok(())
+    Ok(changed)
 }
 
-/// Regroups every stored session.
-pub(super) fn all(conn: &Connection) -> Result<()> {
+/// Regroups every stored session; returns those whose layout changed.
+pub(super) fn all(conn: &Connection) -> Result<Vec<String>> {
     let ids: Vec<String> = conn
         .prepare("SELECT session_id FROM sessions ORDER BY session_id")?
         .query_map([], |r| r.get(0))?
@@ -142,9 +147,29 @@ pub(super) fn all(conn: &Connection) -> Result<()> {
     sessions(conn, ids.iter().map(String::as_str))
 }
 
+/// What a session's audit cells read from its grouping: each window's
+/// id, start offset and start time, and each subagent's window.
+type Layout = (Vec<(i64, i64, Option<String>)>, Vec<(i64, Option<i64>)>);
+
+fn layout(conn: &Connection, session_id: &str) -> Result<Layout> {
+    let windows = conn
+        .prepare_cached(
+            "SELECT id, start_offset, started_at FROM segments WHERE session_id = ?1 ORDER BY id",
+        )?
+        .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_>>()?;
+    let agents = conn
+        .prepare_cached("SELECT id, segment_id FROM agents WHERE session_id = ?1 ORDER BY id")?
+        .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_>>()?;
+    Ok((windows, agents))
+}
+
 /// Rebuilds one session's segments, its workstream, its subagents'
-/// segments and its process root's continuation edges.
-fn session(conn: &Connection, session_id: &str) -> Result<()> {
+/// segments and its process root's continuation edges. Returns whether its
+/// [`Layout`] changed.
+fn session(conn: &Connection, session_id: &str) -> Result<bool> {
+    let before = layout(conn, session_id)?;
     let rows: Vec<Row> = conn
         .prepare_cached(
             "SELECT byte_offset, type = 'assistant', timestamp, cwd, git_branch, custom_title
@@ -235,7 +260,8 @@ fn session(conn: &Connection, session_id: &str) -> Result<()> {
         conn.prepare_cached("UPDATE agents SET segment_id = ?2 WHERE id = ?1")?
             .execute(params![agent, segment])?;
     }
-    continuation(conn, session_id)
+    continuation(conn, session_id)?;
+    Ok(layout(conn, session_id)? != before)
 }
 
 /// Links the orchestrators of every session on `session_id`'s process root,

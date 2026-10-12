@@ -7,12 +7,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use jiff::tz::TimeZone;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 use super::Result;
 use crate::cost::{self, SYNTHETIC, Usage, truthy};
-use crate::time::{self, IDLE_GAP_MS, Record, Timed};
+use crate::time::{self, IDLE_GAP_MS, Record, Split, Timed};
 
 /// The accounting columns of one event (see `0003_cost_time.sql`).
 #[derive(Debug, Default, PartialEq)]
@@ -114,26 +115,72 @@ pub(super) fn touched(
     Ok(out)
 }
 
-/// Recomputes the rollups of the given sessions and their agents.
+/// Recomputes the rollups and audit cells of the given sessions and their
+/// agents, with days in the zone under meta `tz`.
 pub(super) fn rollup<'a>(conn: &Connection, ids: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let tz = zone(conn)?;
     for id in ids {
-        session(conn, id)?;
+        session(conn, id, &tz)?;
     }
     Ok(())
 }
 
-/// Re-reads every event's accounting fields from `raw` and recomputes every
-/// rollup, unless the store was last accounted at the vendored prices. A
-/// store from before v3 has no record of that, so it is filled here too.
-pub(super) fn refresh(conn: &Connection) -> Result<()> {
-    let stored: Option<String> = conn
-        .query_row("SELECT value FROM meta WHERE key = 'prices'", [], |r| {
-            r.get(0)
-        })
-        .optional()?;
-    if stored.as_deref() == Some(cost::PRICES_JSON) {
+/// The machine's IANA zone; UTC when it has none to name (a fixed offset
+/// or a POSIX `TZ`), since meta `tz` stores a name.
+pub(super) fn system_zone() -> String {
+    TimeZone::try_system()
+        .ok()
+        .and_then(|tz| tz.iana_name().map(str::to_string))
+        .unwrap_or_else(|| "UTC".to_string())
+}
+
+/// The zone the stored days are in. Store::open writes meta `tz` before any
+/// rollup, so the UTC fallback only covers a name this build cannot load.
+fn zone(conn: &Connection) -> Result<TimeZone> {
+    Ok(meta(conn, "tz")?
+        .and_then(|name| TimeZone::get(&name).ok())
+        .unwrap_or(TimeZone::UTC))
+}
+
+fn meta(conn: &Connection, key: &str) -> Result<Option<String>> {
+    conn.prepare_cached("SELECT value FROM meta WHERE key = ?1")?
+        .query_row([key], |r| r.get(0))
+        .optional()
+}
+
+fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+    )?
+    .execute([key, value])?;
+    Ok(())
+}
+
+/// Recomputes every rollup and audit cell unless the store was last
+/// accounted at the vendored prices and in `zone` (an IANA name). A new
+/// price list also re-reads every event's accounting fields from `raw`. A
+/// store from before v3 (no prices) or v6 (no zone) is filled here too.
+pub(super) fn refresh(conn: &Connection, zone: &str) -> Result<()> {
+    let repriced = meta(conn, "prices")?.as_deref() != Some(cost::PRICES_JSON);
+    let rezoned = meta(conn, "tz")?.as_deref() != Some(zone);
+    if !repriced && !rezoned {
         return Ok(());
     }
+    if repriced {
+        reread_fields(conn)?;
+    }
+    set_meta(conn, "tz", zone)?;
+    let ids: Vec<String> = conn
+        .prepare("SELECT session_id FROM sessions ORDER BY session_id")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    rollup(conn, ids.iter().map(String::as_str))?;
+    set_meta(conn, "prices", cost::PRICES_JSON)
+}
+
+/// Re-reads every event's accounting fields from `raw`.
+fn reread_fields(conn: &Connection) -> Result<()> {
     let mut after = 0i64;
     loop {
         let rows: Vec<(i64, String)> = conn
@@ -144,7 +191,7 @@ pub(super) fn refresh(conn: &Connection) -> Result<()> {
             .query_map([after], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_>>()?;
         let Some(&(last, _)) = rows.last() else {
-            break;
+            return Ok(());
         };
         for (id, raw) in rows {
             let f = fields(&serde_json::from_str(&raw).unwrap_or(Value::Null));
@@ -167,17 +214,6 @@ pub(super) fn refresh(conn: &Connection) -> Result<()> {
         }
         after = last;
     }
-    let ids: Vec<String> = conn
-        .prepare("SELECT session_id FROM sessions ORDER BY session_id")?
-        .query_map([], |r| r.get(0))?
-        .collect::<Result<_>>()?;
-    rollup(conn, ids.iter().map(String::as_str))?;
-    conn.execute(
-        "INSERT INTO meta (key, value) VALUES ('prices', ?1)
-         ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-        [cost::PRICES_JSON],
-    )?;
-    Ok(())
 }
 
 /// A stored event as the time model reads it.
@@ -208,7 +244,157 @@ fn timed(
     Some(Timed { at, record })
 }
 
-fn session(conn: &Connection, session_id: &str) -> Result<()> {
+/// A `/rename` window of a session transcript (one `segments` row): where it
+/// starts in the transcript and, once it has a timestamped record, in time.
+struct Window {
+    id: i64,
+    offset: i64,
+    start: Option<i64>,
+}
+
+/// The session's windows in transcript order.
+fn windows(conn: &Connection, session_id: &str) -> Result<Vec<Window>> {
+    conn.prepare_cached(
+        "SELECT id, start_offset, started_at FROM segments
+         WHERE session_id = ?1 ORDER BY start_offset",
+    )?
+    .query_map([session_id], |r| {
+        let start: Option<String> = r.get(2)?;
+        Ok(Window {
+            id: r.get(0)?,
+            offset: r.get(1)?,
+            start: start.as_deref().and_then(time::parse_timestamp),
+        })
+    })?
+    .collect()
+}
+
+/// The window live at epoch ms `at`: the latest started by then, else the
+/// first.
+fn window_at(windows: &[Window], at: i64) -> Option<i64> {
+    windows
+        .iter()
+        .rev()
+        .find(|w| w.start.is_some_and(|s| s <= at))
+        .or(windows.first())
+        .map(|w| w.id)
+}
+
+/// The window holding transcript byte `offset`.
+fn window_of(windows: &[Window], offset: i64) -> Option<i64> {
+    windows
+        .iter()
+        .rev()
+        .find(|w| w.offset <= offset)
+        .map(|w| w.id)
+}
+
+/// A bucket's key: agent (`None`: the orchestrator), window, local day. A
+/// bucket stores one audit cell per model of its requests.
+type BucketKey = (Option<String>, Option<i64>, Option<String>);
+
+/// The requests of one model in one bucket.
+#[derive(Default)]
+struct Requests {
+    count: usize,
+    /// The ordinal of the latest one, in time order.
+    latest: usize,
+    cost_usd: Option<f64>,
+    unpriced: i64,
+    /// Input, output, cache read, cache write.
+    tokens: [i64; 4],
+}
+
+/// One (agent, window, day) bucket: its time and its requests per model.
+#[derive(Default)]
+struct Bucket {
+    /// Wall, active and wait ms.
+    time: [i64; 3],
+    models: BTreeMap<Option<String>, Requests>,
+}
+
+impl Bucket {
+    fn time(&mut self, split: &Split) {
+        self.time[0] += split.wall_ms;
+        self.time[1] += split.active_ms();
+        self.time[2] += split.user_ms;
+    }
+
+    /// Adds request number `n` (in time order).
+    fn request(&mut self, n: usize, model: Option<String>, usage: &Usage, cost_usd: Option<f64>) {
+        let r = self.models.entry(model).or_default();
+        r.count += 1;
+        r.latest = n;
+        match cost_usd {
+            Some(c) => r.cost_usd = Some(r.cost_usd.unwrap_or(0.0) + c),
+            None => r.unpriced += 1,
+        }
+        let counts = [
+            usage.input,
+            usage.output,
+            usage.cache_read,
+            usage.cache_creation,
+        ];
+        for (sum, count) in r.tokens.iter_mut().zip(counts) {
+            *sum += count as i64;
+        }
+    }
+
+    /// One cell per model, the time on the model that took the most
+    /// requests (the latest winning ties); a bucket with no requests is one
+    /// cell with no model.
+    fn cells(&self) -> Vec<(Option<&str>, [i64; 3], Option<&Requests>)> {
+        let dominant = self
+            .models
+            .iter()
+            .max_by_key(|(_, r)| (r.count, r.latest))
+            .map(|(model, _)| model);
+        if dominant.is_none() {
+            return vec![(None, self.time, None)];
+        }
+        self.models
+            .iter()
+            .map(|(model, r)| {
+                let time = if Some(model) == dominant {
+                    self.time
+                } else {
+                    [0; 3]
+                };
+                (model.as_deref(), time, Some(r))
+            })
+            .collect()
+    }
+}
+
+fn add(a: Split, b: &Split) -> Split {
+    Split {
+        wall_ms: a.wall_ms + b.wall_ms,
+        idle_ms: a.idle_ms + b.idle_ms,
+        model_ms: a.model_ms + b.model_ms,
+        tools_ms: a.tools_ms + b.tools_ms,
+        user_ms: a.user_ms + b.user_ms,
+        other_ms: a.other_ms + b.other_ms,
+    }
+}
+
+/// `time::split` of a timeline, and the same cut at each local midnight in
+/// `tz` and at `cuts`: the whole, and the buckets that sum to it.
+fn split_days(
+    records: &[Timed],
+    also: &[i64],
+    tz: &TimeZone,
+    cuts: &[i64],
+) -> Option<(Split, Vec<(i64, Split)>)> {
+    let times = records.iter().map(|t| t.at).chain(also.iter().copied());
+    let (first, last) = (times.clone().min()?, times.max()?);
+    let mut all = time::local_midnights(tz, first, last);
+    all.extend_from_slice(cuts);
+    let buckets = time::split_at(records, also, IDLE_GAP_MS, &all)?;
+    let whole = buckets.iter().map(|(_, s)| s).fold(Split::default(), add);
+    Some((whole, buckets))
+}
+
+fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
     // Title, cost-state and ai-title records are bookkeeping, not activity.
     let mut timelines: BTreeMap<Option<String>, Vec<Timed>> = BTreeMap::new();
     let mut stmt = conn.prepare_cached(
@@ -236,17 +422,105 @@ fn session(conn: &Connection, session_id: &str) -> Result<()> {
         }
     }
     let main = timelines.remove(&None).unwrap_or_default();
-    let runs: BTreeMap<String, time::Split> = timelines
-        .iter()
-        .filter_map(|(agent, records)| {
-            let split = time::split(records, &[], IDLE_GAP_MS)?;
-            Some((agent.clone()?, split))
-        })
-        .collect();
-    let also: Vec<i64> = timelines.values().flatten().map(|t| t.at).collect();
-    let whole = time::split(&main, &also, IDLE_GAP_MS);
-    let agent_ms: i64 = runs.values().map(|s| s.wall_ms).sum();
+    let windows = windows(conn, session_id)?;
+    // A subagent counts entirely toward the window it started in.
+    let started_in: BTreeMap<String, Option<i64>> = conn
+        .prepare_cached(
+            "SELECT agent_id, segment_id FROM agents
+             WHERE session_id = ?1 AND agent_id IS NOT NULL",
+        )?
+        .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_>>()?;
+    let window_of_agent = |agent: &str| started_in.get(agent).copied().flatten();
 
+    let mut buckets: BTreeMap<BucketKey, Bucket> = BTreeMap::new();
+    let mut runs: BTreeMap<String, Split> = BTreeMap::new();
+    for (agent, records) in &timelines {
+        let (Some(agent), Some((run, parts))) = (agent, split_days(records, &[], tz, &[])) else {
+            continue;
+        };
+        for (at, split) in &parts {
+            let key = (
+                Some(agent.clone()),
+                window_of_agent(agent),
+                time::local_day(tz, *at),
+            );
+            buckets.entry(key).or_default().time(split);
+        }
+        runs.insert(agent.clone(), run);
+    }
+    // The session timeline is cut at window starts too, so a renamed
+    // transcript splits per window.
+    let also: Vec<i64> = timelines.values().flatten().map(|t| t.at).collect();
+    let starts: Vec<i64> = windows.iter().filter_map(|w| w.start).collect();
+    let whole = split_days(&main, &also, tz, &starts).map(|(whole, parts)| {
+        for (at, split) in &parts {
+            let key = (None, window_at(&windows, *at), time::local_day(tz, *at));
+            buckets.entry(key).or_default().time(split);
+        }
+        whole
+    });
+    // A request counts on the day and in the window of its own record. An
+    // orchestrator's time goes to a window by when it started, its requests
+    // by transcript offset: they agree unless timestamps run out of order.
+    let mut stmt = conn.prepare_cached(
+        "SELECT r.agent_id, r.timestamp, r.model, r.usage, r.cost_usd, e.byte_offset
+         FROM requests AS r JOIN events AS e ON e.id = r.id
+         WHERE r.session_id = ?1
+         ORDER BY r.timestamp, r.id",
+    )?;
+    let mut rows = stmt.query([session_id])?;
+    let mut n = 0;
+    while let Some(r) = rows.next()? {
+        let agent: Option<String> = r.get(0)?;
+        let at: Option<String> = r.get(1)?;
+        let usage: String = r.get(3)?;
+        let window = match &agent {
+            None => window_of(&windows, r.get(5)?),
+            Some(a) => window_of_agent(a),
+        };
+        let day = at
+            .as_deref()
+            .and_then(time::parse_timestamp)
+            .and_then(|ms| time::local_day(tz, ms));
+        let usage = Usage::from_json(&serde_json::from_str(&usage).unwrap_or(Value::Null));
+        buckets
+            .entry((agent, window, day))
+            .or_default()
+            .request(n, r.get(2)?, &usage, r.get(4)?);
+        n += 1;
+    }
+    conn.prepare_cached("DELETE FROM audit_cells WHERE session_id = ?1")?
+        .execute([session_id])?;
+    let mut insert = conn.prepare_cached(
+        "INSERT INTO audit_cells (session_id, agent_id, segment_id, day, wall_ms, active_ms,
+             wait_ms, cost_usd, unpriced, input_tokens, output_tokens, cache_read_tokens,
+             cache_write_tokens, model)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+    )?;
+    for ((agent, window, day), bucket) in &buckets {
+        for (model, [wall, active, wait], r) in bucket.cells() {
+            let [input, output, cache_read, cache_write] = r.map_or([0; 4], |r| r.tokens);
+            insert.execute(params![
+                session_id,
+                agent,
+                window,
+                day,
+                wall,
+                active,
+                wait,
+                r.and_then(|r| r.cost_usd),
+                r.map_or(0, |r| r.unpriced),
+                input,
+                output,
+                cache_read,
+                cache_write,
+                model
+            ])?;
+        }
+    }
+
+    let agent_ms: i64 = runs.values().map(|s| s.wall_ms).sum();
     conn.prepare_cached(
         "UPDATE sessions SET
              cost_usd = (SELECT sum(cost_usd) FROM requests WHERE session_id = ?1),
