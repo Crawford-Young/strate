@@ -1,0 +1,449 @@
+import { Tabs } from '@crawfordyoung/ui'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
+import type { ElkNode } from 'elkjs/lib/elk-api'
+import ELK from 'elkjs/lib/elk.bundled.js'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { centerCalls, flowProps, resetFlow, zoomCalls } from '../tests/xyflow-mock'
+import type { GraphAgent, GraphEdge, LiveGraph, Workstream } from './api'
+import { Canvas } from './Canvas'
+import { NODE_HEIGHT, NODE_WIDTH } from './graphLayout'
+
+const layout = vi.hoisted(() => vi.fn<(graph: ElkNode) => Promise<ElkNode>>())
+
+vi.mock('./elk', () => ({ elk: () => ({ layout }) }))
+
+vi.mock('@xyflow/react', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@xyflow/react')>()),
+  ...(await import('../tests/xyflow-mock')),
+}))
+
+const real = new ELK()
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((r) => (resolve = r))
+  return { promise, resolve }
+}
+
+const ws = (id: number): Workstream => ({
+  id,
+  name: `ws-${id}`,
+  fallback: false,
+  costUsd: null,
+  unpriced: 0,
+  state: 'working',
+  needsYou: 0,
+  sessionId: `s-${id}`,
+  live: true,
+  startedAt: null,
+})
+
+function agent(over: Partial<GraphAgent> & Pick<GraphAgent, 'id'>): GraphAgent {
+  return {
+    agentId: `a-${over.id}`,
+    kind: 'subagent',
+    name: `agent-${over.id}`,
+    agentType: null,
+    description: null,
+    model: null,
+    state: 'working',
+    costUsd: null,
+    contextTokens: null,
+    contextPct: null,
+    nudgePct: 80,
+    hardStopPct: 95,
+    parent: null,
+    ...over,
+  }
+}
+
+const dispatch = (parent: number, child: number): GraphEdge => ({ kind: 'dispatch', parent, child })
+
+// Orchestrator 1 → subagent 2 and teammate 3; subagent 2 → its dispatch 4.
+const tiered: LiveGraph = {
+  sessionId: 's-1',
+  live: true,
+  agents: [
+    agent({ id: 1, kind: 'orchestrator', agentId: null, name: 'lead' }),
+    agent({ id: 2, parent: 1, name: 'builder' }),
+    agent({ id: 3, kind: 'teammate', parent: 1, name: 'mate' }),
+    agent({ id: 4, parent: 2, name: 'helper' }),
+  ],
+  edges: [dispatch(1, 2), { kind: 'teammate', parent: 1, child: 3 }, dispatch(2, 4)],
+}
+
+interface Props {
+  graph?: LiveGraph | null
+  active?: Workstream
+  selected?: number | null
+  onSelect?: (id: number) => void
+}
+
+function view({ graph = tiered, active = ws(1), selected = null, onSelect = () => {} }: Props) {
+  return (
+    <Tabs value={String(active.id)}>
+      <Canvas
+        error={null}
+        status="live"
+        active={active}
+        graph={graph}
+        selected={selected}
+        onSelect={onSelect}
+      />
+    </Tabs>
+  )
+}
+
+const node = (id: number) => screen.getByTestId(`node-${id}`)
+const y = (id: number) => Number(node(id).dataset.y)
+const pos = (id: number) => ({ x: node(id).dataset.x, y: node(id).dataset.y })
+const card = (name: string) => screen.getByRole('button', { name: new RegExp(name) })
+
+beforeEach(() => {
+  resetFlow()
+  layout.mockReset().mockImplementation((g) => real.layout(g))
+})
+
+describe('live graph', () => {
+  it('draws the orchestrator on top, its agents below, their dispatches below those', async () => {
+    render(view({}))
+    await screen.findByTestId('flow')
+    expect(y(1)).toBeLessThan(y(2))
+    expect(y(3)).toBe(y(2))
+    expect(y(2)).toBeLessThan(y(4))
+    expect(within(node(1)).getByRole('button', { name: /lead/ })).toBeInTheDocument()
+  })
+
+  it('draws dispatch edges solid and teammate edges dashed, in the muted colour', async () => {
+    render(view({}))
+    await screen.findByTestId('flow')
+    const solid = screen.getByTestId('edge-1-2')
+    const dashed = screen.getByTestId('edge-1-3')
+    expect(solid.dataset.dash).toBeUndefined()
+    expect(dashed.dataset.dash).toBeTruthy()
+    expect(solid.dataset.stroke).toBe('rgb(var(--muted-foreground) / 0.5)')
+    expect(screen.getByTestId('edge-2-4')).toBeInTheDocument()
+  })
+
+  it('pins nodes in place: no dragging, no connecting, handles top and bottom', async () => {
+    render(view({}))
+    await screen.findByTestId('flow')
+    expect(flowProps().nodesDraggable).toBe(false)
+    expect(flowProps().nodesConnectable).toBe(false)
+    const handles = within(node(2))
+    expect(handles.getByTestId('handle-target')).toHaveAttribute('data-position', 'top')
+    expect(handles.getByTestId('handle-source')).toHaveAttribute('data-position', 'bottom')
+    expect(handles.getByTestId('handle-source')).toHaveAttribute('data-connectable', 'false')
+  })
+
+  it('draws dark, fits the first layout, and puts the dots on the panning surface', async () => {
+    render(view({}))
+    await screen.findByTestId('flow')
+    expect(flowProps().colorMode).toBe('dark')
+    expect(flowProps().fitView).toBe(true)
+    // Space must stay a normal key everywhere else in the app.
+    expect(flowProps().panActivationKeyCode).toBeNull()
+    const dots = screen.getByTestId('background')
+    expect(dots).toHaveAttribute('data-variant', 'dots')
+    expect(dots).toHaveAttribute('data-gap', '20')
+    expect(dots).toHaveAttribute('data-color', 'rgb(63 63 70 / 0.5)')
+  })
+
+  it('zooms out and in from the buttons', async () => {
+    render(view({}))
+    await screen.findByTestId('flow')
+    fireEvent.click(screen.getByRole('button', { name: 'Zoom out' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Zoom in' }))
+    expect(zoomCalls).toEqual(['out', 'in'])
+  })
+})
+
+describe('node cards', () => {
+  it('selects the agent on click and rings the selected one', async () => {
+    const onSelect = vi.fn()
+    render(view({ selected: 3, onSelect }))
+    await screen.findByTestId('flow')
+    fireEvent.click(card('builder'))
+    expect(onSelect).toHaveBeenCalledWith(2)
+    expect(card('mate')).toHaveAttribute('aria-pressed', 'true')
+    expect(card('builder')).toHaveAttribute('aria-pressed', 'false')
+    expect(card('builder')).toHaveAttribute('data-agent', '2')
+  })
+
+  it('names the agent by name, then type, then kind', async () => {
+    const graph: LiveGraph = {
+      ...tiered,
+      agents: [
+        agent({ id: 1, name: null, agentType: 'implementer', description: 'Build it' }),
+        agent({ id: 2, name: null, kind: 'teammate', model: 'claude-opus-5-5' }),
+      ],
+      edges: [],
+    }
+    render(view({ graph }))
+    await screen.findByTestId('flow')
+    expect(card('implementer')).toHaveTextContent('Build it')
+    expect(card('teammate')).toHaveTextContent('claude-opus-5-5')
+  })
+
+  it("colours each gauge against that agent's own nudge and hard stop", async () => {
+    const graph: LiveGraph = {
+      ...tiered,
+      agents: [
+        agent({ id: 1, name: 'early', contextPct: 70, nudgePct: 60, hardStopPct: 90 }),
+        agent({ id: 2, name: 'late', contextPct: 92, nudgePct: 60, hardStopPct: 90 }),
+        agent({ id: 3, name: 'default', contextPct: 70 }),
+        agent({ id: 4, name: 'unknown' }),
+      ],
+      edges: [],
+    }
+    render(view({ graph }))
+    await screen.findByTestId('flow')
+    const fill = (name: string) =>
+      (within(card(name)).getByRole('meter').firstElementChild as Element).className
+    expect(fill('early')).toMatch(/bg-warning/)
+    expect(fill('late')).toMatch(/bg-destructive/)
+    expect(fill('default')).toMatch(/bg-success/)
+    expect(card('early')).toHaveTextContent('70%')
+    expect(within(card('unknown')).queryByRole('meter')).not.toBeInTheDocument()
+  })
+})
+
+describe('keyboard', () => {
+  type Box = { left: number; top: number; right: number; bottom: number }
+  // happy-dom has no layout. The flow sits at `flow` on screen (the mock maps
+  // flow coordinates to the screen 1:1), and every card's own box claims to be
+  // inside it, as it does mid-focus while the browser scrolls the flow to
+  // reveal it, before the flow resets that scroll.
+  function flowAt(flow: Box) {
+    const inside = {
+      left: flow.left + 1,
+      top: flow.top + 1,
+      right: flow.left + 2,
+      bottom: flow.top + 2,
+    }
+    return vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      const box = this.classList.contains('react-flow') ? flow : inside
+      return { ...box, x: box.left, y: box.top, width: 0, height: 0 } as DOMRect
+    })
+  }
+
+  it('leaves the cards as the only tab stops', async () => {
+    render(view({}))
+    await screen.findByTestId('flow')
+    expect(flowProps().nodesFocusable).toBe(false)
+    expect(card('builder').tabIndex).toBe(0)
+  })
+
+  it('centres a card that takes focus off-screen, at the current zoom', async () => {
+    render(view({}))
+    await screen.findByTestId('flow')
+    const spy = flowAt({ left: 5000, top: 5000, right: 5800, bottom: 5600 })
+    fireEvent.focus(card('builder'))
+    spy.mockRestore()
+    expect(centerCalls).toEqual([
+      { x: Number(pos(2).x) + NODE_WIDTH / 2, y: Number(pos(2).y) + NODE_HEIGHT / 2, zoom: 1 },
+    ])
+  })
+
+  it('leaves the view alone when the focused card is in view', async () => {
+    render(view({}))
+    await screen.findByTestId('flow')
+    const spy = flowAt({ left: -10_000, top: -10_000, right: 10_000, bottom: 10_000 })
+    fireEvent.focus(card('builder'))
+    spy.mockRestore()
+    expect(centerCalls).toEqual([])
+  })
+})
+
+describe('measured nodes', () => {
+  const allMeasured = () =>
+    screen.getAllByTestId(/^node-\d+$/).every((n) => n.dataset.measured === 'true')
+
+  it('keeps every node measured and its edges drawn across data and structural updates', async () => {
+    const { rerender } = render(view({}))
+    await screen.findByTestId('flow')
+    expect(allMeasured()).toBe(true)
+    const busy = { ...tiered, agents: tiered.agents.map((a) => ({ ...a, state: 'idle' as const })) }
+    rerender(view({ graph: busy }))
+    await act(async () => {})
+    expect(allMeasured()).toBe(true)
+    expect(screen.getByTestId('edge-1-2')).toBeInTheDocument()
+    const grown: LiveGraph = {
+      ...busy,
+      agents: [...busy.agents, agent({ id: 5, parent: 1 })],
+      edges: [...busy.edges, dispatch(1, 5)],
+    }
+    rerender(view({ graph: grown }))
+    await screen.findByTestId('edge-1-5')
+    expect(allMeasured()).toBe(true)
+    expect(screen.getByTestId('edge-2-4')).toBeInTheDocument()
+  })
+
+  it('ignores node changes that carry no size', async () => {
+    render(view({}))
+    await screen.findByTestId('flow')
+    act(() =>
+      flowProps().onNodesChange?.([
+        { id: '1', type: 'select', selected: true },
+        { id: '2', type: 'dimensions' },
+      ]),
+    )
+    expect(allMeasured()).toBe(true)
+  })
+
+  it('lets clicks reach the cards', async () => {
+    render(view({}))
+    await screen.findByTestId('flow')
+    expect(node(2)).toHaveAttribute('data-pointer-events', 'all')
+  })
+})
+
+describe('layout', () => {
+  it('draws nothing graph-side while the first layout is in flight, header included', async () => {
+    const pending = deferred<ElkNode>()
+    layout.mockReturnValueOnce(pending.promise)
+    render(view({}))
+    expect(screen.getByRole('heading', { name: 'ws-1' })).toBeInTheDocument()
+    await act(async () => {})
+    expect(screen.queryByTestId('flow')).not.toBeInTheDocument()
+    await act(async () => pending.resolve(await real.layout(layout.mock.calls[0]?.[0] as ElkNode)))
+    expect(screen.getByTestId('flow')).toBeInTheDocument()
+  })
+
+  it('updates state, cost and context without laying out again', async () => {
+    const { rerender } = render(view({}))
+    await screen.findByTestId('flow')
+    const before = [1, 2, 3, 4].map(pos)
+    const busy = {
+      ...tiered,
+      agents: tiered.agents.map((a) => ({ ...a, state: 'done' as const, contextPct: 50 })),
+    }
+    rerender(view({ graph: busy }))
+    await act(async () => {})
+    expect(layout).toHaveBeenCalledOnce()
+    expect([1, 2, 3, 4].map(pos)).toEqual(before)
+    expect(card('builder')).toHaveTextContent('done')
+  })
+
+  it('keeps every placed node where it was when an agent joins', async () => {
+    const { rerender } = render(view({}))
+    await screen.findByTestId('flow')
+    const before = [1, 2, 3, 4].map(pos)
+    const grown: LiveGraph = {
+      ...tiered,
+      agents: [...tiered.agents, agent({ id: 5, parent: 1, name: 'newcomer' })],
+      edges: [...tiered.edges, dispatch(1, 5)],
+    }
+    rerender(view({ graph: grown }))
+    // Until the new layout lands, the placed nodes stay and the newcomer waits.
+    expect(screen.queryByTestId('node-5')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('edge-1-5')).not.toBeInTheDocument()
+    await screen.findByTestId('node-5')
+    expect(layout).toHaveBeenCalledTimes(2)
+    expect([1, 2, 3, 4].map(pos)).toEqual(before)
+    expect(y(5)).toBe(y(2))
+    expect(screen.getByTestId('edge-1-5')).toBeInTheDocument()
+  })
+
+  it('lays a new tab out fresh, and drops a layout that lands after its tab was left', async () => {
+    const stale = deferred<ElkNode>()
+    layout.mockReturnValueOnce(stale.promise)
+    const { rerender } = render(view({}))
+    await act(async () => {})
+    const other: LiveGraph = { ...tiered, sessionId: 's-2' }
+    // Same agent ids, another tab: ELK's positions are used, none pinned.
+    layout.mockImplementationOnce(async (g) => ({
+      ...g,
+      children: g.children?.map((c, i) => ({ ...c, x: 1000 + i, y: 500 })),
+    }))
+    rerender(view({ graph: other, active: ws(2) }))
+    await screen.findByTestId('flow')
+    await act(async () => stale.resolve({ id: 'root', children: [{ id: '1', x: 0, y: 0 }] }))
+    expect(pos(1)).toEqual({ x: '1000', y: '500' })
+    expect(screen.getByRole('heading', { name: 'ws-2' })).toBeInTheDocument()
+  })
+
+  it('says so when ELK fails, and retries on the next structural change', async () => {
+    layout.mockRejectedValueOnce(new Error('worker crashed'))
+    const { rerender } = render(view({}))
+    expect(
+      await screen.findByText("Couldn't lay out the graph: worker crashed"),
+    ).toBeInTheDocument()
+    expect(screen.queryByTestId('flow')).not.toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'ws-1' })).toBeInTheDocument()
+    const grown: LiveGraph = {
+      ...tiered,
+      agents: [...tiered.agents, agent({ id: 5, parent: 1 })],
+      edges: [...tiered.edges, dispatch(1, 5)],
+    }
+    rerender(view({ graph: grown }))
+    await screen.findByTestId('flow')
+    expect(screen.getByTestId('node-5')).toBeInTheDocument()
+    expect(screen.queryByText(/Couldn't lay out/)).not.toBeInTheDocument()
+  })
+
+  it('keeps placed nodes pinned across a failed relayout', async () => {
+    const { rerender } = render(view({}))
+    await screen.findByTestId('flow')
+    const before = [1, 2, 3, 4].map(pos)
+    const join = (id: number): LiveGraph => ({
+      ...tiered,
+      agents: [...tiered.agents, agent({ id, parent: 1 })],
+      edges: [...tiered.edges, dispatch(1, id)],
+    })
+    layout.mockRejectedValueOnce(new Error('worker crashed'))
+    rerender(view({ graph: join(5) }))
+    await screen.findByText("Couldn't lay out the graph: worker crashed")
+    // The drawn graph stays up under the error line.
+    expect([1, 2, 3, 4].map(pos)).toEqual(before)
+    expect(screen.queryByTestId('node-5')).not.toBeInTheDocument()
+    rerender(view({ graph: join(6) }))
+    await screen.findByTestId('node-6')
+    expect([1, 2, 3, 4].map(pos)).toEqual(before)
+    expect(screen.queryByText(/Couldn't lay out/)).not.toBeInTheDocument()
+  })
+
+  it('lets the newest structure win when an older layout lands last', async () => {
+    const { rerender } = render(view({}))
+    await screen.findByTestId('flow')
+    const join = (id: number): LiveGraph => ({
+      ...tiered,
+      agents: [...tiered.agents, agent({ id, parent: 1 })],
+      edges: [...tiered.edges, dispatch(1, id)],
+    })
+    const older = deferred<ElkNode>()
+    layout.mockReturnValueOnce(older.promise)
+    rerender(view({ graph: join(5) }))
+    await act(async () => {})
+    rerender(view({ graph: join(6) }))
+    await screen.findByTestId('node-6')
+    await act(async () =>
+      older.resolve({
+        id: 'root',
+        children: [
+          { id: '1', x: 9999, y: 9999 },
+          { id: '5', x: 9999, y: 9999 },
+        ],
+      }),
+    )
+    expect(screen.queryByTestId('node-5')).not.toBeInTheDocument()
+    expect(node(1).dataset.x).not.toBe('9999')
+  })
+
+  it('retries a failed layout on a tab switch, and reports non-Error rejections', async () => {
+    layout.mockRejectedValueOnce('out of memory')
+    const { rerender } = render(view({}))
+    expect(await screen.findByText("Couldn't lay out the graph: out of memory")).toBeInTheDocument()
+    rerender(view({ graph: { ...tiered, sessionId: 's-2' }, active: ws(2) }))
+    await screen.findByTestId('flow')
+    expect(layout).toHaveBeenCalledTimes(2)
+  })
+
+  it('shows the empty state when the tab has no session', () => {
+    render(view({ graph: null }))
+    expect(screen.getByText('No session to draw yet.')).toBeInTheDocument()
+    expect(layout).not.toHaveBeenCalled()
+  })
+})

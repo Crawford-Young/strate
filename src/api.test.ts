@@ -52,6 +52,8 @@ describe('commands', () => {
           costUsd: 0.01,
           contextTokens: 50000,
           contextPct: 25,
+          nudgePct: 70,
+          hardStopPct: 90,
           parent: null,
         },
       ],

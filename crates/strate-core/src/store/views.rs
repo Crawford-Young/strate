@@ -102,6 +102,12 @@ pub struct GraphAgent {
     pub context_tokens: Option<i64>,
     /// That depth over the model's window; `None` for an unknown window.
     pub context_pct: Option<f64>,
+    /// The context percentage at which the agent is nudged: its own gear,
+    /// else the orchestrator's, else the built-in 80.
+    pub nudge_pct: u8,
+    /// The context percentage at which the agent is stopped: its own gear,
+    /// else the orchestrator's, else the built-in 95.
+    pub hard_stop_pct: u8,
     /// The dispatching or team-lead agent, when it is drawn too.
     pub parent: Option<i64>,
 }
@@ -304,8 +310,10 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
              (SELECT p.parent FROM edges AS p
                  WHERE p.child = a.id AND p.kind IN ('dispatch', 'teammate')),
              (SELECT p.kind FROM edges AS p
-                 WHERE p.child = a.id AND p.kind IN ('dispatch', 'teammate'))
+                 WHERE p.child = a.id AND p.kind IN ('dispatch', 'teammate')),
+             ge.nudge_pct, ge.hard_stop_pct
          FROM agents AS a
+         JOIN gear_effective AS ge ON ge.agent = a.id
          LEFT JOIN segments AS g ON g.id = a.segment_id
          LEFT JOIN workstream_roots AS r ON r.id = g.workstream_id
          WHERE a.session_id = ?1 AND (a.agent_id IS NULL OR a.segment_id IS NULL OR r.root = ?2)
@@ -340,6 +348,8 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
                 cost_usd: r.get(7)?,
                 context_tokens: r.get(8)?,
                 context_pct: r.get(9)?,
+                nudge_pct: r.get(16)?,
+                hard_stop_pct: r.get(17)?,
                 parent: None,
             },
             edge,
@@ -410,6 +420,8 @@ mod tests {
             cost_usd: None,
             context_tokens: None,
             context_pct: None,
+            nudge_pct: 80,
+            hard_stop_pct: 95,
             parent: None,
         };
         assert_eq!(
@@ -427,10 +439,12 @@ mod tests {
                 "contextTokens",
                 "costUsd",
                 "description",
+                "hardStopPct",
                 "id",
                 "kind",
                 "model",
                 "name",
+                "nudgePct",
                 "parent",
                 "state"
             ]

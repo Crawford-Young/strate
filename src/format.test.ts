@@ -17,6 +17,8 @@ function agent(costUsd: number | null): GraphAgent {
     costUsd,
     contextTokens: null,
     contextPct: null,
+    nudgePct: 80,
+    hardStopPct: 95,
     parent: null,
   }
 }

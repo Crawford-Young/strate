@@ -20,9 +20,9 @@ import { OrchestratorTab } from './OrchestratorTab'
 import type { Layout } from './layout'
 import { usePanels } from './usePanels'
 
-/** The picked tab while it exists, else the live orchestrator, else the first. */
+/** The picked tab while it exists, else the first. */
 function activeTab(list: Workstream[], picked: number | null): Workstream | null {
-  return list.find((w) => w.id === picked) ?? list.find((w) => w.live) ?? list[0] ?? null
+  return list.find((w) => w.id === picked) ?? list[0] ?? null
 }
 
 export function App() {
@@ -34,8 +34,10 @@ export function App() {
   const canvasRef = useRef<HTMLElement>(null)
   const stripRef = useRef<HTMLDivElement>(null)
 
-  const [current, list] = shell && 'value' in shell ? shell.value : [null, []]
-  // The picked tab went away: fall back, and forget the pick and its node so
+  const [current, all] = shell && 'value' in shell ? shell.value : [null, []]
+  // Only live sessions get a tab; past ones belong to the audit view.
+  const list = all.filter((w) => w.live)
+  // The picked tab went away (or stopped being live): fall back, and forget the pick and its node so
   // neither comes back if the tab reappears.
   if (picked !== null && !list.some((w) => w.id === picked)) {
     setPicked(null)
@@ -145,7 +147,7 @@ export function App() {
               <main
                 ref={canvasRef}
                 tabIndex={-1}
-                className="relative h-full overflow-hidden bg-background bg-[radial-gradient(rgb(63_63_70/0.5)_1px,transparent_1px)] bg-[size:20px_20px] outline-none"
+                className="relative h-full overflow-hidden bg-background outline-none"
               >
                 <Canvas
                   error={error}
