@@ -105,6 +105,7 @@ describe('commands', () => {
         usdPerMergedPr: null,
         cloudUncounted: true,
       },
+      githubErrors: [{ repo: 'other', error: 'gh: not logged in' }],
     }
     invokeMock.mockResolvedValueOnce(audit)
     await expect(auditRollup(filter)).resolves.toEqual(audit)

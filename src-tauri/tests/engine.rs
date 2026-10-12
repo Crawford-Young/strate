@@ -372,6 +372,17 @@ fn recorded_gh(
     })
 }
 
+/// Waits until the alpha-1 window is stored, so a refresh has a repo.
+fn wait_for_window(temp: &Temp) {
+    let reader = Store::open_reader(temp.db()).expect("reader");
+    wait_for("the window stored", || {
+        views::workstreams(&reader)
+            .expect("workstreams")
+            .iter()
+            .any(|w| w.name == "alpha-1")
+    });
+}
+
 fn cached_repos(temp: &Temp) -> Vec<strate_core::store::GhRepo> {
     gh_repos(&Store::open_reader(temp.db()).expect("reader")).expect("repos")
 }
@@ -386,10 +397,7 @@ fn a_refresh_request_caches_the_windows_repos_and_notifies() {
     let engine = Engine::start(config, on_change).expect("start");
     let progress = engine.progress();
     wait_for("live", || progress.status() == Status::Live);
-    wait_for("the window stored", || {
-        let reader = Store::open_reader(temp.db()).expect("reader");
-        github::window_slugs(&reader).expect("slugs") == ["alpha"]
-    });
+    wait_for_window(&temp);
     assert!(cached_repos(&temp).is_empty(), "nothing is fetched unasked");
 
     let before = changes.load(Ordering::SeqCst);
@@ -414,7 +422,7 @@ fn a_refresh_request_caches_the_windows_repos_and_notifies() {
         .iter()
         .map(|i| i.number)
         .collect();
-    assert_eq!(numbers, [8, 9, 10]);
+    assert_eq!(numbers, [8, 9, 10, 11]);
     wait_for("a change", || changes.load(Ordering::SeqCst) > before);
     engine.stop();
 }
@@ -430,10 +438,7 @@ fn requests_during_a_refresh_coalesce_and_never_block_the_other_sources() {
     let engine = Engine::start(config, on_change).expect("start");
     let progress = engine.progress();
     wait_for("live", || progress.status() == Status::Live);
-    wait_for("the window stored", || {
-        github::window_slugs(&Store::open_reader(temp.db()).expect("reader")).expect("slugs")
-            == ["alpha"]
-    });
+    wait_for_window(&temp);
 
     let refresher = engine.refresher();
     refresher.request();
@@ -458,14 +463,46 @@ fn requests_during_a_refresh_coalesce_and_never_block_the_other_sources() {
             .first()
             .is_some_and(|r| r.fetched_at.is_some())
     });
+    // The five requests made during the fetch run once more, after it.
+    wait_for("the trailing fetch", || queries.load(Ordering::SeqCst) == 2);
+    release.send(()).expect("release the trailing fetch");
     thread::sleep(Duration::from_millis(300));
-    assert_eq!(queries.load(Ordering::SeqCst), 1, "six requests, one fetch");
+    assert_eq!(
+        queries.load(Ordering::SeqCst),
+        2,
+        "six requests, two fetches"
+    );
 
     release.send(()).expect("release the next");
     refresher.request();
     wait_for("a later request fetches again", || {
-        queries.load(Ordering::SeqCst) == 2
+        queries.load(Ordering::SeqCst) == 3
     });
+    engine.stop();
+}
+
+#[test]
+fn a_request_during_a_fetch_runs_exactly_one_more_after_it() {
+    let temp = Temp::new("gh-trailing");
+    temp.write("s-alpha.jsonl", &session_lines());
+    let (_changes, on_change) = counter();
+    let queries = Arc::new(AtomicUsize::new(0));
+    let (release, gate) = std::sync::mpsc::channel();
+    let config = temp.config_with(None, Some(recorded_gh(queries.clone(), Some(gate))), None);
+    let engine = Engine::start(config, on_change).expect("start");
+    wait_for_window(&temp);
+
+    let refresher = engine.refresher();
+    refresher.request();
+    wait_for("the fetch to start", || queries.load(Ordering::SeqCst) == 1);
+    // A window named while the fetch runs is not missed: one more fetch
+    // follows.
+    refresher.request();
+    release.send(()).expect("release");
+    wait_for("the trailing fetch", || queries.load(Ordering::SeqCst) == 2);
+    release.send(()).expect("release the trailing fetch");
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(queries.load(Ordering::SeqCst), 2, "no third fetch");
     engine.stop();
 }
 
@@ -479,10 +516,7 @@ fn a_failing_or_missing_gh_is_recorded_per_repo_and_the_engine_carries_on() {
         Engine::start(temp.config_with(None, Some(failing), None), on_change).expect("start");
     let progress = engine.progress();
     wait_for("live", || progress.status() == Status::Live);
-    wait_for("the window stored", || {
-        github::window_slugs(&Store::open_reader(temp.db()).expect("reader")).expect("slugs")
-            == ["alpha"]
-    });
+    wait_for_window(&temp);
 
     engine.refresher().request();
     wait_for("the error recorded", || {

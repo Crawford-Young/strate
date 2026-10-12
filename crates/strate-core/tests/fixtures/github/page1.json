@@ -1,7 +1,7 @@
 {"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":true,"endCursor":"CURSOR-1"},"nodes":[
 {"number":4,"title":"Epic: lorem rollups","state":"OPEN","createdAt":"2026-10-01T09:00:00Z","closedAt":null,"parent":null,
  "subIssuesSummary":{"total":3,"completed":1},"closedByPullRequestsReferences":{"nodes":[]}},
-{"number":25,"title":"Ipsum cache","state":"CLOSED","createdAt":"2026-10-02T09:00:00Z","closedAt":"2026-10-05T12:00:00Z","parent":{"number":4},
+{"number":25,"title":"Ipsum cache","state":"CLOSED","createdAt":"2026-10-02T09:00:00Z","closedAt":"2026-10-05T12:00:00Z","parent":{"number":4,"repository":{"nameWithOwner":"acme/widget"}},
  "subIssuesSummary":{"total":0,"completed":0},
  "closedByPullRequestsReferences":{"nodes":[
    {"number":31,"state":"MERGED","createdAt":"2026-10-04T08:00:00Z","mergedAt":"2026-10-05T12:00:00Z","url":"https://github.com/acme/widget/pull/31"},

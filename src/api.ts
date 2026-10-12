@@ -97,17 +97,7 @@ export interface AuditFilter {
 }
 
 export type NodeKind =
-  | 'root'
-  /** A value of the group-by: a day, `<repo>#<pr>`, an agent type or a model. */
-  | 'group'
-  | 'repo'
-  | 'unlinked'
-  | 'epic'
-  | 'issue'
-  | 'pr'
-  /** One `/rename` window. */
-  | 'session'
-  | 'agent'
+  'root' | 'group' | 'repo' | 'unlinked' | 'epic' | 'issue' | 'pr' | 'session' | 'agent'
 
 export interface Tokens {
   input: number
@@ -149,6 +139,10 @@ export interface Metrics {
 }
 
 export interface AuditNode {
+  /**
+   * `group` is a value of the group-by: a day, `<repo>#<pr>` (the PR's own
+   * repo), an agent type or a model. `session` is one `/rename` window.
+   */
   kind: NodeKind
   /** Unique among its siblings. */
   key: string
@@ -159,20 +153,30 @@ export interface AuditNode {
   children: AuditNode[]
 }
 
-/** The closed issues and merged PRs with work in the filter. */
+/** The issues closed as completed and the merged PRs with work in the filter. */
 export interface Headline {
   issuesClosed: number
+  /** Over each issue's whole life, first window ever to close. */
   medianElapsedMs: number | null
-  /** Their $ over their count. */
+  /** Their $ in the filter over their count. */
   usdPerClosedIssue: number | null
+  /** Their $ in the filter over their count; a PR closing several issues counts once. */
   usdPerMergedPr: number | null
   /** Cloud sessions are not in the store (#29), so their spend is missing. */
   cloudUncounted: boolean
 }
 
+/** A repo (slug) whose latest GitHub refresh failed, and why. */
+export interface GithubError {
+  repo: string
+  error: string
+}
+
 export interface Audit {
   root: AuditNode
   headline: Headline
+  /** The repos whose GitHub data is missing or stale. */
+  githubErrors: GithubError[]
 }
 
 export const status = () => invoke<Status>('status')
@@ -193,7 +197,7 @@ export const auditRollup = (filter: AuditFilter) => invoke<Audit>('audit_rollup'
 /**
  * Asks the engine to refresh the GitHub cache and resolves at once; refetch
  * on `store-changed` when it lands. A missing or failing `gh` is not an
- * error: it shows as unlinked issues.
+ * error: its repos show in `Audit.githubErrors`, their issues with no GitHub data.
  */
 export const auditRefresh = (): Promise<void> => invoke('audit_refresh')
 

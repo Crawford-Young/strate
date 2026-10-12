@@ -18,7 +18,8 @@ use serde::Serialize;
 
 use super::Result;
 pub use super::audit::{
-    Audit, AuditFilter, AuditNode, GroupBy, Headline, Metrics, NodeKind, Progress, Tokens, audit,
+    Audit, AuditFilter, AuditNode, GithubError, GroupBy, Headline, Metrics, NodeKind, Progress,
+    Tokens, audit,
 };
 
 /// An agent's state, as the canvas and tabs show it.

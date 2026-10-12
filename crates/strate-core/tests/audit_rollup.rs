@@ -523,7 +523,7 @@ fn check_sums(node: &AuditNode, path: &str) {
     }
 }
 
-/// The cells in `[from, to]`, summed: $, the 4 token counts, agent ms
+/// The cells in `[from, to]` that are not idle only, summed: $, the 4 token counts, agent ms
 /// (subagent wall), active and waiting (orchestrator cells), windows and
 /// subagents.
 fn cell_totals(db: &Connection, from: &str, to: &str) -> (f64, [i64; 4], [i64; 3], [i64; 2]) {
@@ -535,7 +535,10 @@ fn cell_totals(db: &Connection, from: &str, to: &str) -> (f64, [i64; 4], [i64; 3
              sum(CASE WHEN agent_id IS NULL THEN wait_ms ELSE 0 END),
              count(DISTINCT ifnull('w' || segment_id, session_id)),
              count(DISTINCT session_id || '/' || agent_id)
-         FROM audit_cells WHERE day BETWEEN ?1 AND ?2",
+         FROM audit_cells WHERE day BETWEEN ?1 AND ?2
+             AND NOT (active_ms = 0 AND wait_ms = 0 AND cost_usd IS NULL AND unpriced = 0
+                 AND input_tokens + output_tokens + cache_read_tokens + cache_write_tokens = 0
+                 AND (agent_id IS NULL OR wall_ms = 0))",
         [from, to],
         |r| {
             Ok((
@@ -637,6 +640,15 @@ fn the_filter_and_tree_use_the_webview_shape() {
     let t = Temp::new("shape");
     let db = build(&t);
     let value = serde_json::to_value(october(&db, GroupBy::Hierarchy)).expect("json");
+    let mut keys: Vec<_> = value.as_object().expect("audit").keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["githubErrors", "headline", "root"]);
+    assert_eq!(
+        value["githubErrors"][0]
+            .as_object()
+            .map(|e| e.keys().cloned().collect::<Vec<_>>()),
+        Some(vec!["error".to_string(), "repo".to_string()])
+    );
     let mut keys: Vec<_> = value["headline"]
         .as_object()
         .expect("headline")
@@ -696,4 +708,150 @@ fn the_filter_and_tree_use_the_webview_shape() {
         ["children", "github", "key", "kind", "label", "metrics"]
     );
     assert_eq!(root["children"][2]["kind"], "unlinked");
+}
+
+#[test]
+fn the_headline_elapsed_is_the_whole_lifetime_whatever_the_range() {
+    let t = Temp::new("lifetime");
+    let db = build(&t);
+    // Oct 5 holds only demo-9-s2's tail, but #9's elapsed still runs from
+    // its first window ever (Oct 4 14:00:00Z) to the close (Oct 5 12:00:00Z).
+    let oct5 = audit(
+        &db,
+        &filter("2026-10-05", "2026-10-05", &[], GroupBy::Hierarchy),
+    )
+    .expect("audit")
+    .headline;
+    assert_eq!(oct5.issues_closed, 1);
+    assert_eq!(oct5.median_elapsed_ms, Some(22 * 3600 * S));
+    assert!(close(OPUS, oct5.usd_per_closed_issue.expect("closed")));
+    // A range with no work on #9 does not count it.
+    let none = audit(
+        &db,
+        &filter("2026-10-06", "2026-10-31", &[], GroupBy::Hierarchy),
+    )
+    .expect("audit")
+    .headline;
+    assert_eq!((none.issues_closed, none.median_elapsed_ms), (0, None));
+}
+
+#[test]
+fn the_audit_lists_the_repos_github_could_not_fetch() {
+    let t = Temp::new("gh-errors");
+    let db = build(&t);
+    let errors = october(&db, GroupBy::Hierarchy).github_errors;
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].repo, "other");
+    assert!(errors[0].error.contains("Could not resolve"), "{errors:?}");
+    let t = Temp::new("gh-errors-none");
+    drop(build_without_gh(&t));
+    let db = Store::open_reader(t.db()).expect("reader");
+    assert!(october(&db, GroupBy::Hierarchy).github_errors.is_empty());
+}
+
+/// A store holding exactly `sql`'s rows (no transcripts): the store is
+/// created, then the rows go in on a plain connection, then a reader.
+fn synthetic(t: &Temp, sql: &str) -> Connection {
+    drop(Store::open_in(t.db(), "UTC").expect("open"));
+    Connection::open(t.db())
+        .expect("raw")
+        .execute_batch(sql)
+        .expect("rows");
+    Store::open_reader(t.db()).expect("reader")
+}
+
+/// Repo `lab`: #1 and #2 closed as completed, both closed by PR #5 of
+/// `lab-ui` (merged), with $1 and $3 of work; #3 closed as not planned,
+/// with $2; #4 not cached, one window Friday to Monday, idle on the
+/// weekend.
+const LAB: &str = "
+    INSERT INTO sessions (session_id, path, started_at) VALUES
+        ('s1', '/p/s1.jsonl', '2026-10-02T10:00:00.000Z'),
+        ('s2', '/p/s2.jsonl', '2026-10-02T12:00:00.000Z'),
+        ('s3', '/p/s3.jsonl', '2026-10-02T14:00:00.000Z'),
+        ('s4', '/p/s4.jsonl', '2026-10-09T20:00:00.000Z');
+    INSERT INTO workstreams (id, name, fallback) VALUES
+        (1, 'lab-1', 0), (2, 'lab-2', 0), (3, 'lab-3', 0), (4, 'lab-4', 0);
+    INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id) VALUES
+        (1, 's1', 0, '2026-10-02T10:00:00.000Z', 1),
+        (2, 's2', 0, '2026-10-02T12:00:00.000Z', 2),
+        (3, 's3', 0, '2026-10-02T14:00:00.000Z', 3),
+        (4, 's4', 0, '2026-10-09T20:00:00.000Z', 4);
+    INSERT INTO audit_cells (session_id, agent_id, segment_id, day, model, wall_ms,
+        active_ms, wait_ms, cost_usd, unpriced, input_tokens, output_tokens,
+        cache_read_tokens, cache_write_tokens) VALUES
+        ('s1', NULL, 1, '2026-10-02', 'm', 1000, 1000, 0, 1.0, 0, 10, 1, 0, 0),
+        ('s2', NULL, 2, '2026-10-02', 'm', 1000, 1000, 0, 3.0, 0, 10, 1, 0, 0),
+        ('s3', NULL, 3, '2026-10-02', 'm', 1000, 1000, 0, 2.0, 0, 10, 1, 0, 0),
+        ('s4', NULL, 4, '2026-10-09', 'm', 3600000, 600000, 0, 0.5, 0, 10, 1, 0, 0),
+        ('s4', NULL, 4, '2026-10-10', NULL, 86400000, 0, 0, NULL, 0, 0, 0, 0, 0),
+        ('s4', NULL, 4, '2026-10-11', NULL, 86400000, 0, 0, NULL, 0, 0, 0, 0, 0),
+        ('s4', NULL, 4, '2026-10-12', 'm', 3600000, 600000, 0, 0.5, 0, 10, 1, 0, 0);
+    INSERT INTO gh_repos (slug, owner, name, fetched_at) VALUES ('lab', 'example', 'lab', 1);
+    INSERT INTO gh_issues (repo, number, title, state, state_reason, created_at, closed_at,
+        parent, sub_total, sub_completed) VALUES
+        ('lab', 1, 'Lorem', 'CLOSED', 'COMPLETED', '2026-10-01T00:00:00Z', '2026-10-03T10:00:00Z', NULL, 0, 0),
+        ('lab', 2, 'Ipsum', 'CLOSED', 'COMPLETED', '2026-10-01T00:00:00Z', '2026-10-03T12:00:00Z', NULL, 0, 0),
+        ('lab', 3, 'Dolor', 'CLOSED', 'NOT_PLANNED', '2026-10-01T00:00:00Z', '2026-10-03T14:00:00Z', NULL, 0, 0);
+    INSERT INTO gh_prs (repo, issue, number, state, created_at, merged_at, url) VALUES
+        ('lab', 1, 5, 'MERGED', '2026-10-02T00:00:00Z', '2026-10-03T09:00:00Z', 'https://github.com/example/lab-ui/pull/5'),
+        ('lab', 2, 5, 'MERGED', '2026-10-02T00:00:00Z', '2026-10-03T09:00:00Z', 'https://github.com/example/lab-ui/pull/5');
+";
+
+fn lab(db: &Connection, from: &str, to: &str, group_by: GroupBy) -> Audit {
+    audit(db, &filter(from, to, &[], group_by)).expect("audit")
+}
+
+#[test]
+fn a_pr_closing_two_issues_counts_once_in_dollars_per_merged_pr() {
+    let t = Temp::new("pr-twice");
+    let db = synthetic(&t, LAB);
+    let h = lab(&db, "2026-10-01", "2026-10-31", GroupBy::Hierarchy).headline;
+    // One PR, $1 + $3 of work under it: not two PRs at $1 and $3.
+    assert!(close(4.0, h.usd_per_merged_pr.expect("merged")), "{h:?}");
+}
+
+#[test]
+fn only_issues_closed_as_completed_count_in_the_headline() {
+    let t = Temp::new("completed");
+    let db = synthetic(&t, LAB);
+    let a = lab(&db, "2026-10-01", "2026-10-31", GroupBy::Hierarchy);
+    let h = &a.headline;
+    assert_eq!(h.issues_closed, 2, "#3 was closed as not planned");
+    assert!(close(2.0, h.usd_per_closed_issue.expect("closed")), "{h:?}");
+    // #1: Oct 2 10:00 -> Oct 3 10:00, #2: Oct 2 12:00 -> Oct 3 12:00.
+    assert_eq!(h.median_elapsed_ms, Some(24 * 3600 * S));
+    // #3 keeps its $ in the tree.
+    let three = child(child(&a.root, NodeKind::Repo, "lab"), NodeKind::Issue, "3");
+    assert!(close(2.0, three.metrics.cost_usd));
+    assert!(!three.metrics.open);
+}
+
+#[test]
+fn the_pr_group_is_keyed_by_the_prs_own_repo() {
+    let t = Temp::new("pr-repo");
+    let db = synthetic(&t, LAB);
+    let a = lab(&db, "2026-10-01", "2026-10-31", GroupBy::Pr);
+    let keys: Vec<_> = a.root.children.iter().map(|c| c.key.as_str()).collect();
+    assert_eq!(keys, ["", "lab-ui#5"]);
+    let pr = child(&a.root, NodeKind::Group, "lab-ui#5");
+    assert_eq!(pr.label, "lab-ui #5");
+    assert!(close(4.0, pr.metrics.cost_usd));
+}
+
+#[test]
+fn idle_only_days_show_nothing() {
+    let t = Temp::new("idle");
+    let db = synthetic(&t, LAB);
+    let sat = lab(&db, "2026-10-10", "2026-10-10", GroupBy::Hierarchy).root;
+    assert!(sat.children.is_empty(), "{:?}", sat.children);
+    assert_eq!(sat.metrics.sessions, 0);
+    let weekend = lab(&db, "2026-10-10", "2026-10-11", GroupBy::Day).root;
+    assert!(weekend.children.is_empty());
+    // Friday to Monday: the window, counted once, with its two working days.
+    let four = lab(&db, "2026-10-09", "2026-10-12", GroupBy::Day).root;
+    let days: Vec<_> = four.children.iter().map(|c| c.key.as_str()).collect();
+    assert_eq!(days, ["2026-10-09", "2026-10-12"]);
+    assert_eq!(four.metrics.sessions, 1);
+    assert!(close(1.0, four.metrics.cost_usd));
 }

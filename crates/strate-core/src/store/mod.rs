@@ -72,8 +72,12 @@ impl Store {
     /// `America/Toronto`. A store last accounted in another zone has every
     /// rollup recomputed. Fails, opening nothing, on a zone jiff cannot load.
     pub fn open_in(path: impl AsRef<Path>, zone: &str) -> Result<Self> {
-        jiff::tz::TimeZone::get(zone)
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        jiff::tz::TimeZone::get(zone).map_err(|e| {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_MISUSE),
+                Some(format!("unknown time zone {zone:?}: {e}")),
+            )
+        })?;
         let mut conn = Connection::open(path)?;
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -341,6 +345,22 @@ mod tests {
         assert_eq!(pragma("synchronous"), "Integer(1)");
         assert_eq!(pragma("foreign_keys"), "Integer(1)");
         drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn an_unknown_zone_is_refused_before_the_db_is_created() {
+        let dir = test_dir("store-bad-zone");
+        let db = dir.join("strate.db");
+        let err = Store::open_in(&db, "Lorem/Ipsum")
+            .err()
+            .expect("unknown zone");
+        assert!(
+            matches!(&err, rusqlite::Error::SqliteFailure(_, Some(msg))
+                if msg.contains("Lorem/Ipsum")),
+            "{err:?}"
+        );
+        assert!(!db.exists());
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 

@@ -109,6 +109,32 @@ fn pages_are_followed_by_cursor_and_parse_into_issues_with_their_prs() {
 }
 
 #[test]
+fn a_parent_in_another_repo_is_no_epic_and_the_close_reason_is_kept() {
+    let (mut runner, calls) = scripted(vec![ok("audit-home.json")]);
+    // GitHub owners are case-insensitive.
+    let issues = fetch_repo(&mut runner, "Example", "demo").expect("fetch");
+    let by = |n: i64| issues.iter().find(|i| i.number == n).expect("issue");
+    assert_eq!(by(9).parent, Some(8), "a parent in example/demo");
+    assert_eq!(by(11).parent, None, "a parent in example/elsewhere");
+    assert_eq!(by(9).state_reason.as_deref(), Some("COMPLETED"));
+    assert_eq!(by(11).state_reason.as_deref(), Some("NOT_PLANNED"));
+    assert_eq!(by(8).state_reason, None, "open");
+    let query = calls.lock().expect("calls")[0].clone();
+    assert!(
+        arg(&query, "query")
+            .is_some_and(|q| q.contains("stateReason") && q.contains("nameWithOwner"))
+    );
+
+    let tmp = Temp::new("reason");
+    let mut store = Store::open(tmp.db()).expect("open");
+    store
+        .gh_replace("demo", "example", &issues, 1)
+        .expect("store");
+    let stored = gh_issues(&Store::open_reader(tmp.db()).expect("reader"), "demo").expect("issues");
+    assert_eq!(stored, issues, "parent and close reason round-trip");
+}
+
+#[test]
 fn bad_json_graphql_errors_and_runner_failures_are_errors_not_panics() {
     for answer in [
         Ok(b"not json".to_vec()),

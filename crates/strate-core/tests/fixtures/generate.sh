@@ -220,7 +220,8 @@ kat $K2 /work/cost-other '"isSidechain":false'
 } > "$K/projects/-work-cost-other/$K2.jsonl"
 
 # ---- audit-home: audit rollups (#26); hand values in tests/audit_rollup.rs ----
-# Repo demo (gh JSON: github/audit-home.json): epic #8 over #9 (closed) and #10.
+# Repo demo (gh JSON: github/audit-home.json): epic #8 over #9 (closed) and #10;
+# #11 (closed not planned, no window) has its parent in another repo.
 # Times are UTC; America/Toronto is UTC-4 here, so local midnight is 04:00Z.
 A=fixtures/audit-home
 A1=5e559a9a-0000-4000-8000-0000000000a1
@@ -293,7 +294,7 @@ ameta recon toolu_b1 > "$AD/$A2/subagents/agent-a9000000000000002.meta.json"
 # A3, window demo-10 (open, no PR), 2026-10-05.
 aat $A3 /work/demo '"isSidechain":false'
 { atitle demo-10; aprompt 2026-10-05T15:00:00 a3-01; areply 2026-10-05T15:00:30 a3-02 req_c1 $OPUS "$UO" "$TEXT"; } > "$AD/$A3.jsonl"
-# A4, window other-3: a repo gh cannot fetch, so Unlinked.
+# A4, window other-3: a repo gh cannot fetch, so Repo > Issue with no GitHub data.
 aat $A4 /work/other '"isSidechain":false'
 { atitle other-3; aprompt 2026-10-05T16:00:00 a4-01; areply 2026-10-05T16:00:20 a4-02 req_d1 $OPUS "$UO" "$TEXT"; } > "$A/projects/-work-other/$A4.jsonl"
 # A5, never named: Unlinked.
