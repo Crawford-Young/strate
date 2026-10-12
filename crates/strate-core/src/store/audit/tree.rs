@@ -115,7 +115,7 @@ fn group_step(group_by: GroupBy, cell: &Cell, cells: &Cells, gh: &Gh) -> Option<
         GroupBy::AgentType => {
             let kind = match &cell.agent_id {
                 None => Some("orchestrator".to_string()),
-                Some(id) => cells.agent(cell, id).agent_type.clone(),
+                Some(id) => cells.agent(cell, id).and_then(|a| a.agent_type.clone()),
             };
             match kind {
                 Some(k) => (k.clone(), k),
@@ -160,8 +160,18 @@ fn place_steps(place: &Place, gh: &Gh) -> Vec<Step> {
     ));
     if let Some(epic) = gh.issue(repo, issue).and_then(|i| i.parent) {
         steps.push(Step::issue(NodeKind::Epic, gh, repo, epic));
+        steps.push(Step::issue(NodeKind::Issue, gh, repo, issue));
+    } else if gh.is_epic(repo, issue) {
+        // An epic with a window of its own: one Epic node, the window under
+        // its "Direct work" Issue node beside the sub-issues.
+        steps.push(Step::issue(NodeKind::Epic, gh, repo, issue));
+        let mut direct = Step::issue(NodeKind::Issue, gh, repo, issue);
+        direct.label = "Direct work".into();
+        direct.progress = None;
+        steps.push(direct);
+    } else {
+        steps.push(Step::issue(NodeKind::Issue, gh, repo, issue));
     }
-    steps.push(Step::issue(NodeKind::Issue, gh, repo, issue));
     if let Some(number) = pr {
         steps.push(pr_step(gh, repo, issue, number));
     }
@@ -219,8 +229,9 @@ fn agent_step(cell: &Cell, cells: &Cells) -> Step {
         }
         Some(id) => {
             let agent = cells.agent(cell, id);
-            let mut step = Step::new(NodeKind::Agent, id.clone(), agent.label.clone(), id.clone());
-            step.elapsed = agent.run_ms;
+            let label = agent.map_or_else(|| id.clone(), |a| a.label.clone());
+            let mut step = Step::new(NodeKind::Agent, id.clone(), label, id.clone());
+            step.elapsed = agent.and_then(|a| a.run_ms);
             step
         }
     };
