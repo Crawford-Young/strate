@@ -7,10 +7,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use rusqlite::Connection;
 use strate_core::store::Store;
-use strate_core::store::views::{self, LiveGraph, NeedsYou, Workstream, WorkstreamCost};
+use strate_core::store::views::{
+    self, Audit, AuditFilter, LiveGraph, NeedsYou, Workstream, WorkstreamCost,
+};
 use tauri::State;
 
-use crate::engine::{Progress, Status};
+use crate::engine::{Progress, Refresher, Status};
 
 /// Emitted (no payload, at most four a second) after the store changed.
 pub const STORE_CHANGED: &str = "store-changed";
@@ -63,8 +65,30 @@ pub fn live_graph(reader: State<'_, Reader>, workstream: i64) -> Result<Option<L
     reader.read(|conn| views::live_graph(conn, workstream))
 }
 
+/// The Audit tree and headline for `filter`, over the stored cells and
+/// the cached GitHub rows. A bad day in the filter is an error.
+#[tauri::command(async)]
+pub fn audit_rollup(reader: State<'_, Reader>, filter: AuditFilter) -> Result<Audit, String> {
+    rollup(&reader, &filter)
+}
+
+fn rollup(reader: &Reader, filter: &AuditFilter) -> Result<Audit, String> {
+    reader.read(|conn| views::audit(conn, filter))
+}
+
+/// Asks the engine to refresh the GitHub cache and returns at once; the
+/// webview refetches on [`STORE_CHANGED`] when it lands. A refresh already
+/// running absorbs the request, and no GitHub failure is an error here (it
+/// is stored per repo).
+#[tauri::command]
+pub fn audit_refresh(refresher: State<'_, Refresher>) {
+    refresher.request();
+}
+
 #[cfg(test)]
 mod tests {
+    use strate_core::store::views::GroupBy;
+
     use super::*;
 
     #[test]
@@ -82,6 +106,18 @@ mod tests {
             .read(|conn| conn.execute("DELETE FROM events", []))
             .expect_err("read-only");
         assert!(err.contains("readonly"), "{err}");
+
+        let filter = |from: &str| AuditFilter {
+            from: from.into(),
+            to: "2026-10-31".into(),
+            repos: vec![],
+            group_by: GroupBy::Hierarchy,
+        };
+        let audit = rollup(&reader, &filter("2026-10-01")).expect("an empty store rolls up");
+        assert!(audit.root.children.is_empty());
+        assert_eq!(audit.headline.issues_closed, 0);
+        let err = rollup(&reader, &filter("October")).expect_err("a bad day is an error");
+        assert!(!err.is_empty());
 
         assert!(Reader::open(&dir.join("missing.db")).is_err());
         drop(reader);

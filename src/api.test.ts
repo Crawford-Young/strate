@@ -3,12 +3,16 @@ import { listen } from '@tauri-apps/api/event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   STORE_CHANGED,
+  auditRefresh,
+  auditRollup,
   liveGraph,
   needsYou,
   onStoreChanged,
   status,
   workstreamCosts,
   workstreams,
+  type Audit,
+  type AuditFilter,
   type LiveGraph,
 } from './api'
 
@@ -62,6 +66,55 @@ describe('commands', () => {
     invokeMock.mockResolvedValueOnce(graph)
     await expect(liveGraph(7)).resolves.toEqual(graph)
     expect(invokeMock).toHaveBeenCalledWith('live_graph', { workstream: 7 })
+  })
+
+  it('audit_rollup passes the filter and returns the tree', async () => {
+    const filter: AuditFilter = {
+      from: '2026-10-01',
+      to: '2026-10-31',
+      repos: ['demo'],
+      groupBy: 'agent_type',
+    }
+    const audit: Audit = {
+      root: {
+        kind: 'root',
+        key: '',
+        label: 'All',
+        github: false,
+        metrics: {
+          costUsd: 0.065,
+          unpriced: 0,
+          tokens: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 },
+          agentMs: 180000,
+          approximate: true,
+          activeMs: 470000,
+          waitMs: 295000,
+          sessions: 1,
+          agents: 1,
+          rotations: 0,
+          elapsedMs: null,
+          open: false,
+          progress: { completed: 1, total: 2 },
+        },
+        children: [],
+      },
+      headline: {
+        issuesClosed: 1,
+        medianElapsedMs: null,
+        usdPerClosedIssue: 0.065,
+        usdPerMergedPr: null,
+        cloudUncounted: true,
+      },
+    }
+    invokeMock.mockResolvedValueOnce(audit)
+    await expect(auditRollup(filter)).resolves.toEqual(audit)
+    expect(invokeMock).toHaveBeenCalledWith('audit_rollup', { filter })
+  })
+
+  it('audit_refresh asks for a GitHub refresh and resolves with nothing', async () => {
+    invokeMock.mockResolvedValueOnce(undefined)
+    await expect(auditRefresh()).resolves.toBeUndefined()
+    expect(invokeMock).toHaveBeenCalledWith('audit_refresh')
   })
 
   it('a command error rejects with the message', async () => {

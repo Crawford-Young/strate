@@ -8,16 +8,18 @@
 //! Epics are issues with sub-issues: [`Issue::sub_total`] and
 //! [`Issue::parent`] carry the tree.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::io::{self, Read};
-use std::panic::resume_unwind;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use rusqlite::Connection;
 use serde::Deserialize;
 
+use crate::names::parse_name;
+use crate::proc::{self, run};
 use crate::store::Store;
 
 /// Runs `gh` with the given arguments and returns its stdout.
@@ -197,59 +199,7 @@ pub fn cli_runner(program: PathBuf) -> Runner {
 }
 
 fn command(program: &Path, args: &[String]) -> Command {
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW: no console flashes up.
-        command.creation_flags(0x0800_0000);
-    }
-    command
-}
-
-/// Drained on its own thread so a full pipe cannot stall the child.
-fn drain(mut pipe: impl Read + Send + 'static) -> JoinHandle<io::Result<Vec<u8>>> {
-    thread::spawn(move || {
-        let mut out = Vec::new();
-        pipe.read_to_end(&mut out).map(|_| out)
-    })
-}
-
-fn run(mut command: Command, timeout: Duration) -> io::Result<Vec<u8>> {
-    let mut child = command.spawn()?;
-    let stdout = drain(child.stdout.take().expect("stdout is piped"));
-    let stderr = drain(child.stderr.take().expect("stderr is piped"));
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("no answer within {timeout:?}"),
-            ));
-        }
-        thread::sleep(Duration::from_millis(5));
-    };
-    let join = |reader: JoinHandle<io::Result<Vec<u8>>>| {
-        reader.join().unwrap_or_else(|panic| resume_unwind(panic))
-    };
-    let (out, err) = (join(stdout)?, join(stderr)?);
-    if status.success() {
-        Ok(out)
-    } else {
-        let err = String::from_utf8_lossy(&err);
-        let err: String = err.trim().chars().take(300).collect();
-        Err(io::Error::other(format!("exited with {status}: {err}")))
-    }
+    proc::command(program, args, Stdio::piped())
 }
 
 /// All issues of `owner/name`, following the query's cursor page by page.
@@ -303,32 +253,127 @@ fn login(runner: &mut Runner) -> Result<String, String> {
     Ok(user.login)
 }
 
-/// Refreshes the cache of every repo slug in `slugs`: each is fetched under
-/// its owner (a stored `github_links` repository naming it, else the `gh`
-/// login, asked for once) and its rows replaced at `now_ms`. A repo that
-/// fails keeps its old rows and gets the error recorded. Returns an error
-/// only when the store itself fails.
+/// A repo to fetch: its slug and the owner a stored `github_links`
+/// repository names for it, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub slug: String,
+    pub owner: Option<String>,
+}
+
+/// What fetching one [`Target`] came to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fetched {
+    Cached {
+        slug: String,
+        owner: String,
+        issues: Vec<Issue>,
+    },
+    /// The owner is unknown when `gh api user` failed too.
+    Failed {
+        slug: String,
+        owner: Option<String>,
+        error: String,
+    },
+}
+
+/// The repo slugs of the user-named windows, sorted and unique: the repos
+/// worth fetching. Windows with a fallback name or a name that does not
+/// parse are Unlinked and add none.
+pub fn window_slugs(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT w.name FROM segments AS g
+         JOIN workstream_roots AS r ON r.id = g.workstream_id
+         JOIN workstreams AS w ON w.id = r.root
+         WHERE NOT w.fallback",
+    )?;
+    let names = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut slugs = BTreeSet::new();
+    for name in names {
+        slugs.extend(parse_name(&name?).map(|parsed| parsed.repo));
+    }
+    Ok(slugs.into_iter().collect())
+}
+
+/// `slugs` with the owner hints the store holds.
+pub fn targets(store: &Store, slugs: &[String]) -> rusqlite::Result<Vec<Target>> {
+    slugs
+        .iter()
+        .map(|slug| {
+            Ok(Target {
+                slug: slug.clone(),
+                owner: store.gh_owner_hint(slug)?,
+            })
+        })
+        .collect()
+}
+
+/// Fetches every target: under its owner hint, else the `gh` login, asked
+/// for once. Never touches the store, so it can run off the thread that
+/// owns the writer; a repo that fails comes back as [`Fetched::Failed`].
+pub fn fetch_all(runner: &mut Runner, targets: &[Target]) -> Vec<Fetched> {
+    let mut fallback: Option<Result<String, String>> = None;
+    targets
+        .iter()
+        .map(|target| {
+            let owner = match &target.owner {
+                Some(owner) => Ok(owner.clone()),
+                None => fallback.get_or_insert_with(|| login(runner)).clone(),
+            };
+            let slug = target.slug.clone();
+            match owner {
+                Ok(owner) => match fetch_repo(runner, &owner, &slug) {
+                    Ok(issues) => Fetched::Cached {
+                        slug,
+                        owner,
+                        issues,
+                    },
+                    Err(error) => Fetched::Failed {
+                        slug,
+                        owner: Some(owner),
+                        error,
+                    },
+                },
+                Err(error) => Fetched::Failed {
+                    slug,
+                    owner: None,
+                    error,
+                },
+            }
+        })
+        .collect()
+}
+
+/// Writes what [`fetch_all`] returned at `now_ms`: a fetched repo replaces
+/// its cache; a failed one keeps its old rows and gets the error recorded.
+/// Errors only when the store itself fails.
+pub fn store_fetched(store: &mut Store, fetched: &[Fetched], now_ms: i64) -> rusqlite::Result<()> {
+    for item in fetched {
+        match item {
+            Fetched::Cached {
+                slug,
+                owner,
+                issues,
+            } => store.gh_replace(slug, owner, issues, now_ms)?,
+            Fetched::Failed { slug, owner, error } => {
+                store.gh_record_error(slug, owner.as_deref(), error)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refreshes the cache of every repo slug in `slugs` (see [`fetch_all`]
+/// and [`store_fetched`]) at `now_ms`.
 pub fn refresh(
     store: &mut Store,
     runner: &mut Runner,
     slugs: &[&str],
     now_ms: i64,
 ) -> rusqlite::Result<()> {
-    let mut fallback: Option<Result<String, String>> = None;
-    for &slug in slugs {
-        let owner = match store.gh_owner_hint(slug)? {
-            Some(owner) => Ok(owner),
-            None => fallback.get_or_insert_with(|| login(runner)).clone(),
-        };
-        let fetched = owner
-            .clone()
-            .and_then(|owner| fetch_repo(runner, &owner, slug).map(|issues| (owner, issues)));
-        match fetched {
-            Ok((owner, issues)) => store.gh_replace(slug, &owner, &issues, now_ms)?,
-            Err(error) => store.gh_record_error(slug, owner.as_deref().ok(), &error)?,
-        }
-    }
-    Ok(())
+    let slugs: Vec<String> = slugs.iter().map(|&slug| slug.to_owned()).collect();
+    let targets = targets(store, &slugs)?;
+    store_fetched(store, &fetch_all(runner, &targets), now_ms)
 }
 
 #[cfg(test)]
@@ -348,5 +393,91 @@ mod tests {
         );
         assert_eq!(resolve_gh(None), None);
         std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn window_slugs_are_the_repos_of_user_named_windows_once_each() {
+        let dir = test_dir("gh-slugs");
+        let db = dir.join("strate.db");
+        drop(Store::open(&db).expect("store"));
+        let conn = rusqlite::Connection::open(&db).expect("raw");
+        conn.execute_batch(
+            "INSERT INTO sessions (session_id, path) VALUES ('s1', '/p/s1.jsonl');
+             INSERT INTO workstreams (id, name, fallback) VALUES
+                 (1, 'demo-9', 0), (2, 'demo-9-s2', 0), (3, 'other-lab-3', 0),
+                 (4, 'plain', 0), (5, 'cwd-5', 1), (6, 'merged-4', 0),
+                 (7, 'unused-8', 0);
+             UPDATE workstreams SET merged_into = 3 WHERE id = 6;
+             INSERT INTO segments (session_id, start_offset, workstream_id) VALUES
+                 ('s1', 0, 1), ('s1', 10, 2), ('s1', 20, 3), ('s1', 30, 4),
+                 ('s1', 40, 5), ('s1', 50, 6);",
+        )
+        .expect("rows");
+        let reader = Store::open_reader(&db).expect("reader");
+        assert_eq!(
+            window_slugs(&reader).expect("slugs"),
+            ["demo", "other-lab"],
+            "a fallback name, an unparsed name and a workstream with no window add none; a merge reads as its root"
+        );
+        drop((conn, reader));
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    fn scripted(
+        script: Vec<io::Result<&'static str>>,
+    ) -> (Runner, std::sync::Arc<std::sync::Mutex<usize>>) {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let seen = calls.clone();
+        let mut script = script.into_iter();
+        let runner: Runner = Box::new(move |_| {
+            *seen.lock().expect("calls") += 1;
+            script
+                .next()
+                .unwrap_or_else(|| Err(io::Error::other("exhausted")))
+                .map(|json| json.as_bytes().to_vec())
+        });
+        (runner, calls)
+    }
+
+    const EMPTY_REPO: &str = r#"{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}"#;
+
+    fn target(slug: &str, owner: Option<&str>) -> Target {
+        Target {
+            slug: slug.into(),
+            owner: owner.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn fetch_all_asks_for_the_login_once_and_reports_each_repo_without_failing() {
+        let (mut runner, calls) = scripted(vec![
+            Ok(r#"{"login":"me"}"#),
+            Ok(EMPTY_REPO),
+            Err(io::Error::other("rate limited")),
+            Ok(EMPTY_REPO),
+        ]);
+        let targets = [
+            target("a", None),
+            target("b", None),
+            target("c", Some("org")),
+        ];
+        let fetched = fetch_all(&mut runner, &targets);
+        assert_eq!(*calls.lock().expect("calls"), 4, "login, a, b, c");
+        assert!(
+            matches!(&fetched[0], Fetched::Cached { slug, owner, issues }
+            if slug == "a" && owner == "me" && issues.is_empty())
+        );
+        assert!(matches!(&fetched[1], Fetched::Failed { slug, owner, error }
+            if slug == "b" && owner.as_deref() == Some("me") && error.contains("rate limited")));
+        assert!(matches!(&fetched[2], Fetched::Cached { slug, owner, .. }
+            if slug == "c" && owner == "org"));
+    }
+
+    #[test]
+    fn fetch_all_with_no_gh_fails_each_repo_with_no_owner() {
+        let (mut runner, _) = scripted(vec![]);
+        let fetched = fetch_all(&mut runner, &[target("a", None), target("b", None)]);
+        assert!(fetched.iter().all(|f| matches!(f,
+            Fetched::Failed { owner: None, error, .. } if error.contains("exhausted"))));
     }
 }

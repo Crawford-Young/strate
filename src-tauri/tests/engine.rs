@@ -2,7 +2,7 @@
 //! time, with a fake registry command and the hook receiver on a free port.
 
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,10 +10,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use strate_core::github;
 use strate_core::hooks::HookOptions;
 use strate_core::registry::{PollOptions, Runner};
-use strate_core::store::Store;
 use strate_core::store::views::{self, AgentState};
+use strate_core::store::{Store, gh_issues, gh_repos};
 use strate_core::tail::TailOptions;
 use strate_lib::engine::{Config, Engine, Status};
 
@@ -47,10 +48,20 @@ impl Temp {
     }
 
     fn config(&self, registry: Option<Runner>, hooks: Option<HookOptions>) -> Config {
+        self.config_with(registry, None, hooks)
+    }
+
+    fn config_with(
+        &self,
+        registry: Option<Runner>,
+        github: Option<github::Runner>,
+        hooks: Option<HookOptions>,
+    ) -> Config {
         Config {
             root: self.root(),
             db: self.db(),
             registry,
+            github,
             poll: PollOptions {
                 every: Duration::from_millis(50),
                 ..PollOptions::default()
@@ -334,4 +345,181 @@ fn an_opted_in_hook_receiver_feeds_the_store_and_stop_ends_everything() {
     thread::sleep(Duration::from_millis(400));
     assert_eq!(runs.load(Ordering::SeqCst), runs_at_stop);
     assert_eq!(events(&reader), stored);
+}
+
+fn gh_fixture(name: &str) -> Vec<u8> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../crates/strate-core/tests/fixtures/github")
+        .join(name);
+    fs::read(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"))
+}
+
+/// A `gh` answering `api user` and the issue query from recorded JSON,
+/// counting the issue queries and holding each on `gate` first.
+fn recorded_gh(
+    queries: Arc<AtomicUsize>,
+    gate: Option<std::sync::mpsc::Receiver<()>>,
+) -> github::Runner {
+    Box::new(move |args| {
+        if args.get(1).is_some_and(|a| a == "user") {
+            return Ok(gh_fixture("user.json"));
+        }
+        queries.fetch_add(1, Ordering::SeqCst);
+        if let Some(gate) = &gate {
+            let _ = gate.recv();
+        }
+        Ok(gh_fixture("audit-home.json"))
+    })
+}
+
+fn cached_repos(temp: &Temp) -> Vec<strate_core::store::GhRepo> {
+    gh_repos(&Store::open_reader(temp.db()).expect("reader")).expect("repos")
+}
+
+#[test]
+fn a_refresh_request_caches_the_windows_repos_and_notifies() {
+    let temp = Temp::new("gh-refresh");
+    temp.write("s-alpha.jsonl", &session_lines());
+    let (changes, on_change) = counter();
+    let queries = Arc::new(AtomicUsize::new(0));
+    let config = temp.config_with(None, Some(recorded_gh(queries.clone(), None)), None);
+    let engine = Engine::start(config, on_change).expect("start");
+    let progress = engine.progress();
+    wait_for("live", || progress.status() == Status::Live);
+    wait_for("the window stored", || {
+        let reader = Store::open_reader(temp.db()).expect("reader");
+        github::window_slugs(&reader).expect("slugs") == ["alpha"]
+    });
+    assert!(cached_repos(&temp).is_empty(), "nothing is fetched unasked");
+
+    let before = changes.load(Ordering::SeqCst);
+    engine.refresher().request();
+    wait_for("alpha cached", || {
+        cached_repos(&temp)
+            .first()
+            .is_some_and(|r| r.fetched_at.is_some())
+    });
+    let repos = cached_repos(&temp);
+    assert_eq!(
+        (
+            repos[0].slug.as_str(),
+            repos[0].owner.as_deref(),
+            repos[0].error.as_deref()
+        ),
+        ("alpha", Some("acme"), None)
+    );
+    let reader = Store::open_reader(temp.db()).expect("reader");
+    let numbers: Vec<_> = gh_issues(&reader, "alpha")
+        .expect("issues")
+        .iter()
+        .map(|i| i.number)
+        .collect();
+    assert_eq!(numbers, [8, 9, 10]);
+    wait_for("a change", || changes.load(Ordering::SeqCst) > before);
+    engine.stop();
+}
+
+#[test]
+fn requests_during_a_refresh_coalesce_and_never_block_the_other_sources() {
+    let temp = Temp::new("gh-coalesce");
+    temp.write("s-alpha.jsonl", &session_lines());
+    let (_changes, on_change) = counter();
+    let queries = Arc::new(AtomicUsize::new(0));
+    let (release, gate) = std::sync::mpsc::channel();
+    let config = temp.config_with(None, Some(recorded_gh(queries.clone(), Some(gate))), None);
+    let engine = Engine::start(config, on_change).expect("start");
+    let progress = engine.progress();
+    wait_for("live", || progress.status() == Status::Live);
+    wait_for("the window stored", || {
+        github::window_slugs(&Store::open_reader(temp.db()).expect("reader")).expect("slugs")
+            == ["alpha"]
+    });
+
+    let refresher = engine.refresher();
+    refresher.request();
+    wait_for("the fetch to start", || queries.load(Ordering::SeqCst) == 1);
+    for _ in 0..5 {
+        refresher.request();
+    }
+    // The held fetch blocks neither ingest nor discovery.
+    temp.write(
+        "s-beta.jsonl",
+        &session_lines().replace("alpha-1", "alpha-2"),
+    );
+    let reader = Store::open_reader(temp.db()).expect("reader");
+    wait_for("the second window", || {
+        views::workstreams(&reader).expect("workstreams").len() == 2
+    });
+    assert!(cached_repos(&temp).is_empty(), "still fetching");
+
+    release.send(()).expect("release");
+    wait_for("alpha cached", || {
+        cached_repos(&temp)
+            .first()
+            .is_some_and(|r| r.fetched_at.is_some())
+    });
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(queries.load(Ordering::SeqCst), 1, "six requests, one fetch");
+
+    release.send(()).expect("release the next");
+    refresher.request();
+    wait_for("a later request fetches again", || {
+        queries.load(Ordering::SeqCst) == 2
+    });
+    engine.stop();
+}
+
+#[test]
+fn a_failing_or_missing_gh_is_recorded_per_repo_and_the_engine_carries_on() {
+    let temp = Temp::new("gh-failing");
+    temp.write("s-alpha.jsonl", &session_lines());
+    let (changes, on_change) = counter();
+    let failing: github::Runner = Box::new(|_| Err(io::Error::other("gh: not logged in")));
+    let engine =
+        Engine::start(temp.config_with(None, Some(failing), None), on_change).expect("start");
+    let progress = engine.progress();
+    wait_for("live", || progress.status() == Status::Live);
+    wait_for("the window stored", || {
+        github::window_slugs(&Store::open_reader(temp.db()).expect("reader")).expect("slugs")
+            == ["alpha"]
+    });
+
+    engine.refresher().request();
+    wait_for("the error recorded", || {
+        cached_repos(&temp)
+            .first()
+            .is_some_and(|r| r.error.is_some())
+    });
+    let repos = cached_repos(&temp);
+    assert_eq!(
+        (repos[0].fetched_at, repos[0].owner.as_deref()),
+        (None, None)
+    );
+    assert!(
+        repos[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("not logged in"))
+    );
+    wait_for("a change", || changes.load(Ordering::SeqCst) > 0);
+
+    temp.write(
+        "s-beta.jsonl",
+        &session_lines().replace("alpha-1", "alpha-2"),
+    );
+    let reader = Store::open_reader(temp.db()).expect("reader");
+    wait_for("ingest still runs", || {
+        views::workstreams(&reader).expect("workstreams").len() == 2
+    });
+    engine.stop();
+
+    // No gh configured: a request is dropped quietly.
+    let off = Temp::new("gh-off");
+    off.write("s-alpha.jsonl", &session_lines());
+    let (_changes, on_change) = counter();
+    let engine = Engine::start(off.config(None, None), on_change).expect("start");
+    let refresher = engine.refresher();
+    refresher.request();
+    engine.stop();
+    refresher.request();
 }
