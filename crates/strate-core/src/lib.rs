@@ -5,7 +5,9 @@
 
 pub mod cost;
 pub mod discovery;
+pub mod github;
 pub mod hooks;
+pub mod names;
 pub mod registry;
 pub mod store;
 pub mod tail;

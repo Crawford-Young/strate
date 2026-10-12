@@ -10,11 +10,14 @@
 //! are unique on `uuid`, else on file + byte offset).
 
 mod account;
+mod github;
 mod group;
 mod ingest;
 mod live;
 mod migrate;
 pub mod views;
+
+pub use github::{GhRepo, gh_issues, gh_repos};
 
 use std::path::Path;
 

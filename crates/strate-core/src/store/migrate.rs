@@ -7,6 +7,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
     include_str!("0002_workstreams.sql"),
     include_str!("0003_cost_time.sql"),
     include_str!("0004_live.sql"),
+    include_str!("0005_github.sql"),
 ];
 
 /// Applies every migration past the db's `user_version`, each in its own

@@ -3050,6 +3050,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "file-id",
+ "jiff",
  "notify",
  "rusqlite",
  "serde",
