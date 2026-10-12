@@ -62,8 +62,17 @@ pub struct Ingest<'a> {
 impl Store {
     /// Opens (or creates) the db at `path` in WAL mode with
     /// `synchronous=NORMAL` and foreign keys on, then applies any pending
-    /// migrations.
+    /// migrations. Audit days are in the machine's zone.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_in(path, &account::system_zone())
+    }
+
+    /// [`Store::open`] with audit days in `zone`, an IANA name such as
+    /// `America/Toronto`. A store last accounted in another zone has every
+    /// rollup recomputed. Fails, opening nothing, on a zone jiff cannot load.
+    pub fn open_in(path: impl AsRef<Path>, zone: &str) -> Result<Self> {
+        jiff::tz::TimeZone::get(zone)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let mut conn = Connection::open(path)?;
         conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get::<_, String>(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -75,9 +84,10 @@ impl Store {
         if version == 1 {
             store.regroup_all()?;
         }
-        // A store from before v3, or priced with another price list.
+        // A store from before v3 or v6, or accounted with another price list
+        // or in another zone.
         let tx = store.transaction()?;
-        account::refresh(&tx.tx)?;
+        account::refresh(&tx.tx, zone)?;
         tx.commit()?;
         Ok(store)
     }
@@ -204,10 +214,12 @@ impl Store {
     /// Rebuilds the workstream grouping of every stored session from the
     /// stored events, in one transaction. Ingest keeps grouping current on
     /// its own, so this is only for a rebuild; it is idempotent and leaves
-    /// manual merges alone.
+    /// manual merges alone. Sessions whose windows moved get their rollups
+    /// and audit cells recomputed.
     pub fn regroup_all(&mut self) -> Result<()> {
         let tx = self.transaction()?;
-        group::all(&tx.tx)?;
+        let changed = group::all(&tx.tx)?;
+        account::rollup(&tx.tx, changed.iter().map(String::as_str))?;
         tx.commit()
     }
 

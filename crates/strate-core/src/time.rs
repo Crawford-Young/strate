@@ -224,9 +224,10 @@ pub fn local_midnights(tz: &TimeZone, first_ms: i64, last_ms: i64) -> Vec<i64> {
     midnights
 }
 
-/// The local calendar day of `ms` as `YYYY-MM-DD`.
-pub fn local_day(tz: &TimeZone, ms: i64) -> String {
-    instant(tz, ms).map_or_else(String::new, |z| z.date().to_string())
+/// The local calendar day of `ms` as `YYYY-MM-DD`; `None` outside jiff's
+/// range (years -9999 to 9999).
+pub fn local_day(tz: &TimeZone, ms: i64) -> Option<String> {
+    instant(tz, ms).map(|z| z.date().to_string())
 }
 
 fn instant(tz: &TimeZone, ms: i64) -> Option<Zoned> {
@@ -573,11 +574,22 @@ mod tests {
     fn local_days_follow_the_zone() {
         let toronto = jiff::tz::TimeZone::get("America/Toronto").expect("tz");
         // 2026-10-03T10:00Z is 06:00 EDT on the 3rd.
-        assert_eq!(local_day(&toronto, T0), "2026-10-03");
+        assert_eq!(local_day(&toronto, T0).as_deref(), Some("2026-10-03"));
         // 02:00Z on the 4th is 22:00 EDT on the 3rd.
-        assert_eq!(local_day(&toronto, T0 + 16 * 3_600_000), "2026-10-03");
-        assert_eq!(local_day(&toronto, T0 + 20 * 3_600_000), "2026-10-04");
-        assert_eq!(local_day(&jiff::tz::TimeZone::UTC, T0), "2026-10-03");
+        assert_eq!(
+            local_day(&toronto, T0 + 16 * 3_600_000).as_deref(),
+            Some("2026-10-03")
+        );
+        assert_eq!(
+            local_day(&toronto, T0 + 20 * 3_600_000).as_deref(),
+            Some("2026-10-04")
+        );
+        assert_eq!(
+            local_day(&jiff::tz::TimeZone::UTC, T0).as_deref(),
+            Some("2026-10-03")
+        );
+        // Past jiff's range (year 9999) there is no local day, never "".
+        assert_eq!(local_day(&toronto, i64::MAX), None);
     }
 
     #[test]
@@ -627,8 +639,8 @@ mod tests {
             local_midnights(&toronto, mar8 - 1000, mar9 + 1000),
             vec![mar8, mar9]
         );
-        assert_eq!(local_day(&toronto, mar9 - 1), "2026-03-08");
-        assert_eq!(local_day(&toronto, mar9), "2026-03-09");
+        assert_eq!(local_day(&toronto, mar9 - 1).as_deref(), Some("2026-03-08"));
+        assert_eq!(local_day(&toronto, mar9).as_deref(), Some("2026-03-09"));
     }
 
     #[test]
@@ -658,8 +670,14 @@ mod tests {
         assert_eq!(buckets.len(), 2);
         assert_eq!(buckets[0].1.wall_ms, 240_000);
         assert_eq!(buckets[1].1.wall_ms, 240_000);
-        assert_eq!(local_day(&toronto, buckets[0].0), "2026-11-01");
-        assert_eq!(local_day(&toronto, buckets[1].0), "2026-11-02");
+        assert_eq!(
+            local_day(&toronto, buckets[0].0).as_deref(),
+            Some("2026-11-01")
+        );
+        assert_eq!(
+            local_day(&toronto, buckets[1].0).as_deref(),
+            Some("2026-11-02")
+        );
         assert_eq!(
             sum(&buckets),
             split(&records, &[], IDLE_GAP_MS).expect("records")
