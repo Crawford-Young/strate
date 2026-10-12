@@ -1,5 +1,6 @@
-//! Read views for the app: workstream tabs, needs-you, per-workstream $
-//! and the live graph. Each runs on a read-only connection from
+//! Read views for the app: workstream tabs, needs-you, per-workstream $,
+//! the live graph and the Audit rollups ([`audit()`], from `store/audit.rs`).
+//! Each runs on a read-only connection from
 //! [`super::Store::open_reader`] and serializes in camelCase for the
 //! webview.
 //!
@@ -16,6 +17,9 @@ use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 use super::Result;
+pub use super::audit::{
+    Audit, AuditFilter, AuditNode, GroupBy, Headline, Metrics, NodeKind, Progress, Tokens, audit,
+};
 
 /// An agent's state, as the canvas and tabs show it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

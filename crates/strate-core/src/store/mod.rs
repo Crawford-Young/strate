@@ -10,6 +10,7 @@
 //! are unique on `uuid`, else on file + byte offset).
 
 mod account;
+mod audit;
 mod github;
 mod group;
 mod ingest;

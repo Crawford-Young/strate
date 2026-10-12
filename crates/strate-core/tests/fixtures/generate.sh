@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14). Field names come from
+# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ for #26). Field names come from
 # the "~/.claude format, as observed" comment on strate #10; every value is a placeholder.
 set -eu
 cd "$(dirname "$0")/.."
@@ -218,3 +218,84 @@ kat $K2 /work/cost-other '"isSidechain":false'
   kprompt 09:01:00 k-23
   kreply 09:01:02 k-24 req_d2 claude-haiku-4-5-20251001 "$(ku 8 2000 48000 22 2000 0)" "$TEXT"
 } > "$K/projects/-work-cost-other/$K2.jsonl"
+
+# ---- audit-home: audit rollups (#26); hand values in tests/audit_rollup.rs ----
+# Repo demo (gh JSON: github/audit-home.json): epic #8 over #9 (closed) and #10.
+# Times are UTC; America/Toronto is UTC-4 here, so local midnight is 04:00Z.
+A=fixtures/audit-home
+A1=5e559a9a-0000-4000-8000-0000000000a1
+A2=5e559a9a-0000-4000-8000-0000000000a2
+A3=5e559a9a-0000-4000-8000-0000000000a3
+A4=5e559a9a-0000-4000-8000-0000000000a4
+A5=5e559a9a-0000-4000-8000-0000000000a5
+AD="$A/projects/-work-demo"
+rm -rf "$A"
+mkdir -p "$AD/$A1/subagents" "$AD/$A2/subagents" "$A/projects/-work-other" "$A/projects/-work-scratch"
+aat() { # sessionId cwd sidechain-fields: the envelope of the records that follow
+  AS=$1; AC=$2; ASIDE=$3
+}
+aenv() { # YYYY-MM-DDTHH:MM:SS uuid
+  AE="\"parentUuid\":null,$ASIDE,\"timestamp\":\"$1.000Z\",\"userType\":\"external\",\"entrypoint\":\"cli\",\"cwd\":\"$AC\",\"sessionId\":\"$AS\",\"version\":\"2.1.294\",\"gitBranch\":\"main\",\"uuid\":\"$2\""
+}
+atitle() { echo "{\"type\":\"custom-title\",\"customTitle\":\"$1\",\"sessionId\":\"$AS\"}"; }
+aprompt() { # time uuid: a typed prompt
+  aenv "$1" "$2"; echo "{$AE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Lorem ipsum dolor.\"},\"origin\":{\"kind\":\"human\"}}"
+}
+atask() { # time uuid: a subagent's task prompt
+  aenv "$1" "$2"; echo "{$AE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Lorem ipsum.\"}}"
+}
+aresult() { # time uuid toolUseId
+  aenv "$1" "$2"; echo "{$AE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"$3\",\"content\":\"Lorem.\"}]}}"
+}
+areply() { # time uuid requestId model usage content-block
+  aenv "$1" "$2"; echo "{$AE,\"type\":\"assistant\",\"requestId\":\"$3\",\"message\":{\"role\":\"assistant\",\"id\":\"msg_$3\",\"model\":\"$4\",\"content\":[$6],\"usage\":$5}}"
+}
+ameta() { # agentType toolUseId
+  echo "{\"agentType\":\"$1\",\"description\":\"Lorem task\",\"toolUseId\":\"$2\",\"spawnDepth\":1,\"requestShape\":\"agent\",\"requestNonInteractive\":true,\"model\":\"claude-sonnet-5-5\"}"
+}
+OPUS=claude-opus-5-5
+SONNET=claude-sonnet-5-5
+# Every opus request is $0.008 (a1 $0.018 with its cache write), every sonnet one $0.0035.
+UO=$(ku 1000 0 10000 100)
+US=$(ku 500 0 5000 200)
+# A1, window demo-9, 2026-10-04 14:00:00..14:05:20Z: a foreground subagent.
+aat $A1 /work/demo '"isSidechain":false'
+{ atitle demo-9
+  aprompt 2026-10-04T14:00:00 a1-01
+  areply 2026-10-04T14:00:10 a1-02 req_a1 $OPUS "$(ku 1000 2000 10000 100)" "$(ktool toolu_a1 Agent '{"subagent_type":"implementer","description":"Lorem","prompt":"Lorem ipsum."}')"
+  aresult 2026-10-04T14:02:00 a1-03 toolu_a1
+  areply 2026-10-04T14:02:10 a1-04 req_a2 $OPUS "$UO" "$TEXT"
+  aprompt 2026-10-04T14:05:10 a1-05
+  areply 2026-10-04T14:05:20 a1-06 req_a3 $OPUS "$UO" "$TEXT"
+} > "$AD/$A1.jsonl"
+aat $A1 /work/demo '"isSidechain":true,"agentId":"a9000000000000001"'
+{ atask 2026-10-04T14:00:20 a1s-1
+  areply 2026-10-04T14:01:20 a1s-2 req_f1 $SONNET "$US" "$TEXT"
+} > "$AD/$A1/subagents/agent-a9000000000000001.jsonl"
+ameta implementer toolu_a1 > "$AD/$A1/subagents/agent-a9000000000000001.meta.json"
+# A2, window demo-9-s2, 2026-10-05 03:50:00..04:05:10Z (across local midnight):
+# a background subagent, a link to PR #12, then a 12m40s idle gap.
+aat $A2 /work/demo '"isSidechain":false'
+{ atitle demo-9-s2
+  aprompt 2026-10-05T03:50:00 a2-01
+  areply 2026-10-05T03:50:10 a2-02 req_b1 $OPUS "$UO" "$(ktool toolu_b1 Agent '{"subagent_type":"recon","description":"Lorem","prompt":"Lorem ipsum.","run_in_background":true}')"
+  aresult 2026-10-05T03:50:15 a2-03 toolu_b1
+  areply 2026-10-05T03:50:25 a2-04 req_b2 $OPUS "$UO" "$TEXT"
+  echo "{\"type\":\"pr-link\",\"sessionId\":\"$A2\",\"prNumber\":12,\"prUrl\":\"https://github.com/example/demo/pull/12\",\"prRepository\":\"example/demo\",\"timestamp\":\"2026-10-05T03:50:30.000Z\"}"
+  aprompt 2026-10-05T04:05:00 a2-05
+  areply 2026-10-05T04:05:10 a2-06 req_b3 $OPUS "$UO" "$TEXT"
+} > "$AD/$A2.jsonl"
+aat $A2 /work/demo '"isSidechain":true,"agentId":"a9000000000000002"'
+{ atask 2026-10-05T03:50:20 a2s-1
+  areply 2026-10-05T03:52:20 a2s-2 req_g1 $SONNET "$US" "$TEXT"
+} > "$AD/$A2/subagents/agent-a9000000000000002.jsonl"
+ameta recon toolu_b1 > "$AD/$A2/subagents/agent-a9000000000000002.meta.json"
+# A3, window demo-10 (open, no PR), 2026-10-05.
+aat $A3 /work/demo '"isSidechain":false'
+{ atitle demo-10; aprompt 2026-10-05T15:00:00 a3-01; areply 2026-10-05T15:00:30 a3-02 req_c1 $OPUS "$UO" "$TEXT"; } > "$AD/$A3.jsonl"
+# A4, window other-3: a repo gh cannot fetch, so Unlinked.
+aat $A4 /work/other '"isSidechain":false'
+{ atitle other-3; aprompt 2026-10-05T16:00:00 a4-01; areply 2026-10-05T16:00:20 a4-02 req_d1 $OPUS "$UO" "$TEXT"; } > "$A/projects/-work-other/$A4.jsonl"
+# A5, never named: Unlinked.
+aat $A5 /work/scratch '"isSidechain":false'
+{ aprompt 2026-10-04T18:00:00 a5-01; areply 2026-10-04T18:00:40 a5-02 req_e1 $SONNET "$US" "$TEXT"; } > "$A/projects/-work-scratch/$A5.jsonl"
