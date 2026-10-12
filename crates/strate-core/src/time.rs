@@ -9,6 +9,8 @@
 
 use std::collections::HashMap;
 
+use jiff::{Timestamp, Zoned, tz::TimeZone};
+
 /// Silence longer than this between two records is idle, not active.
 pub const IDLE_GAP_MS: i64 = 10 * 60 * 1000;
 
@@ -111,6 +113,21 @@ enum Cat {
 /// records: a parent waiting on a running agent is not idle. `None` when
 /// there are no records.
 pub fn split(records: &[Timed], also: &[i64], idle_gap_ms: i64) -> Option<Split> {
+    split_at(records, also, idle_gap_ms, &[])?
+        .pop()
+        .map(|(_, whole)| whole)
+}
+
+/// `split` cut into buckets at `cuts` (epoch ms, any order): a new bucket
+/// starts at each cut strictly inside the timeline, and a bucket is keyed by
+/// its start. A span crossing a cut counts on both sides; the buckets sum to
+/// `split`'s result.
+pub fn split_at(
+    records: &[Timed],
+    also: &[i64],
+    idle_gap_ms: i64,
+    cuts: &[i64],
+) -> Option<Vec<(i64, Split)>> {
     if records.is_empty() {
         return None;
     }
@@ -176,13 +193,76 @@ pub fn split(records: &[Timed], also: &[i64], idle_gap_ms: i64) -> Option<Split>
         };
         intervals.extend(end.map(|end| (start, end, cat)));
     }
-    Some(sweep(&intervals, first, last))
+    Some(sweep(&intervals, first, last, cuts))
+}
+
+/// Every local midnight strictly inside `(first_ms, last_ms)`, as epoch ms.
+/// A day is from one midnight to the next, so a 23 h or 25 h day stays one.
+pub fn local_midnights(tz: &TimeZone, first_ms: i64, last_ms: i64) -> Vec<i64> {
+    let Some(start) = instant(tz, first_ms) else {
+        return Vec::new();
+    };
+    let mut midnights = Vec::new();
+    let mut day = start.date();
+    while let Ok(next) = day.tomorrow() {
+        day = next;
+        let Some(ms) = day
+            .to_zoned(tz.clone())
+            .ok()
+            .and_then(|z| z.start_of_day().ok())
+            .map(|z| z.timestamp().as_millisecond())
+        else {
+            break;
+        };
+        if ms >= last_ms {
+            break;
+        }
+        if ms > first_ms {
+            midnights.push(ms);
+        }
+    }
+    midnights
+}
+
+/// The local calendar day of `ms` as `YYYY-MM-DD`.
+pub fn local_day(tz: &TimeZone, ms: i64) -> String {
+    instant(tz, ms).map_or_else(String::new, |z| z.date().to_string())
+}
+
+fn instant(tz: &TimeZone, ms: i64) -> Option<Zoned> {
+    Timestamp::from_millisecond(ms)
+        .ok()
+        .map(|t| t.to_zoned(tz.clone()))
 }
 
 /// Gives each span of `[first, last]` to the highest-priority category
-/// live over it, so parallel spans count once.
-fn sweep(intervals: &[(i64, i64, Cat)], first: i64, last: i64) -> Split {
-    let mut points: Vec<(i64, Option<(Cat, i32)>)> = vec![(first, None), (last, None)];
+/// live over it, so parallel spans count once. Each cut inside the range
+/// starts a new bucket.
+fn sweep(intervals: &[(i64, i64, Cat)], first: i64, last: i64, cuts: &[i64]) -> Vec<(i64, Split)> {
+    let mut starts: Vec<i64> = cuts
+        .iter()
+        .copied()
+        .filter(|&c| c > first && c < last)
+        .collect();
+    starts.sort_unstable();
+    starts.dedup();
+    starts.insert(0, first);
+    let mut out: Vec<(i64, Split)> = starts
+        .iter()
+        .zip(starts.iter().skip(1).chain([&last]))
+        .map(|(&from, &to)| {
+            let wall_ms = to - from;
+            (
+                from,
+                Split {
+                    wall_ms,
+                    ..Split::default()
+                },
+            )
+        })
+        .collect();
+    let mut points: Vec<(i64, Option<(Cat, i32)>)> = starts.iter().map(|&c| (c, None)).collect();
+    points.push((last, None));
     for &(a, b, cat) in intervals {
         let (s, e) = (a.max(first), b.min(last));
         if e > s {
@@ -191,23 +271,21 @@ fn sweep(intervals: &[(i64, i64, Cat)], first: i64, last: i64) -> Split {
     }
     points.sort_by_key(|p| p.0);
     let mut live = [0i32; 5];
-    let mut out = Split {
-        wall_ms: last - first,
-        ..Split::default()
-    };
     for pair in points.windows(2) {
         if let Some((cat, delta)) = pair[0].1 {
             live[cat as usize] += delta;
         }
         let span = pair[1].0 - pair[0].0;
-        let bucket = match live.iter().position(|&n| n > 0) {
-            Some(0) => &mut out.idle_ms,
-            Some(1 | 4) => &mut out.user_ms,
-            Some(2) => &mut out.model_ms,
-            Some(_) => &mut out.tools_ms,
-            None => &mut out.other_ms,
+        let at = starts.partition_point(|&c| c <= pair[0].0) - 1;
+        let bucket = &mut out[at].1;
+        let slot = match live.iter().position(|&n| n > 0) {
+            Some(0) => &mut bucket.idle_ms,
+            Some(1 | 4) => &mut bucket.user_ms,
+            Some(2) => &mut bucket.model_ms,
+            Some(_) => &mut bucket.tools_ms,
+            None => &mut bucket.other_ms,
         };
-        *bucket += span;
+        *slot += span;
     }
     out
 }
@@ -409,5 +487,182 @@ mod tests {
     #[test]
     fn no_records_no_split() {
         assert_eq!(split(&[], &[T0], IDLE_GAP_MS), None);
+        assert_eq!(split_at(&[], &[T0], IDLE_GAP_MS, &[T0]), None);
+    }
+
+    fn sum(buckets: &[(i64, Split)]) -> Split {
+        buckets.iter().fold(Split::default(), |a, (_, b)| Split {
+            wall_ms: a.wall_ms + b.wall_ms,
+            idle_ms: a.idle_ms + b.idle_ms,
+            model_ms: a.model_ms + b.model_ms,
+            tools_ms: a.tools_ms + b.tools_ms,
+            user_ms: a.user_ms + b.user_ms,
+            other_ms: a.other_ms + b.other_ms,
+        })
+    }
+
+    #[test]
+    fn no_cuts_is_one_bucket_keyed_by_its_start() {
+        let whole = split(&session(), &[], IDLE_GAP_MS).expect("records");
+        assert_eq!(
+            split_at(&session(), &[], IDLE_GAP_MS, &[]),
+            Some(vec![(T0, whole)])
+        );
+    }
+
+    #[test]
+    fn a_cut_splits_a_span_and_the_buckets_sum_to_the_whole() {
+        // Cut at 200 s lands inside the Agent call [130,315] (tools) and
+        // after the AskUserQuestion (user).
+        let cut = T0 + 200_000;
+        let buckets = split_at(&session(), &[], IDLE_GAP_MS, &[cut]).expect("records");
+        assert_eq!(buckets.len(), 2);
+        assert_eq!((buckets[0].0, buckets[1].0), (T0, cut));
+        assert_eq!(buckets[0].1.wall_ms, 200_000);
+        assert_eq!(buckets[1].1.wall_ms, 1_606_000);
+        // Tools [130,315]: 70 s before the cut, 115 s after.
+        assert_eq!(buckets[0].1.tools_ms, 70_000);
+        assert_eq!(buckets[1].1.tools_ms, 115_000);
+        assert_eq!(
+            sum(&buckets),
+            split(&session(), &[], IDLE_GAP_MS).expect("records")
+        );
+    }
+
+    #[test]
+    fn cuts_outside_the_span_or_repeated_are_ignored() {
+        let whole = split(&session(), &[], IDLE_GAP_MS).expect("records");
+        let last = T0 + 1_806_000;
+        let cuts = [T0 - 5, T0, last, last + 5, T0 + 100_000, T0 + 100_000];
+        let buckets = split_at(&session(), &[], IDLE_GAP_MS, &cuts).expect("records");
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[1].0, T0 + 100_000);
+        assert_eq!(sum(&buckets), whole);
+    }
+
+    #[test]
+    fn cuts_may_arrive_unsorted() {
+        let a = T0 + 100_000;
+        let b = T0 + 900_000;
+        let sorted = split_at(&session(), &[], IDLE_GAP_MS, &[a, b]);
+        assert_eq!(split_at(&session(), &[], IDLE_GAP_MS, &[b, a]), sorted);
+    }
+
+    #[test]
+    fn an_idle_gap_straddling_a_cut_is_idle_on_both_sides() {
+        // The wait for the 1800 s prompt [445,1800] is idle; cut inside it.
+        let cut = T0 + 1_000_000;
+        let buckets = split_at(&session(), &[], IDLE_GAP_MS, &[cut]).expect("records");
+        assert_eq!(buckets[0].1.idle_ms, 555_000);
+        assert_eq!(buckets[1].1.idle_ms, 800_000);
+        assert_eq!(buckets[0].1.active_ms(), 445_000);
+        assert_eq!(buckets[1].1.active_ms(), 6_000);
+    }
+
+    #[test]
+    fn a_wait_straddling_a_cut_is_user_time_on_both_sides() {
+        // Wait [320,440] for the 440 s prompt; cut at 380 s.
+        let cut = T0 + 380_000;
+        let buckets = split_at(&session(), &[], IDLE_GAP_MS, &[cut]).expect("records");
+        // Ask [8,128] = 120 s sits wholly before the cut.
+        assert_eq!(buckets[0].1.user_ms, 120_000 + 60_000);
+        assert_eq!(buckets[1].1.user_ms, 60_000);
+    }
+
+    #[test]
+    fn local_days_follow_the_zone() {
+        let toronto = jiff::tz::TimeZone::get("America/Toronto").expect("tz");
+        // 2026-10-03T10:00Z is 06:00 EDT on the 3rd.
+        assert_eq!(local_day(&toronto, T0), "2026-10-03");
+        // 02:00Z on the 4th is 22:00 EDT on the 3rd.
+        assert_eq!(local_day(&toronto, T0 + 16 * 3_600_000), "2026-10-03");
+        assert_eq!(local_day(&toronto, T0 + 20 * 3_600_000), "2026-10-04");
+        assert_eq!(local_day(&jiff::tz::TimeZone::UTC, T0), "2026-10-03");
+    }
+
+    #[test]
+    fn a_span_crossing_one_local_midnight_has_one_cut() {
+        let toronto = jiff::tz::TimeZone::get("America/Toronto").expect("tz");
+        // Local midnight 2026-10-04 EDT (UTC-4) is 04:00Z.
+        let midnight = T0 + 18 * 3_600_000;
+        assert_eq!(
+            local_midnights(&toronto, T0, T0 + 30 * 3_600_000),
+            vec![midnight]
+        );
+        let utc = jiff::tz::TimeZone::UTC;
+        assert_eq!(
+            local_midnights(&utc, T0, T0 + 30 * 3_600_000),
+            vec![T0 + 14 * 3_600_000]
+        );
+        // Midnights on the span's edge are not strictly inside.
+        assert_eq!(
+            local_midnights(&toronto, midnight, midnight + 1),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            local_midnights(&toronto, midnight - 1, midnight),
+            Vec::<i64>::new()
+        );
+        assert_eq!(local_midnights(&toronto, T0, T0), Vec::<i64>::new());
+    }
+
+    #[test]
+    fn dst_days_stay_one_day() {
+        let toronto = jiff::tz::TimeZone::get("America/Toronto").expect("tz");
+        // Fall back 2026-11-01 (25 h day): midnight Nov 1 is 04:00Z (EDT),
+        // Nov 2 is 05:00Z (EST). Spring forward 2026-03-08 (23 h day):
+        // Mar 8 is 05:00Z (EST), Mar 9 is 04:00Z (EDT).
+        let nov1 = parse_timestamp("2026-11-01T04:00:00Z").expect("ts");
+        let nov2 = parse_timestamp("2026-11-02T05:00:00Z").expect("ts");
+        let nov3 = parse_timestamp("2026-11-03T05:00:00Z").expect("ts");
+        assert_eq!(nov2 - nov1, 25 * 3_600_000);
+        assert_eq!(
+            local_midnights(&toronto, nov1 - 1000, nov3 + 1000),
+            vec![nov1, nov2, nov3]
+        );
+        let mar8 = parse_timestamp("2026-03-08T05:00:00Z").expect("ts");
+        let mar9 = parse_timestamp("2026-03-09T04:00:00Z").expect("ts");
+        assert_eq!(mar9 - mar8, 23 * 3_600_000);
+        assert_eq!(
+            local_midnights(&toronto, mar8 - 1000, mar9 + 1000),
+            vec![mar8, mar9]
+        );
+        assert_eq!(local_day(&toronto, mar9 - 1), "2026-03-08");
+        assert_eq!(local_day(&toronto, mar9), "2026-03-09");
+    }
+
+    #[test]
+    fn a_session_across_a_dst_change_splits_per_local_day() {
+        let toronto = jiff::tz::TimeZone::get("America/Toronto").expect("tz");
+        // Two replies 8 min apart (under the idle gap) around the Nov 2
+        // local midnight (05:00Z).
+        let mid = parse_timestamp("2026-11-02T05:00:00Z").expect("ts");
+        let records = [
+            Timed {
+                at: mid - 240_000,
+                record: Record::Assistant {
+                    request: Some("a".into()),
+                    tool_uses: vec![],
+                },
+            },
+            Timed {
+                at: mid + 240_000,
+                record: Record::Assistant {
+                    request: Some("b".into()),
+                    tool_uses: vec![],
+                },
+            },
+        ];
+        let cuts = local_midnights(&toronto, mid - 240_000, mid + 240_000);
+        let buckets = split_at(&records, &[], IDLE_GAP_MS, &cuts).expect("records");
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].1.wall_ms, 240_000);
+        assert_eq!(buckets[1].1.wall_ms, 240_000);
+        assert_eq!(local_day(&toronto, buckets[0].0), "2026-11-01");
+        assert_eq!(local_day(&toronto, buckets[1].0), "2026-11-02");
+        assert_eq!(
+            sum(&buckets),
+            split(&records, &[], IDLE_GAP_MS).expect("records")
+        );
     }
 }
