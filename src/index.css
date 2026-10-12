@@ -4,3 +4,7 @@
 @source '../node_modules/@crawfordyoung/ui/dist/index.mjs';
 
 @import '@crawfordyoung/ui/styles.css';
+
+:root {
+  color-scheme: dark;
+}
