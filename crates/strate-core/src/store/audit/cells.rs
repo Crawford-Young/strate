@@ -176,9 +176,11 @@ impl Cells {
     }
 
     /// The subagent `agent_id` of `cell`'s session. [`Cells::load`] gives
-    /// every subagent cell an entry, so the lookup cannot miss.
-    pub(crate) fn agent(&self, cell: &Cell, agent_id: &str) -> &Agent {
-        &self.agents[&(cell.session_id.clone(), agent_id.to_string())]
+    /// every subagent cell an entry, so the lookup misses only for a cell
+    /// that did not come from it.
+    pub(crate) fn agent(&self, cell: &Cell, agent_id: &str) -> Option<&Agent> {
+        self.agents
+            .get(&(cell.session_id.clone(), agent_id.to_string()))
     }
 }
 

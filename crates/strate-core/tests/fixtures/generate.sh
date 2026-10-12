@@ -221,7 +221,8 @@ kat $K2 /work/cost-other '"isSidechain":false'
 
 # ---- audit-home: audit rollups (#26); hand values in tests/audit_rollup.rs ----
 # Repo demo (gh JSON: github/audit-home.json): epic #8 over #9 (closed) and #10;
-# #11 (closed not planned, no window) has its parent in another repo.
+# #11 (closed not planned, no window) has its parent in another repo. The epic
+# #8 has a window of its own too (demo-8): its direct work.
 # Times are UTC; America/Toronto is UTC-4 here, so local midnight is 04:00Z.
 A=fixtures/audit-home
 A1=5e559a9a-0000-4000-8000-0000000000a1
@@ -229,6 +230,7 @@ A2=5e559a9a-0000-4000-8000-0000000000a2
 A3=5e559a9a-0000-4000-8000-0000000000a3
 A4=5e559a9a-0000-4000-8000-0000000000a4
 A5=5e559a9a-0000-4000-8000-0000000000a5
+A6=5e559a9a-0000-4000-8000-0000000000a6
 AD="$A/projects/-work-demo"
 rm -rf "$A"
 mkdir -p "$AD/$A1/subagents" "$AD/$A2/subagents" "$A/projects/-work-other" "$A/projects/-work-scratch"
@@ -300,3 +302,6 @@ aat $A4 /work/other '"isSidechain":false'
 # A5, never named: Unlinked.
 aat $A5 /work/scratch '"isSidechain":false'
 { aprompt 2026-10-04T18:00:00 a5-01; areply 2026-10-04T18:00:40 a5-02 req_e1 $SONNET "$US" "$TEXT"; } > "$A/projects/-work-scratch/$A5.jsonl"
+# A6, window demo-8 (the epic itself), 2026-10-05 10:00:00..10:00:20Z: direct work.
+aat $A6 /work/demo '"isSidechain":false'
+{ atitle demo-8; aprompt 2026-10-05T10:00:00 a6-01; areply 2026-10-05T10:00:20 a6-02 req_h1 $OPUS "$UO" "$TEXT"; } > "$AD/$A6.jsonl"

@@ -275,6 +275,43 @@ fn windows_sit_under_their_pr_or_directly_under_the_issue() {
 }
 
 #[test]
+fn an_epic_with_its_own_window_is_one_node_with_direct_work() {
+    let t = Temp::new("epic-direct");
+    let db = build(&t);
+    let tree = october(&db, GroupBy::Hierarchy).root;
+    let demo = child(&tree, NodeKind::Repo, "demo");
+    // #8 is an epic, so its window is not an `Issue 8` beside it.
+    let kinds: Vec<_> = demo
+        .children
+        .iter()
+        .map(|c| (c.kind, c.key.as_str()))
+        .collect();
+    assert_eq!(kinds, [(NodeKind::Epic, "8")]);
+    let epic = child(demo, NodeKind::Epic, "8");
+    let keys: Vec<_> = epic.children.iter().map(|c| c.key.as_str()).collect();
+    assert_eq!(keys, ["8", "9", "10"]);
+    let direct = child(epic, NodeKind::Issue, "8");
+    assert_eq!(direct.label, "Direct work");
+    assert!(
+        direct.metrics.progress.is_none(),
+        "progress stays on the epic"
+    );
+    let window = labelled(direct, NodeKind::Session, "demo-8");
+    // 10:00:00Z -> 10:00:20Z, one opus request.
+    assert_eq!(window.metrics.elapsed_ms, Some(20 * S));
+    assert!(close(OPUS, direct.metrics.cost_usd));
+    assert!(close(OPUS, window.metrics.cost_usd));
+    assert_eq!((direct.metrics.sessions, direct.metrics.agents), (1, 0));
+    // The epic still sums its direct work and both sub-issues.
+    let sub = |n| child(epic, NodeKind::Issue, n).metrics.cost_usd;
+    assert!(close(
+        sub("8") + sub("9") + sub("10"),
+        epic.metrics.cost_usd
+    ));
+    check_all_sums(&db);
+}
+
+#[test]
 fn only_unparsed_windows_are_unlinked() {
     let t = Temp::new("unlinked");
     let db = build(&t);
@@ -329,7 +366,15 @@ fn with_no_github_cache_issues_sit_under_their_repo() {
         .iter()
         .map(|c| (c.kind, c.key.as_str()))
         .collect();
-    assert_eq!(kinds, [(NodeKind::Issue, "9"), (NodeKind::Issue, "10")]);
+    // With no cache nothing says #8 is an epic: its window is an issue too.
+    assert_eq!(
+        kinds,
+        [
+            (NodeKind::Issue, "8"),
+            (NodeKind::Issue, "9"),
+            (NodeKind::Issue, "10")
+        ]
+    );
     let demo9 = child(demo, NodeKind::Issue, "9");
     assert!(!demo9.github);
     assert_eq!(demo9.label, "demo #9");
@@ -429,8 +474,8 @@ fn the_repo_filter_keeps_the_named_repos() {
     let demo = run(&["demo"]);
     let kinds: Vec<_> = demo.children.iter().map(|c| c.kind).collect();
     assert_eq!(kinds, [NodeKind::Repo]);
-    // demo-9 $0.065 + demo-10's one opus request.
-    assert!(close(0.065 + OPUS, demo.metrics.cost_usd));
+    // demo-9 $0.065 + the one opus request each of demo-10 and demo-8.
+    assert!(close(0.065 + 2.0 * OPUS, demo.metrics.cost_usd));
     let other = run(&["other"]);
     assert_eq!(other.children.len(), 1);
     let three = child(child(&other, NodeKind::Repo, "other"), NodeKind::Issue, "3");

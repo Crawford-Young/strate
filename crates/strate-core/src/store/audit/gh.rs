@@ -1,7 +1,7 @@
 //! The GitHub cache as the Audit reads it: issues, their closing PRs, and
 //! the repos whose latest refresh failed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::Connection;
 
@@ -13,6 +13,8 @@ use crate::time::parse_timestamp;
 pub(crate) struct Gh {
     issues: HashMap<(String, i64), GhIssue>,
     prs: HashMap<(String, i64), Vec<GhPr>>,
+    /// The issues that are epics: with sub-issues, or named as a parent.
+    epics: HashSet<(String, i64)>,
 }
 
 pub(crate) struct GhIssue {
@@ -38,44 +40,55 @@ pub(crate) struct GhPr {
 impl Gh {
     pub(crate) fn load(conn: &Connection) -> Result<Self> {
         let at = |s: Option<String>| s.as_deref().and_then(parse_timestamp);
-        let issues = conn
-            .prepare_cached(
-                "SELECT repo, number, title, state, closed_at, parent, sub_total, sub_completed,
-                     state_reason
-                 FROM gh_issues",
-            )?
-            .query_map([], |r| {
-                let state: String = r.get(3)?;
-                let closed_at: Option<String> = r.get(4)?;
-                let total: i64 = r.get(6)?;
-                let completed: i64 = r.get(7)?;
-                Ok((
-                    (r.get(0)?, r.get(1)?),
-                    GhIssue {
-                        title: r.get(2)?,
-                        closed: (state == "CLOSED").then(|| at(closed_at)),
-                        completed: r.get::<_, Option<String>>(8)?.as_deref() == Some("COMPLETED"),
-                        parent: r.get(5)?,
-                        progress: (total > 0).then_some(Progress { completed, total }),
-                    },
-                ))
-            })?
-            .collect::<Result<_>>()?;
+        let mut issues: HashMap<(String, i64), GhIssue> = HashMap::new();
+        let mut epics: HashSet<(String, i64)> = HashSet::new();
+        let mut stmt = conn.prepare_cached(
+            "SELECT repo, number, title, state, closed_at, parent, sub_total, sub_completed,
+                 state_reason
+             FROM gh_issues",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let repo: String = r.get("repo")?;
+            let number: i64 = r.get("number")?;
+            let state: String = r.get("state")?;
+            let total: i64 = r.get("sub_total")?;
+            let completed: i64 = r.get("sub_completed")?;
+            let parent: Option<i64> = r.get("parent")?;
+            let closed_at: Option<String> = r.get("closed_at")?;
+            if total > 0 {
+                epics.insert((repo.clone(), number));
+            }
+            if let Some(p) = parent {
+                epics.insert((repo.clone(), p));
+            }
+            issues.insert(
+                (repo, number),
+                GhIssue {
+                    title: r.get("title")?,
+                    closed: (state == "CLOSED").then(|| at(closed_at)),
+                    completed: r.get::<_, Option<String>>("state_reason")?.as_deref()
+                        == Some("COMPLETED"),
+                    parent,
+                    progress: (total > 0).then_some(Progress { completed, total }),
+                },
+            );
+        }
         let mut prs: HashMap<(String, i64), Vec<GhPr>> = HashMap::new();
         let mut stmt = conn.prepare_cached(
             "SELECT repo, issue, number, state, merged_at, url FROM gh_prs
              ORDER BY repo, issue, number",
         )?;
         for row in stmt.query_map([], |r| {
-            let issue_repo: String = r.get(0)?;
-            let url: String = r.get(5)?;
+            let issue_repo: String = r.get("repo")?;
+            let url: String = r.get("url")?;
             Ok((
-                (issue_repo.clone(), r.get(1)?),
+                (issue_repo.clone(), r.get("issue")?),
                 GhPr {
                     repo: url_repo(&url).map_or(issue_repo, str::to_string),
-                    number: r.get(2)?,
-                    state: r.get(3)?,
-                    merged_at: at(r.get(4)?),
+                    number: r.get("number")?,
+                    state: r.get("state")?,
+                    merged_at: at(r.get("merged_at")?),
                     url,
                 },
             ))
@@ -83,12 +96,18 @@ impl Gh {
             let (key, pr) = row?;
             prs.entry(key).or_default().push(pr);
         }
-        Ok(Self { issues, prs })
+        Ok(Self { issues, prs, epics })
     }
 
     /// Issue `repo`#`number`, when the cache holds it.
     pub(crate) fn issue(&self, repo: &str, number: i64) -> Option<&GhIssue> {
         self.issues.get(&(repo.to_string(), number))
+    }
+
+    /// Whether `repo`#`number` is an epic: it has sub-issues, or a cached
+    /// issue of the repo names it as parent.
+    pub(crate) fn is_epic(&self, repo: &str, number: i64) -> bool {
+        self.epics.contains(&(repo.to_string(), number))
     }
 
     /// The PRs closing `repo`#`issue`, by number.
@@ -118,8 +137,8 @@ pub(crate) fn github_errors(conn: &Connection) -> Result<Vec<GithubError>> {
     conn.prepare_cached("SELECT slug, error FROM gh_repos WHERE error IS NOT NULL ORDER BY slug")?
         .query_map([], |r| {
             Ok(GithubError {
-                repo: r.get(0)?,
-                error: r.get(1)?,
+                repo: r.get("slug")?,
+                error: r.get("error")?,
             })
         })?
         .collect()
