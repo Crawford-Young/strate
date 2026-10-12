@@ -1,0 +1,10 @@
+{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"CURSOR-A"},"nodes":[
+{"number":8,"title":"Epic: lorem audit","state":"OPEN","createdAt":"2026-10-01T09:00:00Z","closedAt":null,"parent":null,
+ "subIssuesSummary":{"total":2,"completed":1},"closedByPullRequestsReferences":{"nodes":[]}},
+{"number":9,"title":"Ipsum rollup","state":"CLOSED","createdAt":"2026-10-02T09:00:00Z","closedAt":"2026-10-05T12:00:00Z","parent":{"number":8},
+ "subIssuesSummary":{"total":0,"completed":0},
+ "closedByPullRequestsReferences":{"nodes":[
+   {"number":12,"state":"MERGED","createdAt":"2026-10-05T04:30:00Z","mergedAt":"2026-10-05T11:00:00Z","url":"https://github.com/example/demo/pull/12"}]}},
+{"number":10,"title":"Dolor view","state":"OPEN","createdAt":"2026-10-02T10:00:00Z","closedAt":null,"parent":{"number":8},
+ "subIssuesSummary":{"total":0,"completed":0},"closedByPullRequestsReferences":{"nodes":[]}}
+]}}}}
