@@ -22,3 +22,5 @@ Every `strate-core` wave is also checked against the real `~/.claude` with a pro
 - UI comes from `@crawfordyoung/ui`; new pieces land in the library first.
 - happy-dom has no layout, so the real resizable group never reports a layout or applies `resize`/`collapse`. App tests swap in `tests/resizable-mock.tsx`, and graph tests swap in `tests/xyflow-mock.tsx` for React Flow (which never measures nodes) plus in-process `elk.bundled.js` for `./elk`; check real panel and graph behaviour in `bun run tauri dev`.
 - Dev server port 1420 is strict (`vite.config.ts` and Tauri `devUrl`); don't let it fall back.
+- Bun caches a local tgz by its path. To swap `vendor/*.tgz` in place, run `rm -rf ~/.bun/install/cache/@T@* node_modules/@crawfordyoung/ui`, then rewrite its sha512 `integrity` in `bun.lock` (computed with node `crypto`), then `bun install`. `bun add` on its own fails with IntegrityCheckFailed.
+- Windows Smart App Control can block a toolchain's own `rustc.exe` (os error 4551), and reinstalling doesn't help. An older installed toolchain that it allows runs the gates: `cargo +1.98.0 …`, or `RUSTUP_TOOLCHAIN=1.98.0` for `tauri build`. CI still checks `stable`.

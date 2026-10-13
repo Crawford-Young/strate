@@ -20,19 +20,13 @@ interface AuditDetailProps {
   label: string
   /** False while Audit is hidden. */
   active: boolean
-  storeVersion: number
+  /** Moves when Audit rereads (on show, after a refresh). */
+  version: number
   onClose: () => void
 }
 
-export function AuditDetail({
-  filter,
-  path,
-  label,
-  active,
-  storeVersion,
-  onClose,
-}: AuditDetailProps) {
-  const { days, error } = useTimeline(filter, path, active, storeVersion)
+export function AuditDetail({ filter, path, label, active, version, onClose }: AuditDetailProps) {
+  const { days, error } = useTimeline(filter, path, active, version)
   // Marks read `#9 closed` with no repo, which is ambiguous in a row that holds several: a day,
   // agent type or model group (a PR group is one repo, and so is anything below a top level).
   const spansRepos = path.length === 1 && path[0]?.[0] === 'group' && filter.groupBy !== 'pr'

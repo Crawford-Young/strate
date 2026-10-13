@@ -1,7 +1,6 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { auditTimeline, type AuditFilter, type AuditPath, type TimelineDay } from './api'
-import { REFETCH_DEBOUNCE_MS } from './useAudit'
 import { useTimeline } from './useTimeline'
 
 vi.mock('./api', () => ({ auditTimeline: vi.fn() }))
@@ -79,15 +78,13 @@ describe('useTimeline', () => {
     expect(result.current.days?.[0]?.day).toBe('read-2')
   })
 
-  it('rereads once after a burst of store changes has been quiet for 1 s', async () => {
+  it('rereads at once when the version moves, and never on its own', async () => {
     const { result, rerender } = setup(repo, true)
     await settle()
-    for (let version = 1; version <= 10; version++) {
-      rerender({ version })
-      await act(() => vi.advanceTimersByTimeAsync(100))
-    }
+    await act(() => vi.advanceTimersByTimeAsync(60_000))
     expect(timelineMock).toHaveBeenCalledOnce()
-    await act(() => vi.advanceTimersByTimeAsync(REFETCH_DEBOUNCE_MS))
+    rerender({ version: 1 })
+    await settle()
     expect(timelineMock).toHaveBeenCalledTimes(2)
     expect(result.current.days?.[0]?.day).toBe('read-2')
   })

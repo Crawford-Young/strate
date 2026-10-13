@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossbeam_channel::{Receiver, Sender, bounded, never, select};
+use crossbeam_channel::{Receiver, Sender, bounded, never, select, unbounded};
 use serde::Serialize;
 use strate_core::discovery::{Link, discover};
 use strate_core::github::{self, Fetched, Target};
@@ -41,8 +41,8 @@ pub struct Config {
     pub db: PathBuf,
     /// Runs `claude agents --json --all`; `None` leaves the registry off.
     pub registry: Option<Runner>,
-    /// Runs `gh` for [`Refresher::request`]; `None` leaves GitHub off and
-    /// drops requests.
+    /// Runs `gh` for [`Refresher::request`]; `None` leaves GitHub off, so a
+    /// request is done at once.
     pub github: Option<github::Runner>,
     pub poll: PollOptions,
     /// `Some` starts the hook receiver (opt-in).
@@ -98,15 +98,28 @@ pub struct Engine {
 /// Asks the engine to refresh the GitHub cache. Cheap to clone and safe to
 /// call from any thread.
 #[derive(Debug, Clone)]
-pub struct Refresher(Sender<()>);
+pub struct Refresher(Sender<Waiter>);
+
+/// Told once the fetch that covers its request is stored (or none will run).
+type Waiter = Sender<()>;
 
 impl Refresher {
-    /// Requests a refresh and returns at once. Requests made while a fetch
-    /// runs coalesce into one more after it; one made after the engine
-    /// stopped is dropped. Nothing here can fail: GitHub trouble is stored
-    /// per repo, never raised.
-    pub fn request(&self) {
-        let _coalesced_or_stopped = self.0.try_send(());
+    /// Requests a refresh and returns at once with a receiver that gets
+    /// `()`, or disconnects, once it is done: the fetch it started, or the
+    /// one after the fetch it came during, is stored, or GitHub is off, has
+    /// no repos to fetch or failed to list them. Requests made while a fetch
+    /// runs coalesce into one more after it. One made after the engine
+    /// stopped is done at once (the receiver disconnects). Nothing here can
+    /// fail: GitHub trouble is stored per repo, never raised.
+    pub fn request(&self) -> Receiver<()> {
+        let (waiter, done) = bounded(1);
+        let _stopped = self.0.send(waiter);
+        done
+    }
+
+    /// [`Self::request`], then blocks until it is done.
+    pub fn refresh(&self) {
+        let _done_or_stopped = self.request().recv();
     }
 }
 
@@ -142,7 +155,7 @@ impl Engine {
             }
             None => (None, never()),
         };
-        let (request, refresh) = bounded(1);
+        let (request, refresh) = unbounded();
         let hook_addr = receiver.as_ref().map(HookReceiver::local_addr);
         let progress = Arc::new(Progress::default());
         let (stop, stop_rx) = bounded(0);
@@ -155,6 +168,7 @@ impl Engine {
             fetcher,
             fetching: false,
             pending: false,
+            waiters: Vec::new(),
             on_change,
         };
         let sources = Sources {
@@ -219,7 +233,7 @@ struct Sources {
     batches: Receiver<Batch>,
     registry: Receiver<RegistryEvent>,
     hooks: Receiver<Hook>,
-    refresh: Receiver<()>,
+    refresh: Receiver<Waiter>,
     fetched: Receiver<Vec<Fetched>>,
     stop: Receiver<()>,
 }
@@ -382,6 +396,8 @@ struct Ingest<F> {
     /// A request came while a fetch was out: one more runs after it, so a
     /// window named meanwhile is fetched too.
     pending: bool,
+    /// The requests not done yet; all are told once no fetch is out or due.
+    waiters: Vec<Waiter>,
     on_change: F,
 }
 
@@ -419,7 +435,11 @@ impl<F: FnMut()> Ingest<F> {
                     Err(_) => hooks = never(),
                 },
                 recv(refresh) -> request => match request {
-                    Ok(()) => self.refresh(),
+                    Ok(waiter) => {
+                        self.waiters.push(waiter);
+                        self.waiters.extend(refresh.try_iter());
+                        self.refresh();
+                    }
                     Err(_) => refresh = never(),
                 },
                 recv(fetched) -> done => match done {
@@ -483,15 +503,22 @@ impl<F: FnMut()> Ingest<F> {
 
     /// Hands the fetch thread the repos of the stored windows, unless
     /// GitHub is off. While a fetch is out, requests coalesce into one more
-    /// after it.
+    /// after it. With no fetch out after this, the waiters are done.
     fn refresh(&mut self) {
-        let Some(fetcher) = &self.fetcher else {
-            return;
-        };
         if self.fetching {
             self.pending = true;
             return;
         }
+        self.start_fetch();
+        if !self.fetching {
+            self.release_waiters();
+        }
+    }
+
+    fn start_fetch(&mut self) {
+        let Some(fetcher) = &self.fetcher else {
+            return;
+        };
         let targets = self
             .store
             .window_slugs()
@@ -507,7 +534,7 @@ impl<F: FnMut()> Ingest<F> {
     }
 
     /// Stores a finished fetch (new rows, or the error per failed repo),
-    /// then runs the one requested meanwhile.
+    /// then runs the one requested meanwhile, or tells the waiters.
     fn fetched(&mut self, fetched: &[Fetched]) {
         self.fetching = false;
         match github::store_fetched(&mut self.store, fetched, now_ms()) {
@@ -516,16 +543,28 @@ impl<F: FnMut()> Ingest<F> {
         }
         if std::mem::take(&mut self.pending) {
             self.refresh();
+        } else {
+            self.release_waiters();
         }
     }
 
-    /// The fetch thread ended: GitHub refresh is off from here on.
+    /// The fetch thread ended: GitHub refresh is off from here on, and no
+    /// request waits on it.
     fn fetcher_gone(&mut self) {
         if self.fetcher.take().is_some() {
             eprintln!("strate: the GitHub fetch thread ended; GitHub refresh is off");
         }
         self.fetching = false;
         self.pending = false;
+        self.release_waiters();
+    }
+
+    /// Tells every waiter its request is done; one that stopped waiting is
+    /// skipped.
+    fn release_waiters(&mut self) {
+        for waiter in self.waiters.drain(..) {
+            let _stopped_waiting = waiter.try_send(());
+        }
     }
 
     fn discover(&mut self, now: Instant) {
@@ -603,6 +642,109 @@ mod tests {
         assert_eq!(
             fetch_guarded(&mut runner, &targets),
             [failed("a", Some("o")), failed("b", None)]
+        );
+    }
+
+    /// An engine-thread state over an empty store (so a refresh has no repos
+    /// to fetch), with GitHub on through `fetcher`.
+    fn ingest(name: &str, fetcher: Option<Sender<Vec<Target>>>) -> Ingest<impl FnMut()> {
+        let dir = std::env::temp_dir().join(format!("strate-ingest-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        Ingest {
+            root: dir.clone(),
+            store: Store::open(dir.join("strate.db")).expect("store"),
+            progress: Arc::default(),
+            notify: Throttle::new(Duration::ZERO),
+            discovery: Discovery::new(Duration::ZERO),
+            fetcher,
+            fetching: false,
+            pending: false,
+            waiters: Vec::new(),
+            on_change: || {},
+        }
+    }
+
+    fn waiter(ingest: &mut Ingest<impl FnMut()>) -> Receiver<()> {
+        let (waiter, done) = bounded(1);
+        ingest.waiters.push(waiter);
+        done
+    }
+
+    #[test]
+    fn a_request_is_done_at_once_when_no_fetch_runs_for_it() {
+        let mut off = ingest("off", None);
+        let done = waiter(&mut off);
+        off.refresh();
+        assert_eq!(done.try_recv(), Ok(()), "GitHub off");
+
+        let (jobs, queue) = bounded(1);
+        let mut empty = ingest("empty", Some(jobs));
+        let done = waiter(&mut empty);
+        empty.refresh();
+        assert_eq!(done.try_recv(), Ok(()), "no repos to fetch");
+        assert!(queue.is_empty(), "nothing fetched");
+        assert!(!empty.fetching);
+    }
+
+    #[test]
+    fn waiters_are_told_once_the_fetch_chain_covering_them_is_stored() {
+        let (jobs, _queue) = bounded(1);
+        let mut ingest = ingest("chain", Some(jobs));
+        ingest.fetching = true;
+        let first = waiter(&mut ingest);
+        ingest.refresh();
+        assert!(
+            ingest.pending,
+            "a request during a fetch runs one more after it"
+        );
+        let second = waiter(&mut ingest);
+        ingest.refresh();
+        assert!(first.try_recv().is_err() && second.try_recv().is_err());
+
+        // The trailing fetch has no repos here, so the chain ends with this one.
+        ingest.fetched(&[]);
+        assert_eq!((first.try_recv(), second.try_recv()), (Ok(()), Ok(())));
+        assert!(!ingest.pending && !ingest.fetching);
+
+        ingest.fetching = true;
+        let third = waiter(&mut ingest);
+        ingest.fetched(&[]);
+        assert_eq!(third.try_recv(), Ok(()), "no trailing fetch due");
+    }
+
+    #[test]
+    fn waiters_are_told_when_the_fetch_thread_ends() {
+        let (jobs, _queue) = bounded(1);
+        let mut ingest = ingest("gone", Some(jobs));
+        ingest.fetching = true;
+        ingest.pending = true;
+        let done = waiter(&mut ingest);
+        let (gave_up, _) = bounded(1);
+        ingest.waiters.push(gave_up);
+        ingest.fetcher_gone();
+        assert_eq!(done.try_recv(), Ok(()));
+        assert!(ingest.fetcher.is_none() && !ingest.pending);
+    }
+
+    #[test]
+    fn a_request_after_the_engine_stopped_never_hangs() {
+        let (request, refresh) = unbounded();
+        let refresher = Refresher(request);
+        drop(refresh);
+        assert!(
+            refresher.request().recv().is_err(),
+            "disconnected, not blocked"
+        );
+        refresher.refresh();
+
+        let (request, refresh) = unbounded::<Waiter>();
+        let refresher = Refresher(request);
+        let done = refresher.request();
+        drop(refresh);
+        assert!(
+            done.recv().is_err(),
+            "a queued request dies with the engine"
         );
     }
 
