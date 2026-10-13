@@ -107,6 +107,14 @@ pub fn audit_refresh(refresher: State<'_, Refresher>) {
     refresher.request();
 }
 
+/// Writes `text` to exactly `path`, which the user picked in the save
+/// dialog: the Audit CSV export. Replaces the file; the error is the I/O
+/// message.
+#[tauri::command(async)]
+pub fn write_export(path: String, text: String) -> Result<(), String> {
+    std::fs::write(path, text).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use strate_core::store::views::GroupBy;
@@ -147,6 +155,31 @@ mod tests {
 
         assert!(Reader::open(&dir.join("missing.db")).is_err());
         drop(reader);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn write_export_writes_exactly_the_given_path_and_reports_failures() {
+        let dir = std::env::temp_dir().join(format!("strate-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let file = dir.join("audit.csv");
+        let text = "a,b
+\"x, y\",2
+";
+
+        write_export(file.to_str().expect("utf-8").into(), text.into()).expect("written");
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), text);
+        let names: Vec<_> = std::fs::read_dir(&dir).expect("ls").collect();
+        assert_eq!(names.len(), 1, "nothing but the given path");
+
+        write_export(file.to_str().expect("utf-8").into(), "new".into()).expect("replaced");
+        assert_eq!(std::fs::read_to_string(&file).expect("read"), "new");
+
+        let missing = dir.join("no-such-dir").join("audit.csv");
+        let err = write_export(missing.to_str().expect("utf-8").into(), text.into())
+            .expect_err("a missing folder is an error");
+        assert!(!err.is_empty());
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 }

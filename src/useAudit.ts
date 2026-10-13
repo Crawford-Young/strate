@@ -6,7 +6,7 @@ import { useLoad } from './hooks'
 export const REFETCH_DEBOUNCE_MS = 1_000
 
 /** `value`, once it has held for `ms`: a trailing debounce. */
-function useTrailing(value: number, ms: number): number {
+export function useTrailing(value: number, ms: number): number {
   const [settled, setSettled] = useState(value)
   useEffect(() => {
     const timer = setTimeout(() => setSettled(value), ms)

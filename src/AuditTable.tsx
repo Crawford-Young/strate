@@ -15,6 +15,13 @@ const pathOf = (row: Row<AuditNode>): AuditPath =>
 
 const samePath = (a: AuditPath | null, b: AuditPath) => JSON.stringify(a) === JSON.stringify(b)
 
+/**
+ * A row id is its node path, so expanded rows stay put when a refresh inserts or reorders
+ * siblings, and an id from another grouping simply matches nothing.
+ */
+const rowId = (n: AuditNode, _index: number, parent?: Row<AuditNode>) =>
+  `${parent ? `${parent.id}/` : ''}${n.kind}:${n.key}`
+
 const tokenTotal = ({ tokens: t }: Metrics) => t.input + t.output + t.cacheRead + t.cacheWrite
 
 /**
@@ -43,7 +50,7 @@ interface AuditTableProps {
   /** The rollup root's children. */
   nodes: AuditNode[]
   selected: AuditPath | null
-  onSelect: (path: AuditPath) => void
+  onSelect: (path: AuditPath, label: string) => void
 }
 
 export function AuditTable({ nodes, selected, onSelect }: AuditTableProps) {
@@ -61,7 +68,7 @@ export function AuditTable({ nodes, selected, onSelect }: AuditTableProps) {
             <button
               type="button"
               aria-pressed={samePath(selected, path)}
-              onClick={() => onSelect(path)}
+              onClick={() => onSelect(path, node.label)}
               className="rounded text-left hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-ring aria-pressed:font-semibold aria-pressed:text-accent"
             >
               {node.label}
@@ -115,6 +122,7 @@ export function AuditTable({ nodes, selected, onSelect }: AuditTableProps) {
       columns={columns}
       data={nodes}
       getSubRows={(n) => (n.children.length ? n.children : undefined)}
+      getRowId={rowId}
       getRowLabel={(n) => `${n.kind} ${n.label}`}
     />
   )

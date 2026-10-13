@@ -1,17 +1,44 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { save } from '@tauri-apps/plugin-dialog'
 import { audit, headline, node } from '../tests/audit-fixtures'
-import { auditRefresh, auditRollup, onStoreChanged, type Audit, type AuditFilter } from './api'
+import {
+  auditRefresh,
+  auditRollup,
+  auditTimeline,
+  onStoreChanged,
+  writeExport,
+  type Audit,
+  type AuditFilter,
+  type TimelineDay,
+} from './api'
 import { AuditView } from './AuditView'
 
 vi.mock('./api', () => ({
   auditRollup: vi.fn(),
   auditRefresh: vi.fn(),
+  auditTimeline: vi.fn(),
+  writeExport: vi.fn(),
   onStoreChanged: vi.fn(),
+}))
+vi.mock('@tauri-apps/plugin-dialog', () => ({ save: vi.fn() }))
+// happy-dom has no layout, so the panels are the stand-in group; the panel also shows its
+// default size, which the stand-in ignores.
+vi.mock('@crawfordyoung/ui', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@crawfordyoung/ui')>()),
+  ...(await import('../tests/resizable-mock')),
+  ResizablePanel: ({ id, defaultSize, children }: Record<string, never>) => (
+    <section data-testid={`panel-${id}`} data-default-size={defaultSize}>
+      {children}
+    </section>
+  ),
 }))
 
 const rollupMock = vi.mocked(auditRollup)
 const refreshMock = vi.mocked(auditRefresh)
+const timelineMock = vi.mocked(auditTimeline)
+const writeMock = vi.mocked(writeExport)
+const saveMock = vi.mocked(save)
 
 const HOUR = 3_600_000
 const DAY = 24 * HOUR
@@ -66,6 +93,17 @@ const byDay: Audit = audit([
   ]),
 ])
 
+const timelineDays: TimelineDay[] = [
+  {
+    day: '2026-10-12',
+    spans: [
+      { startMs: 9 * HOUR, endMs: 11 * HOUR, kind: 'active' },
+      { startMs: 10 * HOUR, endMs: 12 * HOUR, kind: 'agent' },
+    ],
+    marks: [{ atMs: 11 * HOUR, label: '#11 closed' }],
+  },
+]
+
 const calls = (groupBy: (g: string) => boolean) =>
   rollupMock.mock.calls.map(([f]) => f).filter((f) => groupBy(f.groupBy))
 const treeCalls = () => calls((g) => g !== 'day')
@@ -78,6 +116,9 @@ beforeEach(() => {
     .mockReset()
     .mockImplementation((f) => Promise.resolve(f.groupBy === 'day' ? byDay : tree))
   refreshMock.mockReset().mockResolvedValue()
+  timelineMock.mockReset().mockResolvedValue(timelineDays)
+  writeMock.mockReset().mockResolvedValue()
+  saveMock.mockReset().mockResolvedValue(null)
   vi.mocked(onStoreChanged).mockResolvedValue(() => {})
 })
 
@@ -427,9 +468,181 @@ describe('tree table', () => {
     )
     await choose('Group by', 'Day')
     await choose('Group by', 'Repo › Epic › Issue › PR')
+    expect(fix()).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('keeps rows expanded by node, not position, across a change of grouping', async () => {
+    await show()
+    fireEvent.click(screen.getByRole('button', { name: 'Expand repo acme/web' }))
+    await choose('Group by', 'Day')
+    await choose('Group by', 'Repo › Epic › Issue › PR')
+    expect(tableRows().slice(0, 3)).toEqual(['acme/web', '#10 Epic', '#13 Guess'])
+  })
+})
+
+describe('row detail', () => {
+  const detail = () => screen.getByRole('complementary', { name: 'Row detail' })
+  const selectFix = () => {
     fireEvent.click(screen.getByRole('button', { name: 'Expand repo acme/web' }))
     fireEvent.click(screen.getByRole('button', { name: 'Expand epic #10 Epic' }))
-    expect(fix()).toHaveAttribute('aria-pressed', 'false')
+    fireEvent.click(screen.getByRole('button', { name: '#11 Fix' }))
+  }
+
+  it('is closed, and reads nothing, until a row is selected', async () => {
+    await show()
+    expect(screen.queryByRole('complementary', { name: 'Row detail' })).toBeNull()
+    expect(timelineMock).not.toHaveBeenCalled()
+  })
+
+  it('docks at 38% under the table and shows the timeline of the selected row', async () => {
+    await show()
+    selectFix()
+    expect(await within(detail()).findByText('#11 closed')).toBeInTheDocument()
+    expect(timelineMock).toHaveBeenLastCalledWith(
+      { from: '2026-10-07', to: '2026-10-13', repos: [], groupBy: 'hierarchy' },
+      [
+        ['repo', 'acme/web'],
+        ['epic', 'acme/web#10'],
+        ['issue', 'acme/web#11'],
+      ],
+    )
+    expect(within(detail()).getByRole('heading', { name: '#11 Fix' })).toBeInTheDocument()
+    expect(within(detail()).getAllByText('Oct 12').length).toBeGreaterThan(0)
+    expect(screen.getByTestId('panel-audit-detail')).toHaveAttribute('data-default-size', '38%')
+    expect(screen.getByTestId('panel-audit-detail')).toContainElement(detail())
+  })
+
+  it('says its agent time is non-idle, unlike the wall time of the table column', async () => {
+    await show()
+    selectFix()
+    expect((await within(detail()).findAllByText('Agent (non-idle)')).length).toBeGreaterThan(0)
+  })
+
+  it('follows the selection to another row', async () => {
+    await show()
+    selectFix()
+    fireEvent.click(screen.getByRole('button', { name: '#13 Guess' }))
+    expect(within(detail()).getByRole('heading', { name: '#13 Guess' })).toBeInTheDocument()
+    await act(() => Promise.resolve())
+    expect(timelineMock.mock.lastCall?.[1]).toEqual([
+      ['repo', 'acme/web'],
+      ['issue', 'acme/web#13'],
+    ])
+  })
+
+  it('closes with its close button, or by selecting the row again', async () => {
+    await show()
+    selectFix()
+    fireEvent.click(within(detail()).getByRole('button', { name: 'Close row detail' }))
+    expect(screen.queryByRole('complementary', { name: 'Row detail' })).toBeNull()
+    expect(screen.getByRole('button', { name: '#11 Fix' })).toHaveAttribute('aria-pressed', 'false')
+    fireEvent.click(screen.getByRole('button', { name: '#11 Fix' }))
+    expect(detail()).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '#11 Fix' }))
+    expect(screen.queryByRole('complementary', { name: 'Row detail' })).toBeNull()
+  })
+
+  it('closes when the grouping changes, since its path means nothing there', async () => {
+    await show()
+    selectFix()
+    await choose('Group by', 'Day')
+    expect(screen.queryByRole('complementary', { name: 'Row detail' })).toBeNull()
+  })
+
+  it('says so when the row has no activity in range', async () => {
+    timelineMock.mockResolvedValue([])
+    await show()
+    selectFix()
+    expect(await within(detail()).findByText('No activity in this range.')).toBeInTheDocument()
+  })
+
+  it('shows a failed read', async () => {
+    timelineMock.mockRejectedValue('bad day: 2026-13-01')
+    await show()
+    selectFix()
+    expect(await within(detail()).findByRole('alert')).toHaveTextContent('bad day: 2026-13-01')
+  })
+
+  it('warns that marks name no repo only for a row that spans repos', async () => {
+    await show()
+    await choose('Group by', 'Day')
+    const note = /spans repos/
+    fireEvent.click(await screen.findByRole('button', { name: '2026-10-12' }))
+    expect(within(detail()).getByText(note)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Expand group 2026-10-12' }))
+    fireEvent.click(screen.getByRole('button', { name: 'acme/api' }))
+    expect(within(detail()).queryByText(note)).toBeNull()
+  })
+
+  it('does not warn for a PR group, which is one repo', async () => {
+    rollupMock.mockImplementation((f) =>
+      Promise.resolve(
+        f.groupBy === 'day'
+          ? byDay
+          : f.groupBy === 'pr'
+            ? audit([node('group', 'acme/web#12', {}, [], { label: 'PR #12' })])
+            : tree,
+      ),
+    )
+    await show()
+    await choose('Group by', 'PR')
+    fireEvent.click(await screen.findByRole('button', { name: 'PR #12' }))
+    expect(within(detail()).queryByText(/spans repos/)).toBeNull()
+  })
+})
+
+describe('export', () => {
+  const exportButton = () => screen.getByRole('button', { name: 'Export CSV' })
+
+  it('is off until a rollup is shown, and while a new filter is read', async () => {
+    render(<AuditView hidden={false} onBack={() => {}} />)
+    expect(exportButton()).toBeDisabled()
+    await screen.findByRole('region', { name: 'Breakdown' })
+    expect(exportButton()).toBeEnabled()
+    rollupMock.mockImplementation(() => new Promise(() => {}))
+    pick('14d')
+    expect(exportButton()).toBeDisabled()
+  })
+
+  it('asks where to save, then writes the whole tree under the filter there', async () => {
+    saveMock.mockResolvedValue('C:/out/audit.csv')
+    await show()
+    fireEvent.click(exportButton())
+    await vi.waitFor(() => expect(writeMock).toHaveBeenCalledOnce())
+    expect(saveMock).toHaveBeenCalledWith({
+      defaultPath: 'strate-audit-2026-10-07_2026-10-13.csv',
+      filters: [{ name: 'CSV', extensions: ['csv'] }],
+    })
+    const [path, text] = writeMock.mock.calls[0] as [string, string]
+    expect(path).toBe('C:/out/audit.csv')
+    // Collapsed rows are in it too.
+    const rows = text.split('\r\n')
+    expect(rows[0]).toMatch(/^Kind,Level 1,Level 2,Level 3,GitHub,/)
+    expect(rows.filter((r) => r.startsWith('issue,acme/web,#10 Epic,#11 Fix,true,'))).toHaveLength(
+      1,
+    )
+    expect(rows.filter((r) => r.startsWith('unlinked,Unlinked,'))).toHaveLength(1)
+  })
+
+  it('writes nothing when the dialog is cancelled', async () => {
+    await show()
+    fireEvent.click(exportButton())
+    await vi.waitFor(() => expect(saveMock).toHaveBeenCalledOnce())
+    await act(() => Promise.resolve())
+    expect(writeMock).not.toHaveBeenCalled()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('reports a failed write, and clears the report on the next export', async () => {
+    saveMock.mockResolvedValue('C:/out/audit.csv')
+    writeMock.mockRejectedValueOnce('Access is denied. (os error 5)')
+    await show()
+    fireEvent.click(exportButton())
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Export failed: Access is denied. (os error 5)',
+    )
+    fireEvent.click(exportButton())
+    await vi.waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
   })
 })
 
