@@ -27,6 +27,9 @@ pub(crate) struct Cell {
     pub(crate) agent_id: Option<String>,
     /// Its index in [`Cells`]' windows; see [`Cells::window`].
     window: usize,
+    /// Its `segments` row (`None`: a session with no window, or a
+    /// subagent whose start no window holds).
+    pub(crate) segment: Option<i64>,
     pub(crate) day: String,
     pub(crate) model: Option<String>,
     pub(crate) share: Share,
@@ -162,6 +165,7 @@ impl Cells {
                 session_id: row.session_id,
                 agent_id: row.agent_id,
                 window,
+                segment: row.segment_id,
                 day: row.day,
                 model: row.model,
                 share,

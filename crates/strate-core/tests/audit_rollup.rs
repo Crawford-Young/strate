@@ -4,7 +4,9 @@
 //! test (every additive metric of every node is the sum of its children,
 //! under every group-by, and the root is the sum of the cells in the filter),
 //! the date-range and repo filters, Unlinked, the background-dispatch flag
-//! and the headline. Every db lives in a temp dir.
+//! and the headline. The row timeline (`audit_timeline`): hand values for
+//! demo-9 across a local midnight, and a property test (each day's spans
+//! sum to every node's cells that day). Every db lives in a temp dir.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -16,7 +18,10 @@ use rusqlite::Connection;
 use strate_core::discovery::discover;
 use strate_core::github::{Runner, refresh};
 use strate_core::store::Store;
-use strate_core::store::views::{Audit, AuditFilter, AuditNode, GroupBy, NodeKind, audit};
+use strate_core::store::views::{
+    Audit, AuditFilter, AuditNode, GroupBy, NodeKind, SpanKind, TimelineDay, TimelineMark,
+    TimelineSpan, audit, audit_timeline,
+};
 use strate_core::tail::{Batch, Checkpoint, FileIdentity, TailEvent};
 
 const TORONTO: &str = "America/Toronto";
@@ -899,4 +904,224 @@ fn idle_only_days_show_nothing() {
     assert_eq!(days, ["2026-10-09", "2026-10-12"]);
     assert_eq!(four.metrics.sessions, 1);
     assert!(close(1.0, four.metrics.cost_usd));
+}
+
+fn span(start_ms: i64, end_ms: i64, kind: SpanKind) -> TimelineSpan {
+    TimelineSpan {
+        start_ms,
+        end_ms,
+        kind,
+    }
+}
+
+fn mark(at_ms: i64, label: &str) -> TimelineMark {
+    TimelineMark {
+        at_ms,
+        label: label.into(),
+    }
+}
+
+/// A node path from the root (the root itself not included).
+fn steps(path: &[(NodeKind, &str)]) -> Vec<(NodeKind, String)> {
+    path.iter().map(|&(k, key)| (k, key.to_string())).collect()
+}
+
+#[test]
+fn a_window_across_local_midnight_draws_on_both_days() {
+    let t = Temp::new("timeline-hand");
+    let db = build(&t);
+    let tree = october(&db, GroupBy::Hierarchy).root;
+    let pr = child(issue(&tree, "9"), NodeKind::Pr, "12");
+    let s2 = labelled(pr, NodeKind::Session, "demo-9-s2");
+    let oct = filter("2026-10-01", "2026-10-31", &[], GroupBy::Hierarchy);
+    let to_pr = [
+        (NodeKind::Repo, "demo"),
+        (NodeKind::Epic, "8"),
+        (NodeKind::Issue, "9"),
+        (NodeKind::Pr, "12"),
+    ];
+    let mut path = steps(&to_pr);
+    path.push((NodeKind::Session, s2.key.clone()));
+    let days = audit_timeline(&db, &oct, &path).expect("timeline");
+    // demo-9-s2 starts 03:50:00Z Oct 5 = 23:50 EDT Oct 4, 85 800 s after
+    // that day's local midnight; the next (04:00Z) falls 600 s in, inside
+    // the idle [140,900]. Orchestrator: model [0,10], tools [10,15], model
+    // [15,25] are one active span; the wait [25,900] is waiting until the
+    // idle gap takes it at 140; req_b3 [900,910] is 300..310 s into Oct 5.
+    // The background subagent runs [20,140]. A session holds no issue or
+    // PR, so it has no marks.
+    let oct4 = |s: i64| (85_800 + s) * S;
+    let s2_oct4 = [
+        span(oct4(0), oct4(25), SpanKind::Active),
+        span(oct4(20), oct4(140), SpanKind::Agent),
+        span(oct4(25), oct4(140), SpanKind::Wait),
+    ];
+    assert_eq!(
+        days,
+        [
+            TimelineDay {
+                day: "2026-10-04".into(),
+                spans: s2_oct4.to_vec(),
+                marks: vec![],
+            },
+            TimelineDay {
+                day: "2026-10-05".into(),
+                spans: vec![span(300 * S, 310 * S, SpanKind::Active)],
+                marks: vec![],
+            },
+        ]
+    );
+
+    // Issue 9 adds demo-9 (14:00:00Z Oct 4 = 10:00 EDT, 36 000 s in):
+    // model [0,10], tools [10,120] and model [120,130] active, the wait
+    // [130,310], model [310,320]; its subagent [20,80]. Marks at or under
+    // the issue: PR #12 merged 11:00Z Oct 5 (07:00 EDT) and #9 closed 12:00Z
+    // (08:00 EDT).
+    let oct4_9 = |s: i64| (36_000 + s) * S;
+    let mut spans = vec![
+        span(oct4_9(0), oct4_9(130), SpanKind::Active),
+        span(oct4_9(20), oct4_9(80), SpanKind::Agent),
+        span(oct4_9(130), oct4_9(310), SpanKind::Wait),
+        span(oct4_9(310), oct4_9(320), SpanKind::Active),
+    ];
+    spans.extend(s2_oct4);
+    let days = audit_timeline(&db, &oct, &steps(&to_pr[..3])).expect("timeline");
+    assert_eq!(
+        days,
+        [
+            TimelineDay {
+                day: "2026-10-04".into(),
+                spans,
+                marks: vec![],
+            },
+            TimelineDay {
+                day: "2026-10-05".into(),
+                spans: vec![span(300 * S, 310 * S, SpanKind::Active)],
+                marks: vec![
+                    mark(7 * 3600 * S, "PR #12 merged"),
+                    mark(8 * 3600 * S, "#9 closed"),
+                ],
+            },
+        ]
+    );
+    // The PR node holds the merge, not the issue's close above it.
+    let days = audit_timeline(&db, &oct, &steps(&to_pr)).expect("timeline");
+    assert_eq!(days[1].marks, [mark(7 * 3600 * S, "PR #12 merged")]);
+}
+
+#[test]
+fn an_unknown_path_has_no_timeline_and_a_bad_day_is_an_error() {
+    let t = Temp::new("timeline-unknown");
+    let db = build(&t);
+    let oct = filter("2026-10-01", "2026-10-31", &[], GroupBy::Hierarchy);
+    for path in [
+        steps(&[(NodeKind::Repo, "nope")]),
+        steps(&[(NodeKind::Repo, "demo"), (NodeKind::Issue, "9")]),
+        steps(&[
+            (NodeKind::Repo, "demo"),
+            (NodeKind::Epic, "8"),
+            (NodeKind::Issue, "99"),
+        ]),
+    ] {
+        assert_eq!(audit_timeline(&db, &oct, &path).expect("timeline"), []);
+    }
+    // The root's own step may lead the path.
+    let demo = steps(&[(NodeKind::Repo, "demo")]);
+    let mut rooted = steps(&[(NodeKind::Root, "")]);
+    rooted.extend(demo.clone());
+    let want = audit_timeline(&db, &oct, &demo).expect("timeline");
+    assert!(!want.is_empty());
+    assert_eq!(audit_timeline(&db, &oct, &rooted).expect("timeline"), want);
+    let bad = filter("October", "2026-10-31", &[], GroupBy::Hierarchy);
+    assert!(audit_timeline(&db, &bad, &demo).is_err());
+}
+
+/// Calls `visit` on `node` and every node under it, with its path.
+fn walk(
+    node: &AuditNode,
+    path: &mut Vec<(NodeKind, String)>,
+    visit: &mut impl FnMut(&[(NodeKind, String)], &AuditNode),
+) {
+    visit(path, node);
+    for c in &node.children {
+        path.push((c.kind, c.key.clone()));
+        walk(c, path, visit);
+        path.pop();
+    }
+}
+
+#[test]
+fn each_days_spans_sum_to_every_nodes_cells_that_day() {
+    let t = Temp::new("timeline-sums");
+    let db = build(&t);
+    let days: Vec<String> = october(&db, GroupBy::Day)
+        .root
+        .children
+        .iter()
+        .map(|c| c.key.clone())
+        .collect();
+    assert!(days.len() >= 2, "{days:?}");
+    let mut checked = 0;
+    for day in &days {
+        for group_by in [GroupBy::Hierarchy, GroupBy::Model] {
+            let f = filter(day, day, &[], group_by);
+            let tree = audit(&db, &f).expect("audit").root;
+            walk(&tree, &mut Vec::new(), &mut |path, node| {
+                let got = audit_timeline(&db, &f, path).expect("timeline");
+                assert!(got.iter().all(|d| &d.day == day), "{day} {path:?}");
+                let total = |kind| -> i64 {
+                    got.iter()
+                        .flat_map(|d| &d.spans)
+                        .filter(|s| s.kind == kind)
+                        .map(|s| s.end_ms - s.start_ms)
+                        .sum()
+                };
+                let (active, wait, agent) = (
+                    total(SpanKind::Active),
+                    total(SpanKind::Wait),
+                    total(SpanKind::Agent),
+                );
+                let m = &node.metrics;
+                let at = format!("{day} {group_by:?} {path:?}");
+                if node.kind == NodeKind::Agent && !node.key.is_empty() {
+                    // A subagent's node: its own non-idle time.
+                    assert_eq!((active, wait, agent), (0, 0, m.active_ms), "{at}");
+                } else {
+                    // Active time includes the waiting; agent-hours are the
+                    // subagents' wall, none of it idle in this fixture.
+                    assert_eq!(
+                        (active + wait, wait, agent),
+                        (m.active_ms, m.wait_ms, m.agent_ms),
+                        "{at}"
+                    );
+                }
+                checked += 1;
+            });
+        }
+    }
+    assert!(checked > 20, "{checked}");
+}
+
+#[test]
+fn the_timeline_uses_the_webview_shape() {
+    let path: Vec<(NodeKind, String)> =
+        serde_json::from_value(serde_json::json!([["repo", "demo"], ["issue", "9"]]))
+            .expect("path");
+    assert_eq!(
+        path,
+        steps(&[(NodeKind::Repo, "demo"), (NodeKind::Issue, "9")])
+    );
+    let day = TimelineDay {
+        day: "2026-10-05".into(),
+        spans: vec![span(1, 2, SpanKind::Agent)],
+        marks: vec![mark(3, "#9 closed")],
+    };
+    assert_eq!(
+        serde_json::to_value(day).expect("json"),
+        serde_json::json!({
+            "day": "2026-10-05",
+            "spans": [{"startMs": 1, "endMs": 2, "kind": "agent"}],
+            "marks": [{"atMs": 3, "label": "#9 closed"}]
+        })
+    );
 }

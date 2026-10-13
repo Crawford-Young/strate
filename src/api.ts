@@ -179,6 +179,36 @@ export interface Audit {
   githubErrors: GithubError[]
 }
 
+/** An Audit node's `[kind, key]` steps from the root (the root's own may lead). */
+export type AuditPath = [NodeKind, string][]
+
+/**
+ * `active`: the orchestrator at work. `wait`: it waits on you. `agent`: a
+ * subagent at work; parallel ones overlap.
+ */
+export type SpanKind = 'active' | 'wait' | 'agent'
+
+/** `[startMs, endMs)` in ms since the day's local midnight. */
+export interface TimelineSpan {
+  startMs: number
+  endMs: number
+  kind: SpanKind
+}
+
+/** `#N closed` or `PR #N merged`, in ms since the day's local midnight. */
+export interface TimelineMark {
+  atMs: number
+  label: string
+}
+
+/** One local day of a node's timeline: spans by start, marks by time. */
+export interface TimelineDay {
+  /** Local day, `YYYY-MM-DD`. */
+  day: string
+  spans: TimelineSpan[]
+  marks: TimelineMark[]
+}
+
 export const status = () => invoke<Status>('status')
 
 export const workstreams = () => invoke<Workstream[]>('workstreams')
@@ -193,6 +223,10 @@ export const liveGraph = (workstream: number) =>
 
 /** Rejects with the message on a bad day in the filter. */
 export const auditRollup = (filter: AuditFilter) => invoke<Audit>('audit_rollup', { filter })
+
+/** The node's days in the filter; empty for an unknown path, rejects on a bad day. */
+export const auditTimeline = (filter: AuditFilter, path: AuditPath) =>
+  invoke<TimelineDay[]>('audit_timeline', { filter, path })
 
 /**
  * Asks the engine to refresh the GitHub cache and resolves at once; refetch

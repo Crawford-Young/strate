@@ -8,7 +8,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rusqlite::Connection;
 use strate_core::store::Store;
 use strate_core::store::views::{
-    self, Audit, AuditFilter, LiveGraph, NeedsYou, Workstream, WorkstreamCost,
+    self, Audit, AuditFilter, LiveGraph, NeedsYou, NodeKind, TimelineDay, Workstream,
+    WorkstreamCost,
 };
 use tauri::State;
 
@@ -76,6 +77,27 @@ fn rollup(reader: &Reader, filter: &AuditFilter) -> Result<Audit, String> {
     reader.read(|conn| views::audit(conn, filter))
 }
 
+/// The day timeline of the Audit node at `path` (its `(kind, key)` steps
+/// from the root) under `filter`: spans in ms since each local midnight,
+/// plus close and merge marks. An unknown path has no days; a bad day in
+/// the filter is an error.
+#[tauri::command(async)]
+pub fn audit_timeline(
+    reader: State<'_, Reader>,
+    filter: AuditFilter,
+    path: Vec<(NodeKind, String)>,
+) -> Result<Vec<TimelineDay>, String> {
+    timeline(&reader, &filter, &path)
+}
+
+fn timeline(
+    reader: &Reader,
+    filter: &AuditFilter,
+    path: &[(NodeKind, String)],
+) -> Result<Vec<TimelineDay>, String> {
+    reader.read(|conn| views::audit_timeline(conn, filter, path))
+}
+
 /// Asks the engine to refresh the GitHub cache and returns at once; the
 /// webview refetches on [`STORE_CHANGED`] when it lands. Requests during a
 /// refresh coalesce into one more after it, and no GitHub failure is an
@@ -117,6 +139,10 @@ mod tests {
         assert!(audit.root.children.is_empty());
         assert_eq!(audit.headline.issues_closed, 0);
         let err = rollup(&reader, &filter("October")).expect_err("a bad day is an error");
+        assert!(!err.is_empty());
+        let path = vec![(NodeKind::Repo, "demo".to_string())];
+        assert_eq!(timeline(&reader, &filter("2026-10-01"), &path), Ok(vec![]));
+        let err = timeline(&reader, &filter("October"), &path).expect_err("a bad day");
         assert!(!err.is_empty());
 
         assert!(Reader::open(&dir.join("missing.db")).is_err());

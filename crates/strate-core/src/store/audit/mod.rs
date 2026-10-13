@@ -26,12 +26,13 @@
 //!
 //! Modules: `gh` reads the GitHub cache, `cells` the cells in a filter and
 //! the windows and subagents they belong to, `tree` builds each cell's path
-//! and the rollup tree over them, and `headline` the closed-issue and
-//! merged-PR figures.
+//! and the rollup tree over them, `headline` the closed-issue and merged-PR
+//! figures, and `timeline` one node's per-day spans and marks.
 
 mod cells;
 mod gh;
 mod headline;
+mod timeline;
 mod tree;
 
 use rusqlite::Connection;
@@ -40,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use super::Result;
 use cells::Cells;
 use gh::Gh;
+pub use timeline::{SpanKind, TimelineDay, TimelineMark, TimelineSpan, audit_timeline};
 
 /// How the tree's top level groups the cells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,7 +67,7 @@ pub struct AuditFilter {
     pub group_by: GroupBy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeKind {
     Root,

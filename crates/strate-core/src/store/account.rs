@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use super::Result;
 use crate::cost::{self, SYNTHETIC, Usage, truthy};
-use crate::time::{self, IDLE_GAP_MS, Record, Split, Timed};
+use crate::time::{self, Cat, IDLE_GAP_MS, Record, Split, Timed};
 
 /// The accounting columns of one event (see `0003_cost_time.sql`).
 #[derive(Debug, Default, PartialEq)]
@@ -144,7 +144,7 @@ pub(super) fn system_zone() -> String {
 
 /// The zone the stored days are in. Store::open writes meta `tz` before any
 /// rollup, so the UTC fallback only covers a name this build cannot load.
-fn zone(conn: &Connection) -> Result<TimeZone> {
+pub(super) fn zone(conn: &Connection) -> Result<TimeZone> {
     Ok(meta(conn, "tz")?
         .and_then(|name| TimeZone::get(&name).ok())
         .unwrap_or(TimeZone::UTC))
@@ -393,58 +393,161 @@ fn split_days(
     tz: &TimeZone,
     cuts: &[i64],
 ) -> Option<(Split, Vec<(i64, Split)>)> {
-    let times = records.iter().map(|t| t.at).chain(also.iter().copied());
-    let (first, last) = (times.clone().min()?, times.max()?);
-    let mut all = time::local_midnights(tz, first, last);
-    all.extend_from_slice(cuts);
-    let buckets = time::split_at(records, also, IDLE_GAP_MS, &all)?;
+    let buckets = time::split_at(
+        records,
+        also,
+        IDLE_GAP_MS,
+        &day_cuts(records, also, tz, cuts)?,
+    )?;
     let whole = buckets.iter().map(|(_, s)| s).fold(Split::default(), add);
     Some((whole, buckets))
 }
 
-fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
-    // Title, cost-state and ai-title records are bookkeeping, not activity.
-    let mut timelines: BTreeMap<Option<String>, Vec<Timed>> = BTreeMap::new();
-    let mut stmt = conn.prepare_cached(
-        "SELECT agent_id, timestamp, type, request_key, tool_uses, tool_results, prompt
-         FROM events
-         WHERE session_id = ?1 AND timestamp IS NOT NULL
-           AND ifnull(type, '') NOT IN ('custom-title', 'ai-title', 'cost-state')
-         ORDER BY agent_id, byte_offset",
-    )?;
-    let mut rows = stmt.query([session_id])?;
-    while let Some(r) = rows.next()? {
-        let at: String = r.get(1)?;
-        let kind: Option<String> = r.get(2)?;
-        let uses: Option<String> = r.get(4)?;
-        let results: Option<String> = r.get(5)?;
-        if let Some(t) = timed(
-            &at,
-            kind.as_deref(),
-            r.get(3)?,
-            uses.as_deref(),
-            results.as_deref(),
-            r.get(6)?,
-        ) {
-            timelines.entry(r.get(0)?).or_default().push(t);
+/// `cuts` plus each local midnight in `tz` inside the timeline; `None`
+/// with no records.
+fn day_cuts(records: &[Timed], also: &[i64], tz: &TimeZone, cuts: &[i64]) -> Option<Vec<i64>> {
+    let times = records.iter().map(|t| t.at).chain(also.iter().copied());
+    let (first, last) = (times.clone().min()?, times.max()?);
+    let mut all = time::local_midnights(tz, first, last);
+    all.extend_from_slice(cuts);
+    Some(all)
+}
+
+/// A session's timelines and windows: what its cells and runs are cut from.
+struct Lines {
+    /// The orchestrator's records.
+    main: Vec<Timed>,
+    /// Each subagent's records.
+    agents: BTreeMap<String, Vec<Timed>>,
+    windows: Vec<Window>,
+    /// The window each subagent started in.
+    started_in: BTreeMap<String, Option<i64>>,
+}
+
+impl Lines {
+    fn load(conn: &Connection, session_id: &str) -> Result<Self> {
+        // Title, cost-state and ai-title records are bookkeeping, not activity.
+        let mut timelines: BTreeMap<Option<String>, Vec<Timed>> = BTreeMap::new();
+        let mut stmt = conn.prepare_cached(
+            "SELECT agent_id, timestamp, type, request_key, tool_uses, tool_results, prompt
+             FROM events
+             WHERE session_id = ?1 AND timestamp IS NOT NULL
+               AND ifnull(type, '') NOT IN ('custom-title', 'ai-title', 'cost-state')
+             ORDER BY agent_id, byte_offset",
+        )?;
+        let mut rows = stmt.query([session_id])?;
+        while let Some(r) = rows.next()? {
+            let at: String = r.get(1)?;
+            let kind: Option<String> = r.get(2)?;
+            let uses: Option<String> = r.get(4)?;
+            let results: Option<String> = r.get(5)?;
+            if let Some(t) = timed(
+                &at,
+                kind.as_deref(),
+                r.get(3)?,
+                uses.as_deref(),
+                results.as_deref(),
+                r.get(6)?,
+            ) {
+                timelines.entry(r.get(0)?).or_default().push(t);
+            }
         }
+        let main = timelines.remove(&None).unwrap_or_default();
+        let agents = timelines
+            .into_iter()
+            .filter_map(|(agent, records)| Some((agent?, records)))
+            .collect();
+        let started_in = conn
+            .prepare_cached(
+                "SELECT agent_id, segment_id FROM agents
+                 WHERE session_id = ?1 AND agent_id IS NOT NULL",
+            )?
+            .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            main,
+            agents,
+            windows: windows(conn, session_id)?,
+            started_in,
+        })
     }
-    let main = timelines.remove(&None).unwrap_or_default();
-    let windows = windows(conn, session_id)?;
-    // A subagent counts entirely toward the window it started in.
-    let started_in: BTreeMap<String, Option<i64>> = conn
-        .prepare_cached(
-            "SELECT agent_id, segment_id FROM agents
-             WHERE session_id = ?1 AND agent_id IS NOT NULL",
-        )?
-        .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<Result<_>>()?;
-    let window_of_agent = |agent: &str| started_in.get(agent).copied().flatten();
+
+    /// A subagent counts entirely toward the window it started in.
+    fn window_of_agent(&self, agent: &str) -> Option<i64> {
+        self.started_in.get(agent).copied().flatten()
+    }
+
+    /// The orchestrator's `also`: its subagents' record times, so a parent
+    /// waiting on a running agent is not idle.
+    fn also(&self) -> Vec<i64> {
+        self.agents.values().flatten().map(|t| t.at).collect()
+    }
+
+    /// The orchestrator's timeline is cut at window starts too, so a
+    /// renamed transcript splits per window.
+    fn window_starts(&self) -> Vec<i64> {
+        self.windows.iter().filter_map(|w| w.start).collect()
+    }
+}
+
+/// One run of a session's time (`time::runs`), placed as its audit cell
+/// is: by agent (`None`: the orchestrator), window and local day.
+pub(super) struct Run {
+    pub(super) agent: Option<String>,
+    pub(super) segment: Option<i64>,
+    pub(super) day: Option<String>,
+    pub(super) start: i64,
+    pub(super) end: i64,
+    pub(super) cat: Cat,
+}
+
+/// The runs of `session_id`'s timelines in `tz`, cut where [`rollup`]
+/// cuts its cells, so each lies in one cell's (agent, window, day) and a
+/// cell's time is the sum of its runs.
+pub(super) fn session_runs(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<Vec<Run>> {
+    let lines = Lines::load(conn, session_id)?;
+    let runs = |records: &[Timed], also: &[i64], cuts: &[i64]| {
+        day_cuts(records, also, tz, cuts)
+            .and_then(|all| time::runs(records, also, IDLE_GAP_MS, &all))
+            .unwrap_or_default()
+    };
+    let mut out = Vec::new();
+    for (agent, records) in &lines.agents {
+        let segment = lines.window_of_agent(agent);
+        out.extend(
+            runs(records, &[], &[])
+                .into_iter()
+                .map(|(start, end, cat)| Run {
+                    agent: Some(agent.clone()),
+                    segment,
+                    day: time::local_day(tz, start),
+                    start,
+                    end,
+                    cat,
+                }),
+        );
+    }
+    let main = runs(&lines.main, &lines.also(), &lines.window_starts());
+    out.extend(main.into_iter().map(|(start, end, cat)| Run {
+        agent: None,
+        segment: window_at(&lines.windows, start),
+        day: time::local_day(tz, start),
+        start,
+        end,
+        cat,
+    }));
+    Ok(out)
+}
+
+fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
+    let lines = Lines::load(conn, session_id)?;
+    let (main, windows) = (&lines.main, &lines.windows);
+    let window_of_agent = |agent: &str| lines.window_of_agent(agent);
 
     let mut buckets: BTreeMap<BucketKey, Bucket> = BTreeMap::new();
-    let mut runs: BTreeMap<String, Split> = BTreeMap::new();
-    for (agent, records) in &timelines {
-        let (Some(agent), Some((run, parts))) = (agent, split_days(records, &[], tz, &[])) else {
+    let mut agent_splits: BTreeMap<String, Split> = BTreeMap::new();
+    for (agent, records) in &lines.agents {
+        let Some((run, parts)) = split_days(records, &[], tz, &[]) else {
             continue;
         };
         for (at, split) in &parts {
@@ -455,19 +558,16 @@ fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
             );
             buckets.entry(key).or_default().time(split);
         }
-        runs.insert(agent.clone(), run);
+        agent_splits.insert(agent.clone(), run);
     }
-    // The session timeline is cut at window starts too, so a renamed
-    // transcript splits per window.
-    let also: Vec<i64> = timelines.values().flatten().map(|t| t.at).collect();
-    let starts: Vec<i64> = windows.iter().filter_map(|w| w.start).collect();
-    let whole = split_days(&main, &also, tz, &starts).map(|(whole, parts)| {
-        for (at, split) in &parts {
-            let key = (None, window_at(&windows, *at), time::local_day(tz, *at));
-            buckets.entry(key).or_default().time(split);
-        }
-        whole
-    });
+    let whole =
+        split_days(main, &lines.also(), tz, &lines.window_starts()).map(|(whole, parts)| {
+            for (at, split) in &parts {
+                let key = (None, window_at(windows, *at), time::local_day(tz, *at));
+                buckets.entry(key).or_default().time(split);
+            }
+            whole
+        });
     // A request counts on the day and in the window of its own record. An
     // orchestrator's time goes to a window by when it started, its requests
     // by transcript offset: they agree unless timestamps run out of order.
@@ -484,7 +584,7 @@ fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
         let at: Option<String> = r.get(1)?;
         let usage: String = r.get(3)?;
         let window = match &agent {
-            None => window_of(&windows, r.get(5)?),
+            None => window_of(windows, r.get(5)?),
             Some(a) => window_of_agent(a),
         };
         let day = at
@@ -528,7 +628,7 @@ fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
         }
     }
 
-    let agent_ms: i64 = runs.values().map(|s| s.wall_ms).sum();
+    let agent_ms: i64 = agent_splits.values().map(|s| s.wall_ms).sum();
     conn.prepare_cached(
         "UPDATE sessions SET
              cost_usd = (SELECT sum(cost_usd) FROM requests WHERE session_id = ?1),
@@ -557,7 +657,7 @@ fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
                 let wall = own.clone().max().zip(own.min()).map(|(b, a)| b - a);
                 (wall, whole.map(|s| s.user_ms))
             }
-            Some(a) => runs.get(a).map(|s| (s.wall_ms, s.user_ms)).unzip(),
+            Some(a) => agent_splits.get(a).map(|s| (s.wall_ms, s.user_ms)).unzip(),
         };
         let latest: Option<(String, String)> = conn
             .prepare_cached(

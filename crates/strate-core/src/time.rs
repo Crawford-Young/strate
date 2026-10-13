@@ -4,8 +4,9 @@
 //! user, waits for the next prompt, idle gaps), and a sweep over
 //! `[first, last]` gives every millisecond to one bucket: idle beats ask
 //! beats model beats tools beats wait, and a span none covers is other.
-//! Totals only: audit's per-UTC-day rows split the same spans, so their
-//! sums are these.
+//! The sweep gives runs (`runs`, for the Audit timeline), and the totals
+//! (`split`, and `split_at` for audit's per-local-day cells) are their
+//! sums.
 
 use std::collections::HashMap;
 
@@ -98,15 +99,24 @@ pub fn parse_timestamp(s: &str) -> Option<i64> {
     Some(((days * 24 + h) * 60 + mi) * 60_000 + sec * 1000 + ms)
 }
 
-/// Overlap priority, highest first.
-#[derive(Debug, Clone, Copy)]
-enum Cat {
+/// What a span of a timeline is, in overlap priority (highest first);
+/// `Other` is a span no interval covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cat {
     Idle,
     Ask,
     Model,
     Tools,
     Wait,
+    Other,
 }
+
+/// `[start, end)` in epoch ms, of one category.
+pub type Span = (i64, i64, Cat);
+
+/// The interval categories in priority order: a sweep gives a span to the
+/// first one live over it.
+const PRIORITY: [Cat; 5] = [Cat::Idle, Cat::Ask, Cat::Model, Cat::Tools, Cat::Wait];
 
 /// Splits a timeline (records in file order). `also` holds timestamps that
 /// count as activity without being replayed, such as a session's subagent
@@ -128,6 +138,24 @@ pub fn split_at(
     idle_gap_ms: i64,
     cuts: &[i64],
 ) -> Option<Vec<(i64, Split)>> {
+    let (intervals, first, last) = intervals(records, also, idle_gap_ms)?;
+    let starts = starts(first, last, cuts);
+    let runs = sweep(&intervals, last, &starts);
+    Some(buckets(&starts, last, &runs))
+}
+
+/// The same timeline as `split_at` reads it, as the runs of one category
+/// each, in time order: they tile `[first, last]`, and a run ends at each
+/// cut strictly inside it. A run sums into its bucket of `split_at`:
+/// `Ask` and `Wait` are `user_ms`. `None` when there are no records.
+pub fn runs(records: &[Timed], also: &[i64], idle_gap_ms: i64, cuts: &[i64]) -> Option<Vec<Span>> {
+    let (intervals, first, last) = intervals(records, also, idle_gap_ms)?;
+    Some(sweep(&intervals, last, &starts(first, last, cuts)))
+}
+
+/// A timeline replayed into its categorized intervals, with its first and
+/// last timestamps.
+fn intervals(records: &[Timed], also: &[i64], idle_gap_ms: i64) -> Option<(Vec<Span>, i64, i64)> {
     if records.is_empty() {
         return None;
     }
@@ -138,7 +166,7 @@ pub fn split_at(
         .collect();
     ts.sort_unstable();
     let (first, last) = (ts[0], ts[ts.len() - 1]);
-    let mut intervals: Vec<(i64, i64, Cat)> = ts
+    let mut intervals: Vec<Span> = ts
         .windows(2)
         .filter(|w| w[1] - w[0] > idle_gap_ms)
         .map(|w| (w[0], w[1], Cat::Idle))
@@ -193,7 +221,7 @@ pub fn split_at(
         };
         intervals.extend(end.map(|end| (start, end, cat)));
     }
-    Some(sweep(&intervals, first, last, cuts))
+    Some((intervals, first, last))
 }
 
 /// Every local midnight strictly inside `(first_ms, last_ms)`, as epoch ms.
@@ -230,16 +258,21 @@ pub fn local_day(tz: &TimeZone, ms: i64) -> Option<String> {
     instant(tz, ms).map(|z| z.date().to_string())
 }
 
+/// The local midnight starting the day of `ms`, as epoch ms.
+pub fn day_start(tz: &TimeZone, ms: i64) -> Option<i64> {
+    let start = instant(tz, ms)?.start_of_day().ok()?;
+    Some(start.timestamp().as_millisecond())
+}
+
 fn instant(tz: &TimeZone, ms: i64) -> Option<Zoned> {
     Timestamp::from_millisecond(ms)
         .ok()
         .map(|t| t.to_zoned(tz.clone()))
 }
 
-/// Gives each span of `[first, last]` to the highest-priority category
-/// live over it, so parallel spans count once. Each cut inside the range
-/// starts a new bucket.
-fn sweep(intervals: &[(i64, i64, Cat)], first: i64, last: i64, cuts: &[i64]) -> Vec<(i64, Split)> {
+/// `first`, then each cut strictly inside `(first, last)`, sorted: where
+/// each bucket starts.
+fn starts(first: i64, last: i64, cuts: &[i64]) -> Vec<i64> {
     let mut starts: Vec<i64> = cuts
         .iter()
         .copied()
@@ -248,6 +281,47 @@ fn sweep(intervals: &[(i64, i64, Cat)], first: i64, last: i64, cuts: &[i64]) -> 
     starts.sort_unstable();
     starts.dedup();
     starts.insert(0, first);
+    starts
+}
+
+/// Gives each span of `[starts[0], last]` to the highest-priority category
+/// live over it, so parallel spans count once, as runs: like neighbours
+/// merge unless a bucket starts between them.
+fn sweep(intervals: &[Span], last: i64, starts: &[i64]) -> Vec<Span> {
+    let first = starts[0];
+    let mut points: Vec<(i64, Option<(Cat, i32)>)> = starts.iter().map(|&c| (c, None)).collect();
+    points.push((last, None));
+    for &(a, b, cat) in intervals {
+        let (s, e) = (a.max(first), b.min(last));
+        if e > s {
+            points.extend([(s, Some((cat, 1))), (e, Some((cat, -1)))]);
+        }
+    }
+    points.sort_by_key(|p| p.0);
+    let mut live = [0i32; PRIORITY.len()];
+    let mut runs: Vec<Span> = Vec::new();
+    for pair in points.windows(2) {
+        if let Some((cat, delta)) = pair[0].1 {
+            live[cat as usize] += delta;
+        }
+        let (from, to) = (pair[0].0, pair[1].0);
+        if to == from {
+            continue;
+        }
+        let cat = live
+            .iter()
+            .position(|&n| n > 0)
+            .map_or(Cat::Other, |i| PRIORITY[i]);
+        match runs.last_mut() {
+            Some((_, end, c)) if *c == cat && starts.binary_search(&from).is_err() => *end = to,
+            _ => runs.push((from, to, cat)),
+        }
+    }
+    runs
+}
+
+/// Sums `runs` into one bucket per start, keyed by it.
+fn buckets(starts: &[i64], last: i64, runs: &[Span]) -> Vec<(i64, Split)> {
     let mut out: Vec<(i64, Split)> = starts
         .iter()
         .zip(starts.iter().skip(1).chain([&last]))
@@ -262,31 +336,16 @@ fn sweep(intervals: &[(i64, i64, Cat)], first: i64, last: i64, cuts: &[i64]) -> 
             )
         })
         .collect();
-    let mut points: Vec<(i64, Option<(Cat, i32)>)> = starts.iter().map(|&c| (c, None)).collect();
-    points.push((last, None));
-    for &(a, b, cat) in intervals {
-        let (s, e) = (a.max(first), b.min(last));
-        if e > s {
-            points.extend([(s, Some((cat, 1))), (e, Some((cat, -1)))]);
-        }
-    }
-    points.sort_by_key(|p| p.0);
-    let mut live = [0i32; 5];
-    for pair in points.windows(2) {
-        if let Some((cat, delta)) = pair[0].1 {
-            live[cat as usize] += delta;
-        }
-        let span = pair[1].0 - pair[0].0;
-        let at = starts.partition_point(|&c| c <= pair[0].0) - 1;
-        let bucket = &mut out[at].1;
-        let slot = match live.iter().position(|&n| n > 0) {
-            Some(0) => &mut bucket.idle_ms,
-            Some(1 | 4) => &mut bucket.user_ms,
-            Some(2) => &mut bucket.model_ms,
-            Some(_) => &mut bucket.tools_ms,
-            None => &mut bucket.other_ms,
+    for &(from, to, cat) in runs {
+        let bucket = &mut out[starts.partition_point(|&c| c <= from) - 1].1;
+        let slot = match cat {
+            Cat::Idle => &mut bucket.idle_ms,
+            Cat::Ask | Cat::Wait => &mut bucket.user_ms,
+            Cat::Model => &mut bucket.model_ms,
+            Cat::Tools => &mut bucket.tools_ms,
+            Cat::Other => &mut bucket.other_ms,
         };
-        *slot += span;
+        *slot += to - from;
     }
     out
 }
@@ -503,6 +562,110 @@ mod tests {
     }
 
     #[test]
+    fn a_session_runs_in_priority_order_merging_like_neighbours() {
+        let sub: Vec<i64> = [132, 192, 252, 312].map(|s| T0 + s * 1000).into();
+        let got = runs(&session(), &sub, IDLE_GAP_MS, &[]).expect("records");
+        let ms = |(a, b, cat): Span| (T0 + a * 1000, T0 + b * 1000, cat);
+        // The spans of `a_session_splits_into_model_tools_user_and_idle`, in
+        // time order; c4 [1800,1804] and the synthetic [1804,1806] are one
+        // model run.
+        let want: Vec<_> = [
+            (0, 8, Cat::Model),
+            (8, 128, Cat::Ask),
+            (128, 130, Cat::Model),
+            (130, 315, Cat::Tools),
+            (315, 320, Cat::Model),
+            (320, 440, Cat::Wait),
+            (440, 445, Cat::Model),
+            (445, 1800, Cat::Idle),
+            (1800, 1806, Cat::Model),
+        ]
+        .into_iter()
+        .map(ms)
+        .collect();
+        assert_eq!(got, want);
+        // A cut inside a run splits it, and nothing else.
+        let cut = runs(&session(), &sub, IDLE_GAP_MS, &[T0 + 200_000]).expect("records");
+        assert_eq!(cut.len(), want.len() + 1);
+        assert_eq!(cut[3], (T0 + 130_000, T0 + 200_000, Cat::Tools));
+        assert_eq!(cut[4], (T0 + 200_000, T0 + 315_000, Cat::Tools));
+        assert_eq!(runs(&[], &[T0], IDLE_GAP_MS, &[]), None);
+    }
+
+    /// A timeline, its `also`, idle gap and cuts.
+    type Case = (Vec<Timed>, Vec<i64>, i64, Vec<i64>);
+
+    /// Every fixture timeline above, with the `also` and cuts its tests use.
+    fn fixtures() -> Vec<Case> {
+        let sub: Vec<i64> = [132, 192, 252, 312].map(|s| T0 + s * 1000).into();
+        let subagent = vec![
+            prompt(132, true),
+            reply(192, "req_s1", Some(("toolu_s1", "Bash"))),
+            result(252, "toolu_s1"),
+            reply(312, "req_s2", None),
+        ];
+        let parallel = vec![
+            prompt(0, true),
+            at(
+                5,
+                Record::Assistant {
+                    request: Some("req_a".into()),
+                    tool_uses: vec![
+                        ("toolu_a".into(), Some("Read".into())),
+                        ("toolu_b".into(), Some("Grep".into())),
+                    ],
+                },
+            ),
+            result(15, "toolu_b"),
+            result(25, "toolu_a"),
+            prompt(86, false),
+            reply(90, "req_c", None),
+        ];
+        let cuts = [200, 380, 1000, 100, 900].map(|s| T0 + s * 1000);
+        let mut out = vec![
+            (session(), sub.clone(), IDLE_GAP_MS, vec![]),
+            (session(), vec![], 100_000, vec![]),
+            (session(), sub, 100_000, cuts.into()),
+            (subagent, vec![], IDLE_GAP_MS, vec![T0 + 200_000]),
+            (parallel, vec![], IDLE_GAP_MS, vec![T0 + 20_000]),
+        ];
+        for cut in cuts {
+            out.push((session(), vec![], IDLE_GAP_MS, vec![cut]));
+        }
+        out
+    }
+
+    #[test]
+    fn runs_sum_per_category_to_split_at_in_every_bucket() {
+        for (i, (records, also, gap, cuts)) in fixtures().into_iter().enumerate() {
+            let buckets = split_at(&records, &also, gap, &cuts).expect("records");
+            let got = runs(&records, &also, gap, &cuts).expect("records");
+            let starts: Vec<i64> = buckets.iter().map(|b| b.0).collect();
+            let mut sums: Vec<(i64, Split)> =
+                starts.iter().map(|&s| (s, Split::default())).collect();
+            for (n, &(from, to, cat)) in got.iter().enumerate() {
+                assert!(to > from, "fixture {i}: run {n} is empty");
+                if n > 0 {
+                    assert_eq!(got[n - 1].1, from, "fixture {i}: runs are contiguous");
+                }
+                let b = starts.partition_point(|&s| s <= from) - 1;
+                let end = starts.get(b + 1).copied().unwrap_or(i64::MAX);
+                assert!(to <= end, "fixture {i}: run {n} crosses a cut");
+                let split = &mut sums[b].1;
+                split.wall_ms += to - from;
+                *match cat {
+                    Cat::Idle => &mut split.idle_ms,
+                    Cat::Ask | Cat::Wait => &mut split.user_ms,
+                    Cat::Model => &mut split.model_ms,
+                    Cat::Tools => &mut split.tools_ms,
+                    Cat::Other => &mut split.other_ms,
+                } += to - from;
+            }
+            assert_eq!(sums, buckets, "fixture {i}");
+        }
+    }
+
+    #[test]
     fn no_cuts_is_one_bucket_keyed_by_its_start() {
         let whole = split(&session(), &[], IDLE_GAP_MS).expect("records");
         assert_eq!(
@@ -641,6 +804,26 @@ mod tests {
         );
         assert_eq!(local_day(&toronto, mar9 - 1).as_deref(), Some("2026-03-08"));
         assert_eq!(local_day(&toronto, mar9).as_deref(), Some("2026-03-09"));
+    }
+
+    #[test]
+    fn a_local_day_starts_at_its_own_midnight() {
+        let toronto = jiff::tz::TimeZone::get("America/Toronto").expect("tz");
+        // 06:00 EDT on Oct 3 -> 04:00Z; in UTC, 10:00 -> 00:00Z.
+        assert_eq!(day_start(&toronto, T0), Some(T0 - 6 * 3_600_000));
+        assert_eq!(
+            day_start(&jiff::tz::TimeZone::UTC, T0),
+            Some(T0 - 10 * 3_600_000)
+        );
+        // Around the 25 h Nov 1 and the 23 h Mar 8.
+        let nov1 = parse_timestamp("2026-11-01T04:00:00Z").expect("ts");
+        let nov2 = parse_timestamp("2026-11-02T05:00:00Z").expect("ts");
+        assert_eq!(day_start(&toronto, nov2), Some(nov2));
+        assert_eq!(day_start(&toronto, nov2 - 1), Some(nov1));
+        let mar8 = parse_timestamp("2026-03-08T05:00:00Z").expect("ts");
+        let mar9 = parse_timestamp("2026-03-09T04:00:00Z").expect("ts");
+        assert_eq!(day_start(&toronto, mar9 - 1), Some(mar8));
+        assert_eq!(day_start(&toronto, i64::MAX), None);
     }
 
     #[test]
