@@ -1,7 +1,9 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { audit, headline, node } from '../tests/audit-fixtures'
+import { agentRow, performance } from '../tests/performance-fixtures'
 import {
+  auditPerformance,
   auditRefresh,
   auditRollup,
   auditTimeline,
@@ -13,8 +15,10 @@ import {
 } from './api'
 import { compact, dailyChart } from './audit'
 import { AuditView } from './AuditView'
+import { totals } from './performance'
 
 vi.mock('./api', () => ({
+  auditPerformance: vi.fn(),
   auditRollup: vi.fn(),
   auditRefresh: vi.fn(),
   auditTimeline: vi.fn(),
@@ -25,6 +29,10 @@ vi.mock('./api', () => ({
 vi.mock('./audit', async (importOriginal) => {
   const real = await importOriginal<typeof import('./audit')>()
   return { ...real, dailyChart: vi.fn(real.dailyChart), compact: vi.fn(real.compact) }
+})
+vi.mock('./performance', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./performance')>()
+  return { ...real, totals: vi.fn(real.totals) }
 })
 // happy-dom has no layout, so the panels are the stand-in group; the panel also shows its
 // default size, which the stand-in ignores.
@@ -39,6 +47,7 @@ vi.mock('@crawfordyoung/ui', async (importOriginal) => ({
 }))
 
 const rollupMock = vi.mocked(auditRollup)
+const performanceMock = vi.mocked(auditPerformance)
 const refreshMock = vi.mocked(auditRefresh)
 const timelineMock = vi.mocked(auditTimeline)
 const writeMock = vi.mocked(writeExport)
@@ -112,6 +121,8 @@ const timelineDays: TimelineDay[] = [
   },
 ]
 
+const perf = performance({ agents: [agentRow({ dispatches: 4, completed: 4, costUsd: 2 })] })
+
 const calls = (groupBy: (g: string) => boolean) =>
   rollupMock.mock.calls.map(([f]) => f).filter((f) => groupBy(f.groupBy))
 const treeCalls = () => calls((g) => g !== 'day')
@@ -123,6 +134,7 @@ beforeEach(() => {
   rollupMock
     .mockReset()
     .mockImplementation((f) => Promise.resolve(f.groupBy === 'day' ? byDay : tree))
+  performanceMock.mockReset().mockResolvedValue(perf)
   refreshMock.mockReset().mockResolvedValue()
   timelineMock.mockReset().mockResolvedValue(timelineDays)
   writeMock.mockReset().mockResolvedValue(true)
@@ -313,26 +325,102 @@ describe('controls', () => {
   })
 })
 
-describe('headline', () => {
-  it('shows issues closed, median elapsed, $ per closed issue and $ per merged PR', async () => {
+describe('performance', () => {
+  /** A tile's value, then its delta and hint, as text. */
+  const tile = (label: string) =>
+    [...(screen.getByText(label, { selector: 'dt' }).closest('dl') as HTMLElement).children]
+      .slice(1)
+      .map((d) => d.textContent)
+  const perfCalls = () => performanceMock.mock.calls.map(([f]) => f)
+
+  it('sits above the spend chart and tree: outcome, agents, bottleneck, waste, then spend', async () => {
     await show()
-    const kpis = region('Headline')
-    expect(within(kpis).getByText('Issues closed').nextSibling).toHaveTextContent('3')
-    expect(within(kpis).getByText('Median elapsed').nextSibling).toHaveTextContent('1d 4h')
-    expect(within(kpis).getByText('$ per closed issue').nextSibling).toHaveTextContent('$4.20')
-    expect(within(kpis).getByText('$ per merged PR').nextSibling).toHaveTextContent('$3.10')
+    await screen.findByRole('region', { name: 'Outcome' })
+    const sections = within(screen.getByRole('main'))
+      .getAllByRole('heading', { level: 2 })
+      .map((h) => h.textContent)
+    expect(sections).toEqual([
+      'Outcome',
+      'Agents & models',
+      'Bottleneck',
+      'Waste & rework',
+      'Spend',
+    ])
+    expect(region('Spend')).toContainElement(region('Breakdown'))
   })
 
-  it('shows dashes when nothing closed or merged', async () => {
-    rollupMock.mockImplementation((f) => Promise.resolve(f.groupBy === 'day' ? byDay : audit([])))
-    render(<AuditView hidden={false} onBack={() => {}} />)
-    const kpis = await screen.findByRole('region', { name: 'Headline' })
-    expect(within(kpis).getByText('Median elapsed').nextSibling).toHaveTextContent('—')
-    expect(within(kpis).getByText('$ per closed issue').nextSibling).toHaveTextContent('$—')
+  it('takes only the median elapsed from the rollup, the other range figures from the weeks', async () => {
+    await show()
+    await screen.findByRole('region', { name: 'Outcome' })
+    expect(tile('Median elapsed')).toEqual(['1d 4h', 'range: first window to close'])
+    expect(tile('$ per closed issue')[1]).toBe('range: none')
+    expect(tile('Issues closed')[1]).toBe('range: 0, completed only')
+  })
+
+  it('has no headline of its own any more: the outcome tiles carry it', async () => {
+    await show()
+    expect(screen.queryByRole('region', { name: 'Headline' })).toBeNull()
+  })
+
+  it('reads once on show under the range and repo, and never on a store change', async () => {
+    await show()
+    await flush()
+    expect(perfCalls()).toEqual([
+      expect.objectContaining({ from: '2026-10-07', to: '2026-10-13', repos: [] }),
+    ])
+    storeChanged()
+    await flush()
+    expect(performanceMock).toHaveBeenCalledOnce()
+  })
+
+  it('reads nothing while hidden, and rereads each time it is shown again', async () => {
+    const { rerender } = render(<AuditView hidden onBack={() => {}} />)
+    await flush()
+    expect(performanceMock).not.toHaveBeenCalled()
+    rerender(<AuditView hidden={false} onBack={() => {}} />)
+    await flush()
+    rerender(<AuditView hidden onBack={() => {}} />)
+    rerender(<AuditView hidden={false} onBack={() => {}} />)
+    await flush()
+    expect(performanceMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('follows the repo filter and range, but not the grouping', async () => {
+    await show()
+    await flush()
+    await choose('Group by', 'Model')
+    await flush()
+    expect(performanceMock).toHaveBeenCalledOnce()
+    await choose('Repo', 'acme/web')
+    await flush()
+    pick('14d')
+    await flush()
+    expect(perfCalls().slice(1)).toEqual([
+      expect.objectContaining({ from: '2026-10-07', repos: ['acme/web'] }),
+      expect.objectContaining({ from: '2026-09-30', repos: ['acme/web'] }),
+    ])
+  })
+
+  it('rereads after a GitHub refresh', async () => {
+    await show()
+    await flush()
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh GitHub' }))
+    await flush()
+    expect(performanceMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('reports a failed read and still shows the spend tree', async () => {
+    performanceMock.mockRejectedValue('bad day: 2026-13-01')
+    await show()
+    await flush()
+    expect(screen.getByRole('alert')).toHaveTextContent('bad day: 2026-13-01')
+    expect(screen.queryByRole('region', { name: 'Outcome' })).toBeNull()
+    expect(region('Breakdown')).toBeInTheDocument()
   })
 
   it('notes that cloud spend is not counted, only when it applies', async () => {
     await show()
+    await screen.findByRole('region', { name: 'Outcome' })
     expect(screen.queryByText(/Cloud sessions/)).not.toBeInTheDocument()
     rollupMock.mockImplementation((f) =>
       Promise.resolve(
@@ -415,16 +503,19 @@ describe('GitHub refresh', () => {
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
-  it('recomputes no chart or table while it is busy', async () => {
+  it('recomputes no chart, table or performance view while it is busy', async () => {
     await show()
     await flush()
     refreshMock.mockReturnValue(new Promise(() => {}))
     const charts = vi.mocked(dailyChart).mock.calls.length
     const cells = vi.mocked(compact).mock.calls.length
+    const sums = vi.mocked(totals).mock.calls.length
+    expect(sums).toBeGreaterThan(0)
     fireEvent.click(refreshButton())
     expect(refreshButton()).toBeDisabled()
     expect(vi.mocked(dailyChart).mock.calls.length).toBe(charts)
     expect(vi.mocked(compact).mock.calls.length).toBe(cells)
+    expect(vi.mocked(totals).mock.calls.length).toBe(sums)
   })
 })
 
