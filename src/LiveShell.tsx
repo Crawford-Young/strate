@@ -1,5 +1,6 @@
 // The live view: the header, then resizable panels (Harness left, canvas centre, console right,
-// terminal below). The console body is #19, Harness content #23, terminals Epic E.
+// terminal below). The console body is #19, Harness content #23, terminals Epic E. It stays mounted
+// while the Audit view shows, `hidden` instead, so its state survives the visit.
 import {
   Button,
   EmptyState,
@@ -9,7 +10,7 @@ import {
   Tabs,
 } from '@crawfordyoung/ui'
 import { X } from 'lucide-react'
-import { useRef, useState } from 'react'
+import { useRef, useState, type RefObject } from 'react'
 import { liveGraph, status, workstreams, type Workstream } from './api'
 import { Canvas, agentName } from './Canvas'
 import { Header } from './Header'
@@ -27,7 +28,13 @@ const NONE: Selection = { tab: null, agent: null }
 const isLive = (sessions: Workstream[], id: number | null) =>
   sessions.some((w) => w.live && w.id === id)
 
-export function LiveShell() {
+interface LiveShellProps {
+  hidden: boolean
+  auditButtonRef: RefObject<HTMLButtonElement | null>
+  onOpenAudit: () => void
+}
+
+export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProps) {
   const version = useStoreVersion()
   const [selection, setSelection] = useState<Selection>(NONE)
   const overview = useLoad('overview', version, async () => {
@@ -81,6 +88,7 @@ export function LiveShell() {
       onValueChange={(value) => {
         setSelection({ tab: Number(value), agent: null })
       }}
+      hidden={hidden}
       className="flex h-screen flex-col bg-background text-foreground"
     >
       <Header
@@ -88,6 +96,8 @@ export function LiveShell() {
         activeKey={activeKey}
         prefs={panels.prefs}
         onTogglePanel={panels.toggle}
+        auditButtonRef={auditButtonRef}
+        onOpenAudit={onOpenAudit}
       />
 
       <ResizablePanelGroup

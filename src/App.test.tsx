@@ -601,3 +601,48 @@ describe('panels', () => {
     expect(saved().harness).toEqual({ open: false, size: 30 })
   })
 })
+
+describe('audit view', () => {
+  const openAudit = () => fireEvent.click(screen.getByRole('button', { name: 'Audit' }))
+  const back = () => fireEvent.click(screen.getByRole('button', { name: 'Live' }))
+
+  it('starts on the live view with the Audit view hidden', async () => {
+    render(<App />)
+    await screen.findByRole('tab', { name: /strate-17/ })
+    expect(screen.queryByRole('heading', { name: 'Audit' })).not.toBeInTheDocument()
+  })
+
+  it('opens full-screen from the header, hiding the live view, and takes focus', async () => {
+    render(<App />)
+    await screen.findByRole('tab', { name: /strate-17/ })
+    openAudit()
+    const heading = screen.getByRole('heading', { name: 'Audit' })
+    expect(heading).toHaveFocus()
+    expect(screen.queryByRole('tablist')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Audit' })).not.toBeInTheDocument()
+  })
+
+  it('goes back with ‹ Live, returning focus to the Audit button', async () => {
+    render(<App />)
+    await screen.findByRole('tab', { name: /strate-17/ })
+    openAudit()
+    back()
+    expect(screen.queryByRole('heading', { name: 'Audit' })).not.toBeInTheDocument()
+    expect(screen.getByRole('tablist')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Audit' })).toHaveFocus()
+  })
+
+  it('keeps the picked tab and panel prefs across a visit', async () => {
+    render(<App />)
+    await screen.findByRole('tab', { name: /strate-17/ })
+    selectTab(/app@main/)
+    fireEvent.click(screen.getByRole('button', { name: 'Harness' }))
+    act(() => dragTo('strate-columns', { harness: 22, canvas: 78, console: 0 }))
+    const before = localStorage.getItem(PREFS_KEY)
+    openAudit()
+    back()
+    expect(tab(/app@main/)).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('button', { name: 'Harness' })).toHaveAttribute('aria-pressed', 'true')
+    expect(localStorage.getItem(PREFS_KEY)).toBe(before)
+  })
+})
