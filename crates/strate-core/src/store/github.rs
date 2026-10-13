@@ -1,4 +1,4 @@
-//! The GitHub cache: `gh_repos`, `gh_issues` and `gh_prs`, keyed by repo
+//! The GitHub cache: `gh_repos`, `gh_issues`, `gh_prs` and `gh_reverts`, keyed by repo
 //! slug (the repo part of a session name).
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rusqlite::{Connection, params};
 
 use super::{Result, Store};
-use crate::github::{Issue, Pr};
+use crate::github::{Issue, Pr, Repo, Revert};
 use crate::names::parse_name;
 
 /// One cached repo: `fetched_at` (unix ms) is its last successful refresh,
@@ -57,13 +57,14 @@ impl Store {
         Ok(None)
     }
 
-    /// Replaces everything cached for `slug` with `issues` (and their PRs)
-    /// in one transaction, clearing its error and stamping `fetched_at`.
+    /// Replaces everything cached for `slug` with `repo` (its issues, their
+    /// PRs and its reverts) in one transaction, clearing its error and
+    /// stamping `fetched_at`.
     pub fn gh_replace(
         &mut self,
         slug: &str,
         owner: &str,
-        issues: &[Issue],
+        repo: &Repo,
         fetched_at: i64,
     ) -> Result<()> {
         let tx = self.transaction()?;
@@ -75,19 +76,24 @@ impl Store {
                  name = excluded.name, fetched_at = excluded.fetched_at, error = NULL",
             params![slug, owner, fetched_at],
         )?;
+        conn.execute("DELETE FROM gh_reverts WHERE repo = ?1", [slug])?;
         conn.execute("DELETE FROM gh_prs WHERE repo = ?1", [slug])?;
         conn.execute("DELETE FROM gh_issues WHERE repo = ?1", [slug])?;
         let mut insert_issue = conn.prepare(
             "INSERT OR REPLACE INTO gh_issues (repo, number, title, state, created_at,
-                 closed_at, parent, sub_total, sub_completed, state_reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 closed_at, parent, sub_total, sub_completed, state_reason, reopened)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )?;
         let mut insert_pr = conn.prepare(
             "INSERT OR REPLACE INTO gh_prs (repo, issue, number, state, created_at,
                  merged_at, url)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
-        for issue in issues {
+        let mut insert_revert = conn.prepare(
+            "INSERT OR REPLACE INTO gh_reverts (repo, number, reverted, merged_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for issue in &repo.issues {
             insert_issue.execute(params![
                 slug,
                 issue.number,
@@ -99,6 +105,7 @@ impl Store {
                 issue.sub_total,
                 issue.sub_completed,
                 issue.state_reason,
+                issue.reopened,
             ])?;
             for pr in &issue.prs {
                 insert_pr.execute(params![
@@ -112,7 +119,15 @@ impl Store {
                 ])?;
             }
         }
-        drop((insert_issue, insert_pr));
+        for revert in &repo.reverts {
+            insert_revert.execute(params![
+                slug,
+                revert.number,
+                revert.reverted,
+                revert.merged_at
+            ])?;
+        }
+        drop((insert_issue, insert_pr, insert_revert));
         tx.commit()
     }
 
@@ -169,7 +184,7 @@ pub fn gh_issues(conn: &Connection, slug: &str) -> Result<Vec<Issue>> {
     }
     conn.prepare(
         "SELECT number, title, state, created_at, closed_at, parent, sub_total, sub_completed,
-             state_reason
+             state_reason, reopened
          FROM gh_issues WHERE repo = ?1 ORDER BY number",
     )?
     .query_map([slug], |r| {
@@ -184,7 +199,23 @@ pub fn gh_issues(conn: &Connection, slug: &str) -> Result<Vec<Issue>> {
             parent: r.get(5)?,
             sub_total: r.get(6)?,
             sub_completed: r.get(7)?,
+            reopened: r.get(9)?,
             prs: prs.remove(&number).unwrap_or_default(),
+        })
+    })?
+    .collect()
+}
+
+/// The cached reverts of `slug` by number. A test and probe helper.
+pub fn gh_reverts(conn: &Connection, slug: &str) -> Result<Vec<Revert>> {
+    conn.prepare(
+        "SELECT number, reverted, merged_at FROM gh_reverts WHERE repo = ?1 ORDER BY number",
+    )?
+    .query_map([slug], |r| {
+        Ok(Revert {
+            number: r.get(0)?,
+            reverted: r.get(1)?,
+            merged_at: r.get(2)?,
         })
     })?
     .collect()

@@ -7,7 +7,8 @@
 //! or errors out for it.
 //! The command runner is injected, so tests never spawn the real CLI.
 //! Epics are issues with sub-issues in the same repo: [`Issue::sub_total`]
-//! and [`Issue::parent`] carry the tree.
+//! and [`Issue::parent`] carry the tree. The first page also carries the
+//! repo's merged revert PRs ([`Revert`]), so a repo costs no extra call.
 
 use std::ffi::OsString;
 use std::io;
@@ -53,10 +54,31 @@ pub struct Issue {
     pub parent: Option<i64>,
     pub sub_total: i64,
     pub sub_completed: i64,
+    /// How many times it was reopened; `None` when not fetched (a row
+    /// cached before v8, until the next refresh).
+    pub reopened: Option<i64>,
     pub prs: Vec<Pr>,
 }
 
-const QUERY: &str = "query($owner: String!, $name: String!, $after: String) {
+/// A merged PR with `revert` in its title.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Revert {
+    pub number: i64,
+    /// The PR it reverts, from a `Reverts owner/name#N` (or `Reverts #N`)
+    /// line in its body; `None` for a commit revert or one in another repo.
+    pub reverted: Option<i64>,
+    pub merged_at: String,
+}
+
+/// One repo as fetched: every issue, and up to 100 merged revert PRs.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Repo {
+    pub issues: Vec<Issue>,
+    pub reverts: Vec<Revert>,
+}
+
+const QUERY: &str = "query($owner: String!, $name: String!, $after: String,
+    $revertSearch: String!, $withReverts: Boolean!) {
   repository(owner: $owner, name: $name) {
     issues(first: 100, after: $after) {
       pageInfo { hasNextPage endCursor }
@@ -64,11 +86,15 @@ const QUERY: &str = "query($owner: String!, $name: String!, $after: String) {
         number title state stateReason createdAt closedAt
         parent { number repository { nameWithOwner } }
         subIssuesSummary { total completed }
+        timelineItems(itemTypes: [REOPENED_EVENT], first: 1) { totalCount }
         closedByPullRequestsReferences(first: 10, includeClosedPrs: true) {
           nodes { number state createdAt mergedAt url }
         }
       }
     }
+  }
+  search(query: $revertSearch, type: ISSUE, first: 100) @include(if: $withReverts) {
+    nodes { ... on PullRequest { number body mergedAt } }
   }
 }";
 
@@ -92,6 +118,28 @@ struct ApiError {
 #[derive(Deserialize)]
 struct Data {
     repository: Option<Repository>,
+    /// Present on the first page only.
+    search: Option<Search>,
+}
+
+#[derive(Deserialize)]
+struct Search {
+    nodes: Vec<RevertNode>,
+}
+
+/// A search hit: a PR, or `{}` for any other node type.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RevertNode {
+    number: Option<i64>,
+    body: Option<String>,
+    merged_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Count {
+    total_count: i64,
 }
 
 #[derive(Deserialize)]
@@ -124,6 +172,7 @@ struct IssueNode {
     closed_at: Option<String>,
     parent: Option<Parent>,
     sub_issues_summary: Option<SubIssues>,
+    timeline_items: Option<Count>,
     closed_by_pull_requests_references: Option<PrNodes>,
 }
 
@@ -198,9 +247,37 @@ impl IssueNode {
                 .map(|p| p.number),
             sub_total,
             sub_completed,
+            reopened: self.timeline_items.map(|t| t.total_count),
             prs,
         }
     }
+}
+
+impl RevertNode {
+    /// The revert, when the hit is a merged PR of `repository`.
+    fn into_revert(self, repository: &str) -> Option<Revert> {
+        Some(Revert {
+            number: self.number?,
+            reverted: self.body.as_deref().and_then(|b| reverted(b, repository)),
+            merged_at: self.merged_at?,
+        })
+    }
+}
+
+/// The PR number a revert PR's `body` names on a line starting
+/// `Reverts owner/name#N` (GitHub's own revert body) or `Reverts #N`, when
+/// `owner/name` is `repository` (case-insensitive).
+fn reverted(body: &str, repository: &str) -> Option<i64> {
+    body.lines().find_map(|line| {
+        let (repo, number) = line.trim().strip_prefix("Reverts ")?.split_once('#')?;
+        if !(repo.is_empty() || repo.eq_ignore_ascii_case(repository)) {
+            return None;
+        }
+        let digits = number
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(number.len());
+        number[..digits].parse().ok()
+    })
 }
 
 /// The `gh` binary: `gh` on `path` (the `PATH` value). Pure: the caller
@@ -223,18 +300,27 @@ fn command(program: &Path, args: &[String]) -> Command {
     proc::command(program, args, Stdio::piped())
 }
 
-/// All issues of `owner/name`, following the query's cursor page by page.
+/// All issues of `owner/name`, following the query's cursor page by page,
+/// and (from the first page) its merged revert PRs.
 /// Errors (as text for the repo's `error` column): the runner failing, a
 /// malformed or error response, a missing repo, or more than 50 pages.
-pub fn fetch_repo(runner: &mut Runner, owner: &str, name: &str) -> Result<Vec<Issue>, String> {
-    let mut issues = Vec::new();
+pub fn fetch_repo(runner: &mut Runner, owner: &str, name: &str) -> Result<Repo, String> {
+    let repository = format!("{owner}/{name}");
+    let revert_search = format!("repo:{repository} is:pr is:merged in:title revert");
+    let mut repo = Repo::default();
     let mut after: Option<String> = None;
     for _ in 0..MAX_PAGES {
         let mut args: Vec<String> = ["api", "graphql", "-f"].map(String::from).into();
         args.push(format!("query={QUERY}"));
-        for (key, value) in [("owner", owner), ("name", name)] {
+        for (key, value) in [
+            ("owner", owner),
+            ("name", name),
+            ("revertSearch", &revert_search),
+        ] {
             args.extend(["-f".into(), format!("{key}={value}")]);
         }
+        // -F is typed, so GraphQL gets a Boolean.
+        args.extend(["-F".into(), format!("withReverts={}", after.is_none())]);
         if let Some(cursor) = &after {
             args.extend(["-f".into(), format!("after={cursor}")]);
         }
@@ -244,19 +330,24 @@ pub fn fetch_repo(runner: &mut Runner, owner: &str, name: &str) -> Result<Vec<Is
         if let Some(first) = response.errors.as_deref().and_then(<[_]>::first) {
             return Err(format!("GitHub: {}", first.message));
         }
-        let page = response
+        let data = response
             .data
-            .and_then(|d| d.repository)
-            .ok_or_else(|| format!("GitHub: no repository {owner}/{name}"))?
+            .ok_or_else(|| format!("GitHub: no repository {repository}"))?;
+        let page = data
+            .repository
+            .ok_or_else(|| format!("GitHub: no repository {repository}"))?
             .issues;
-        let repository = format!("{owner}/{name}");
-        issues.extend(page.nodes.into_iter().map(|n| n.into_issue(&repository)));
+        let hits = data.search.map_or_else(Vec::new, |s| s.nodes);
+        repo.reverts
+            .extend(hits.into_iter().filter_map(|n| n.into_revert(&repository)));
+        repo.issues
+            .extend(page.nodes.into_iter().map(|n| n.into_issue(&repository)));
         match page.page_info {
             PageInfo {
                 has_next_page: true,
                 end_cursor: Some(cursor),
             } => after = Some(cursor),
-            _ => return Ok(issues),
+            _ => return Ok(repo),
         }
     }
     Err(format!("more than {MAX_PAGES} pages of issues"))
@@ -289,7 +380,7 @@ pub enum Fetched {
     Cached {
         slug: String,
         owner: String,
-        issues: Vec<Issue>,
+        repo: Repo,
     },
     /// The owner is unknown when `gh api user` failed too.
     Failed {
@@ -328,11 +419,7 @@ pub fn fetch_all(runner: &mut Runner, targets: &[Target]) -> Vec<Fetched> {
             let slug = target.slug.clone();
             match owner {
                 Ok(owner) => match fetch_repo(runner, &owner, &slug) {
-                    Ok(issues) => Fetched::Cached {
-                        slug,
-                        owner,
-                        issues,
-                    },
+                    Ok(repo) => Fetched::Cached { slug, owner, repo },
                     Err(error) => Fetched::Failed {
                         slug,
                         owner: Some(owner),
@@ -355,11 +442,7 @@ pub fn fetch_all(runner: &mut Runner, targets: &[Target]) -> Vec<Fetched> {
 pub fn store_fetched(store: &mut Store, fetched: &[Fetched], now_ms: i64) -> rusqlite::Result<()> {
     for item in fetched {
         match item {
-            Fetched::Cached {
-                slug,
-                owner,
-                issues,
-            } => store.gh_replace(slug, owner, issues, now_ms)?,
+            Fetched::Cached { slug, owner, repo } => store.gh_replace(slug, owner, repo, now_ms)?,
             Fetched::Failed { slug, owner, error } => {
                 store.gh_record_error(slug, owner.as_deref(), error)?;
             }
@@ -442,14 +525,29 @@ mod tests {
         ];
         let fetched = fetch_all(&mut runner, &targets);
         assert_eq!(*calls.lock().expect("calls"), 4, "login, a, b, c");
-        assert!(
-            matches!(&fetched[0], Fetched::Cached { slug, owner, issues }
-            if slug == "a" && owner == "me" && issues.is_empty())
-        );
+        assert!(matches!(&fetched[0], Fetched::Cached { slug, owner, repo }
+            if slug == "a" && owner == "me" && repo.issues.is_empty()));
         assert!(matches!(&fetched[1], Fetched::Failed { slug, owner, error }
             if slug == "b" && owner.as_deref() == Some("me") && error.contains("rate limited")));
         assert!(matches!(&fetched[2], Fetched::Cached { slug, owner, .. }
             if slug == "c" && owner == "org"));
+    }
+
+    #[test]
+    fn a_revert_names_the_pr_it_reverts_in_its_own_repo_only() {
+        let repo = "example/perf";
+        for (body, want) in [
+            ("Reverts example/perf#2", Some(2)),
+            ("Reverts Example/Perf#12\n\nLorem.", Some(12)),
+            ("Lorem.\r\nReverts #7.", Some(7)),
+            ("Reverts example/other#9", None),
+            ("Reverts example/perf-two#9", None),
+            ("This reverts commit 0000000.", None),
+            ("Reverts example/perf#", None),
+            ("", None),
+        ] {
+            assert_eq!(reverted(body, repo), want, "{body:?}");
+        }
     }
 
     #[test]

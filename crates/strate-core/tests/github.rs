@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, params};
-use strate_core::github::{Runner, cli_runner, fetch_repo, refresh};
-use strate_core::store::{Store, gh_issues, gh_repos};
+use strate_core::github::{Revert, Runner, cli_runner, fetch_repo, refresh};
+use strate_core::store::{Store, gh_issues, gh_repos, gh_reverts};
 
 fn fixture(name: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -68,7 +68,9 @@ impl Drop for Temp {
 #[test]
 fn pages_are_followed_by_cursor_and_parse_into_issues_with_their_prs() {
     let (mut runner, calls) = scripted(vec![ok("page1.json"), ok("page2.json")]);
-    let issues = fetch_repo(&mut runner, "acme", "widget").expect("fetch");
+    let issues = fetch_repo(&mut runner, "acme", "widget")
+        .expect("fetch")
+        .issues;
     let numbers: Vec<_> = issues.iter().map(|i| i.number).collect();
     assert_eq!(numbers, [4, 25, 26]);
 
@@ -106,13 +108,23 @@ fn pages_are_followed_by_cursor_and_parse_into_issues_with_their_prs() {
     assert_eq!(arg(&calls[0], "after"), None);
     assert_eq!(arg(&calls[1], "after"), Some("CURSOR-1"));
     assert!(arg(&calls[0], "query").is_some_and(|q| q.contains("closedByPullRequestsReferences")));
+    assert_eq!(
+        (arg(&calls[0], "withReverts"), arg(&calls[1], "withReverts")),
+        (Some("true"), Some("false")),
+        "the revert search rides on the first page only"
+    );
+    assert!(
+        issues.iter().all(|i| i.reopened.is_none()),
+        "no timelineItems: not known"
+    );
 }
 
 #[test]
 fn a_parent_in_another_repo_is_no_epic_and_the_close_reason_is_kept() {
     let (mut runner, calls) = scripted(vec![ok("audit-home.json")]);
     // GitHub owners are case-insensitive.
-    let issues = fetch_repo(&mut runner, "Example", "demo").expect("fetch");
+    let repo = fetch_repo(&mut runner, "Example", "demo").expect("fetch");
+    let issues = &repo.issues;
     let by = |n: i64| issues.iter().find(|i| i.number == n).expect("issue");
     assert_eq!(by(9).parent, Some(8), "a parent in example/demo");
     assert_eq!(by(11).parent, None, "a parent in example/elsewhere");
@@ -128,10 +140,47 @@ fn a_parent_in_another_repo_is_no_epic_and_the_close_reason_is_kept() {
     let tmp = Temp::new("reason");
     let mut store = Store::open(tmp.db()).expect("open");
     store
-        .gh_replace("demo", "example", &issues, 1)
+        .gh_replace("demo", "example", &repo, 1)
         .expect("store");
     let stored = gh_issues(&Store::open_reader(tmp.db()).expect("reader"), "demo").expect("issues");
-    assert_eq!(stored, issues, "parent and close reason round-trip");
+    assert_eq!(&stored, issues, "parent and close reason round-trip");
+}
+
+#[test]
+fn reopen_counts_and_merged_reverts_are_fetched_with_the_issues_and_cached() {
+    let (mut runner, calls) = scripted(vec![ok("perf-home.json")]);
+    let repo = fetch_repo(&mut runner, "example", "perf").expect("fetch");
+    let reopened: Vec<_> = repo.issues.iter().map(|i| (i.number, i.reopened)).collect();
+    assert_eq!(reopened, [(1, Some(1)), (3, Some(0))]);
+    let revert = Revert {
+        number: 4,
+        reverted: Some(2),
+        merged_at: "2026-10-06T11:40:00Z".into(),
+    };
+    assert_eq!(repo.reverts, std::slice::from_ref(&revert));
+    let call = calls.lock().expect("calls")[0].clone();
+    assert!(arg(&call, "query").is_some_and(|q| q.contains("REOPENED_EVENT")));
+    assert_eq!(
+        arg(&call, "revertSearch"),
+        Some("repo:example/perf is:pr is:merged in:title revert")
+    );
+
+    let tmp = Temp::new("perf");
+    let mut store = Store::open(tmp.db()).expect("open");
+    store
+        .gh_replace("perf", "example", &repo, 1)
+        .expect("store");
+    let reader = Store::open_reader(tmp.db()).expect("reader");
+    assert_eq!(gh_issues(&reader, "perf").expect("issues"), repo.issues);
+    assert_eq!(gh_reverts(&reader, "perf").expect("reverts"), [revert]);
+
+    // A refresh replaces the reverts with the issues.
+    let (mut runner, _) = scripted(vec![ok("page2.json")]);
+    let empty = fetch_repo(&mut runner, "example", "perf").expect("fetch");
+    store
+        .gh_replace("perf", "example", &empty, 2)
+        .expect("store");
+    assert_eq!(gh_reverts(&reader, "perf").expect("reverts"), []);
 }
 
 #[test]
