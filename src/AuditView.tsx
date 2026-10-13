@@ -1,13 +1,26 @@
 // The full-screen Audit view (#27): its own header with "‹ Live", the control bar, the headline
-// KPIs, a daily chart stacked by repo and the tree table. It stays mounted while hidden, like
-// LiveShell, reads nothing then, and takes focus each time it is shown.
-import { Alert, AlertDescription, Button, EmptyState, StackedBarChart } from '@crawfordyoung/ui'
+// KPIs, a daily chart stacked by repo, the tree table and, docked below, the selected row's
+// timeline. It stays mounted while hidden, like LiveShell, reads nothing then, and takes focus
+// each time it is shown.
+import {
+  Alert,
+  AlertDescription,
+  Button,
+  EmptyState,
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+  StackedBarChart,
+} from '@crawfordyoung/ui'
+import { save } from '@tauri-apps/plugin-dialog'
 import { ChevronLeft } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
-import { auditRefresh, type AuditPath, type Headline } from './api'
+import { auditRefresh, writeExport, type Audit, type AuditPath, type Headline } from './api'
 import { dailyChart, hoursLabel, lastDays, repoOptions } from './audit'
 import { AuditControls, type Controls } from './AuditControls'
+import { AuditDetail } from './AuditDetail'
 import { AuditTable } from './AuditTable'
+import { toCsv } from './csv'
 import { duration, money } from './format'
 import { useStoreVersion } from './hooks'
 import { useAudit } from './useAudit'
@@ -34,8 +47,13 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
   }, [hidden])
 
   const [controls, setControls] = useState(START)
-  // The selected row, for the row detail (#27 U2). A path means nothing under another grouping.
-  const [selected, setSelected] = useState<AuditPath | null>(null)
+  // The selected row, for the row detail. A path means nothing under another grouping.
+  const [selected, setSelected] = useState<{ path: AuditPath; label: string } | null>(null)
+  const select = (path: AuditPath, label: string) =>
+    setSelected((s) =>
+      s && JSON.stringify(s.path) === JSON.stringify(path) ? null : { path, label },
+    )
+  const [exportError, setExportError] = useState<string | null>(null)
   const change = (patch: Partial<Controls>) => {
     if (patch.groupBy !== undefined && patch.groupBy !== controls.groupBy) setSelected(null)
     setControls((c) => ({ ...c, ...patch }))
@@ -48,11 +66,26 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
       : lastDays(Number.parseInt(controls.range), new Date())
   const repos = controls.repo === null ? [] : [controls.repo]
   const storeVersion = useStoreVersion()
-  const main = useAudit({ ...days, repos, groupBy: controls.groupBy }, !hidden, storeVersion)
+  const filter = { ...days, repos, groupBy: controls.groupBy }
+  const main = useAudit(filter, !hidden, storeVersion)
   // Every repo, so the repo select lists them all; the chart narrows to the picked one itself.
   const daily = useAudit({ ...days, repos: [], groupBy: 'day' }, !hidden, storeVersion)
   const chart =
     daily.audit && dailyChart(daily.audit, controls.measure, controls.repo, days.from, days.to)
+
+  // The full tree under the current filter, saved wherever the user picks.
+  const exportCsv = async () => {
+    setExportError(null)
+    try {
+      const path = await save({
+        defaultPath: `strate-audit-${days.from}_${days.to}.csv`,
+        filters: [{ name: 'CSV', extensions: ['csv'] }],
+      })
+      if (path !== null) await writeExport(path, toCsv(main.audit as Audit))
+    } catch (e) {
+      setExportError(String(e))
+    }
+  }
 
   return (
     <div hidden={hidden} className="flex h-screen flex-col bg-background text-foreground">
@@ -74,58 +107,90 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
         days={days}
         onChange={change}
         repos={daily.audit ? repoOptions(daily.audit) : []}
+        actions={
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={main.audit === null || main.pending}
+            onClick={() => void exportCsv()}
+          >
+            Export CSV
+          </Button>
+        }
       />
-      <main
-        aria-busy={main.pending}
-        className="min-h-0 flex-1 space-y-4 overflow-auto p-4 aria-busy:opacity-70"
-      >
-        {main.error !== null && (
-          <Alert variant="destructive">
-            <AlertDescription>{main.error}</AlertDescription>
-          </Alert>
-        )}
-        {main.audit === null ? (
-          main.error === null && <EmptyState message="Loading…" />
-        ) : (
-          <>
-            {main.audit.githubErrors.length > 0 && (
-              <Alert variant="warning" className="flex items-start gap-3">
-                <AlertDescription className="flex-1">
-                  GitHub data is missing or stale for{' '}
-                  {main.audit.githubErrors.map((e) => `${e.repo}: ${e.error}`).join('; ')}.
-                </AlertDescription>
-                <Button variant="outline" size="sm" onClick={() => void auditRefresh()}>
-                  Refresh
-                </Button>
+      <ResizablePanelGroup id="strate-audit" orientation="vertical" className="min-h-0 flex-1">
+        <ResizablePanel id="audit-main" minSize="20%">
+          <main
+            aria-busy={main.pending}
+            className="h-full space-y-4 overflow-auto p-4 aria-busy:opacity-70"
+          >
+            {exportError !== null && (
+              <Alert variant="destructive">
+                <AlertDescription>Export failed: {exportError}</AlertDescription>
               </Alert>
             )}
-            <Kpis headline={main.audit.headline} />
-            {chart && (
-              <section aria-label="Per day" className="space-y-2">
-                <h2 className="text-sm font-semibold">
-                  {controls.measure === 'usd' ? '$' : 'Agent-hours'} per day, stacked by repo
-                </h2>
-                <StackedBarChart
-                  data={chart.data}
-                  series={chart.series}
-                  xKey="day"
-                  xFormat={(day) => dayLabel.format(new Date(`${day}T00:00`))}
-                  format={controls.measure === 'usd' ? money : hoursLabel}
-                />
-              </section>
+            {main.error !== null && (
+              <Alert variant="destructive">
+                <AlertDescription>{main.error}</AlertDescription>
+              </Alert>
             )}
-            <section aria-label="Breakdown">
-              <AuditTable
-                // Expanded rows are kept by index, which means nothing under another grouping.
-                key={controls.groupBy}
-                nodes={main.audit.root.children}
-                selected={selected}
-                onSelect={setSelected}
+            {main.audit === null ? (
+              main.error === null && <EmptyState message="Loading…" />
+            ) : (
+              <>
+                {main.audit.githubErrors.length > 0 && (
+                  <Alert variant="warning" className="flex items-start gap-3">
+                    <AlertDescription className="flex-1">
+                      GitHub data is missing or stale for{' '}
+                      {main.audit.githubErrors.map((e) => `${e.repo}: ${e.error}`).join('; ')}.
+                    </AlertDescription>
+                    <Button variant="outline" size="sm" onClick={() => void auditRefresh()}>
+                      Refresh
+                    </Button>
+                  </Alert>
+                )}
+                <Kpis headline={main.audit.headline} />
+                {chart && (
+                  <section aria-label="Per day" className="space-y-2">
+                    <h2 className="text-sm font-semibold">
+                      {controls.measure === 'usd' ? '$' : 'Agent-hours'} per day, stacked by repo
+                    </h2>
+                    <StackedBarChart
+                      data={chart.data}
+                      series={chart.series}
+                      xKey="day"
+                      xFormat={(day) => dayLabel.format(new Date(`${day}T00:00`))}
+                      format={controls.measure === 'usd' ? money : hoursLabel}
+                    />
+                  </section>
+                )}
+                <section aria-label="Breakdown">
+                  <AuditTable
+                    nodes={main.audit.root.children}
+                    selected={selected?.path ?? null}
+                    onSelect={select}
+                  />
+                </section>
+              </>
+            )}
+          </main>
+        </ResizablePanel>
+        {selected && (
+          <>
+            <ResizableHandle />
+            <ResizablePanel id="audit-detail" defaultSize="38%" minSize="15%">
+              <AuditDetail
+                filter={filter}
+                path={selected.path}
+                label={selected.label}
+                active={!hidden}
+                storeVersion={storeVersion}
+                onClose={() => setSelected(null)}
               />
-            </section>
+            </ResizablePanel>
           </>
         )}
-      </main>
+      </ResizablePanelGroup>
     </div>
   )
 }

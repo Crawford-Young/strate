@@ -12,6 +12,7 @@ import {
   status,
   workstreamCosts,
   workstreams,
+  writeExport,
   type Audit,
   type AuditFilter,
   type AuditPath,
@@ -146,6 +147,15 @@ describe('commands', () => {
     invokeMock.mockResolvedValueOnce(undefined)
     await expect(auditRefresh()).resolves.toBeUndefined()
     expect(invokeMock).toHaveBeenCalledWith('audit_refresh')
+  })
+
+  it('write_export hands the picked path and the text over', async () => {
+    invokeMock.mockResolvedValueOnce(undefined)
+    await expect(writeExport('C:/out/audit.csv', 'a,b\r\n')).resolves.toBeUndefined()
+    expect(invokeMock).toHaveBeenCalledWith('write_export', {
+      path: 'C:/out/audit.csv',
+      text: 'a,b\r\n',
+    })
   })
 
   it('a command error rejects with the message', async () => {

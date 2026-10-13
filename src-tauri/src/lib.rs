@@ -16,6 +16,7 @@ struct Running(Mutex<Option<Engine>>);
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             commands::status,
             commands::workstreams,
@@ -25,6 +26,7 @@ pub fn run() {
             commands::audit_rollup,
             commands::audit_timeline,
             commands::audit_refresh,
+            commands::write_export,
         ])
         .setup(|app| {
             let data = app.path().app_data_dir()?;

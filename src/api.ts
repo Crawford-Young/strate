@@ -228,6 +228,10 @@ export const auditRollup = (filter: AuditFilter) => invoke<Audit>('audit_rollup'
 export const auditTimeline = (filter: AuditFilter, path: AuditPath) =>
   invoke<TimelineDay[]>('audit_timeline', { filter, path })
 
+/** Writes `text` to exactly `path` (one the user picked in the save dialog); rejects with the I/O message. */
+export const writeExport = (path: string, text: string): Promise<void> =>
+  invoke('write_export', { path, text })
+
 /**
  * Asks the engine to refresh the GitHub cache and resolves at once; refetch
  * on `store-changed` when it lands. A missing or failing `gh` is not an

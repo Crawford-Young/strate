@@ -29,6 +29,7 @@
     "@crawfordyoung/ui": "file:vendor/crawfordyoung-ui-0.31.0-local.tgz",
     "@tanstack/react-table": "^8.21.3",
     "@tauri-apps/api": "^2.12.1",
+    "@tauri-apps/plugin-dialog": "^2.8.2",
     "@xyflow/react": "^12.12.0",
     "elkjs": "^0.12.0",
     "lucide-react": "^1.52.0",
