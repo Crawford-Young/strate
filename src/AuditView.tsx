@@ -1,8 +1,8 @@
 // The full-screen Audit view (#27): one bar (the "Audit" heading, the controls, Refresh GitHub,
-// Export CSV and "‹ Live"), the headline KPIs, a daily chart stacked by repo, the tree table and,
-// docked below, the selected row's timeline. It stays mounted while hidden, like LiveShell, reads
-// nothing then, and takes focus each time it is shown. It reads when shown, when a control changes
-// and after Refresh GitHub, never on a store change or a timer.
+// Export CSV and "‹ Live"), the performance sections (#51), then Spend: a daily chart stacked by
+// repo, the tree table and, docked below, the selected row's timeline. It stays mounted while
+// hidden, like LiveShell, reads nothing then, and takes focus each time it is shown. It reads when
+// shown, when a control changes and after Refresh GitHub, never on a store change or a timer.
 import {
   Alert,
   AlertDescription,
@@ -23,15 +23,16 @@ import {
   type AuditFilter,
   type AuditPath,
   type GithubError,
-  type Headline,
 } from './api'
 import { dailyChart, hasPath, hoursLabel, lastDays, repoOptions, shortDay } from './audit'
 import { AuditControls, PRESET_DAYS, type Controls } from './AuditControls'
 import { AuditDetail } from './AuditDetail'
 import { AuditTable } from './AuditTable'
 import { toCsv } from './csv'
-import { duration, money } from './format'
+import { money } from './format'
+import { PerformanceView, Section } from './PerformanceView'
 import { useAudit } from './useAudit'
+import { usePerformance } from './usePerformance'
 
 interface AuditViewProps {
   hidden: boolean
@@ -104,6 +105,8 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
   const sameRead = controls.groupBy === 'day' && controls.repo === null
   const own = useAudit(filter, !hidden && !sameRead, version)
   const main = sameRead ? daily : own
+  // Days and repos only: the grouping is not part of the read.
+  const perf = usePerformance(filter, !hidden, version)
   const chart = useMemo(
     () =>
       daily.audit && dailyChart(daily.audit, controls.measure, controls.repo, days.from, days.to),
@@ -198,6 +201,11 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
                 <AlertDescription>{main.error}</AlertDescription>
               </Alert>
             )}
+            {perf.error !== null && (
+              <Alert variant="destructive">
+                <AlertDescription>Performance read failed: {perf.error}</AlertDescription>
+              </Alert>
+            )}
             {main.audit === null ? (
               main.error === null && <EmptyState message="Loading…" />
             ) : (
@@ -205,36 +213,40 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
                 {main.audit.githubErrors.length > 0 && (
                   <GithubBanner errors={main.audit.githubErrors} />
                 )}
-                <Kpis headline={main.audit.headline} />
-                {chart && (
-                  <section aria-label="Per day" className="space-y-2">
-                    <h2 className="text-sm font-semibold">
-                      {controls.measure === 'usd' ? '$' : 'Agent-hours'} per day, stacked by repo
-                    </h2>
-                    <StackedBarChart
-                      data={chart.data}
-                      series={chart.series}
-                      xKey="day"
-                      xLabel="Day"
-                      xFormat={shortDay}
-                      format={controls.measure === 'usd' ? money : hoursLabel}
+                {perf.performance && (
+                  <PerformanceView headline={main.audit.headline} performance={perf.performance} />
+                )}
+                <Section title="Spend" sub="Where the $ and time went.">
+                  {chart && (
+                    <section aria-label="Per day" className="space-y-2">
+                      <h3 className="text-xs font-medium text-muted-foreground">
+                        {controls.measure === 'usd' ? '$' : 'Agent-hours'} per day, stacked by repo
+                      </h3>
+                      <StackedBarChart
+                        data={chart.data}
+                        series={chart.series}
+                        xKey="day"
+                        xLabel="Day"
+                        xFormat={shortDay}
+                        format={controls.measure === 'usd' ? money : hoursLabel}
+                      />
+                    </section>
+                  )}
+                  <section
+                    ref={breakdownRef}
+                    aria-label="Breakdown"
+                    tabIndex={-1}
+                    className="outline-none"
+                  >
+                    <AuditTable
+                      nodes={main.audit.root.children}
+                      selected={shown?.path ?? null}
+                      onSelect={select}
+                      // The tree on screen may be the last filter's while this one is read.
+                      disabled={main.pending}
                     />
                   </section>
-                )}
-                <section
-                  ref={breakdownRef}
-                  aria-label="Breakdown"
-                  tabIndex={-1}
-                  className="outline-none"
-                >
-                  <AuditTable
-                    nodes={main.audit.root.children}
-                    selected={shown?.path ?? null}
-                    onSelect={select}
-                    // The tree on screen may be the last filter's while this one is read.
-                    disabled={main.pending}
-                  />
-                </section>
+                </Section>
               </>
             )}
           </main>
@@ -267,31 +279,5 @@ function GithubBanner({ errors }: { errors: GithubError[] }) {
         GitHub data is missing or stale for {errors.map((e) => `${e.repo}: ${e.error}`).join('; ')}.
       </AlertDescription>
     </Alert>
-  )
-}
-
-function Kpis({ headline: h }: { headline: Headline }) {
-  const kpis: [string, string][] = [
-    ['Issues closed', String(h.issuesClosed)],
-    ['Median elapsed', h.medianElapsedMs === null ? '—' : duration(h.medianElapsedMs)],
-    ['$ per closed issue', money(h.usdPerClosedIssue)],
-    ['$ per merged PR', money(h.usdPerMergedPr)],
-  ]
-  return (
-    <section aria-label="Headline" className="space-y-2">
-      <dl className="grid grid-cols-4 gap-3">
-        {kpis.map(([label, value]) => (
-          <div key={label} className="rounded-lg border border-border bg-surface px-4 py-3">
-            <dt className="text-xs text-muted-foreground">{label}</dt>
-            <dd className="text-xl font-semibold tabular-nums">{value}</dd>
-          </div>
-        ))}
-      </dl>
-      {h.cloudUncounted && (
-        <p className="text-xs text-muted-foreground">
-          Cloud sessions are not counted: their spend is not in the store (#29).
-        </p>
-      )}
-    </section>
   )
 }
