@@ -27,3 +27,18 @@ ALTER TABLE agents ADD COLUMN outcome TEXT
 ALTER TABLE agents ADD COLUMN followups INTEGER;
 -- The deepest of its requests as a % of its model's context window.
 ALTER TABLE agents ADD COLUMN context_peak_pct REAL;
+
+-- How many times an issue was reopened; NULL on a row cached before v8,
+-- until the repo's next refresh.
+ALTER TABLE gh_issues ADD COLUMN reopened INTEGER;
+
+-- A repo's merged PRs with `revert` in the title, replaced with its issues
+-- on each refresh. `reverted` is the PR its body's `Reverts owner/name#N`
+-- names in the same repo; NULL for a commit revert or another repo's PR.
+CREATE TABLE gh_reverts (
+    repo TEXT NOT NULL REFERENCES gh_repos (slug),
+    number INTEGER NOT NULL,
+    reverted INTEGER,
+    merged_at TEXT NOT NULL,
+    PRIMARY KEY (repo, number)
+) STRICT;

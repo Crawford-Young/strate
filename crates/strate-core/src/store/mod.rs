@@ -18,7 +18,7 @@ mod live;
 mod migrate;
 pub mod views;
 
-pub use github::{GhRepo, gh_issues, gh_repos};
+pub use github::{GhRepo, gh_issues, gh_repos, gh_reverts};
 
 use std::path::Path;
 

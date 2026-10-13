@@ -1,0 +1,11 @@
+{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"CURSOR-P"},"nodes":[
+{"number":1,"title":"Lorem performance","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-10-05T09:00:00Z","closedAt":"2026-10-06T12:00:00Z","parent":null,
+ "subIssuesSummary":{"total":0,"completed":0},"timelineItems":{"totalCount":1},
+ "closedByPullRequestsReferences":{"nodes":[
+   {"number":2,"state":"MERGED","createdAt":"2026-10-06T10:30:00Z","mergedAt":"2026-10-06T11:00:00Z","url":"https://github.com/example/perf/pull/2"}]}},
+{"number":3,"title":"Ipsum follow-up","state":"OPEN","stateReason":null,"createdAt":"2026-10-06T09:00:00Z","closedAt":null,"parent":null,
+ "subIssuesSummary":{"total":0,"completed":0},"timelineItems":{"totalCount":0},"closedByPullRequestsReferences":{"nodes":[]}}
+]}},
+"search":{"nodes":[
+{"number":4,"body":"Reverts example/perf#2","mergedAt":"2026-10-06T11:40:00Z"}
+]}}}
