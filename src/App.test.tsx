@@ -1,7 +1,9 @@
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { audit } from '../tests/audit-fixtures'
 import { defaultLayoutOf, dragTo, resetGroups } from '../tests/resizable-mock'
 import {
+  auditRollup,
   liveGraph,
   onStoreChanged,
   status,
@@ -18,6 +20,8 @@ vi.mock('./api', () => ({
   workstreams: vi.fn(),
   liveGraph: vi.fn(),
   onStoreChanged: vi.fn(),
+  auditRollup: vi.fn(),
+  auditRefresh: vi.fn(),
 }))
 
 vi.mock('./elk', async () => {
@@ -40,6 +44,7 @@ const statusMock = vi.mocked(status)
 const workstreamsMock = vi.mocked(workstreams)
 const liveGraphMock = vi.mocked(liveGraph)
 const onStoreChangedMock = vi.mocked(onStoreChanged)
+const auditRollupMock = vi.mocked(auditRollup)
 
 function ws(over: Partial<Workstream> & Pick<Workstream, 'id' | 'name'>): Workstream {
   return {
@@ -119,7 +124,9 @@ const unnamedGraph: LiveGraph = {
   edges: [],
 }
 
-let storeChanged: () => void
+// Every view listens; the event reaches them all.
+let listeners: (() => void)[] = []
+const storeChanged = () => listeners.forEach((listener) => listener())
 const unlisten = vi.fn()
 
 function deferred<T>() {
@@ -139,8 +146,10 @@ beforeEach(() => {
     .mockImplementation((id) =>
       Promise.resolve(id === 2 ? shellGraph : id === 3 ? unnamedGraph : null),
     )
+  listeners = []
+  auditRollupMock.mockReset().mockResolvedValue(audit([]))
   onStoreChangedMock.mockReset().mockImplementation((callback) => {
-    storeChanged = callback
+    listeners.push(callback)
     return Promise.resolve(unlisten)
   })
 })
@@ -372,7 +381,7 @@ describe('refetching', () => {
     const { unmount } = render(<App />)
     await screen.findByRole('tab', { name: /strate-17/ })
     unmount()
-    expect(unlisten).toHaveBeenCalledOnce()
+    expect(unlisten).toHaveBeenCalledTimes(onStoreChangedMock.mock.calls.length)
   })
 
   it('stops listening when unmounted before the listener is ready', async () => {
@@ -381,7 +390,7 @@ describe('refetching', () => {
     const { unmount } = render(<App />)
     unmount()
     await act(async () => ready.resolve(unlisten))
-    expect(unlisten).toHaveBeenCalledOnce()
+    expect(unlisten).toHaveBeenCalledTimes(onStoreChangedMock.mock.calls.length)
   })
 })
 
@@ -606,10 +615,11 @@ describe('audit view', () => {
   const openAudit = () => fireEvent.click(screen.getByRole('button', { name: 'Audit' }))
   const back = () => fireEvent.click(screen.getByRole('button', { name: 'Live' }))
 
-  it('starts on the live view with the Audit view hidden', async () => {
+  it('starts on the live view with the Audit view hidden, reading no rollup', async () => {
     render(<App />)
     await screen.findByRole('tab', { name: /strate-17/ })
     expect(screen.queryByRole('heading', { name: 'Audit' })).not.toBeInTheDocument()
+    expect(auditRollupMock).not.toHaveBeenCalled()
   })
 
   it('opens full-screen from the header, hiding the live view, and takes focus', async () => {
