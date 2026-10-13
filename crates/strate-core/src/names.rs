@@ -16,9 +16,11 @@ pub struct ParsedName {
 /// Parses `name`: past a `ticket-` or `epic-` prefix, the issue is the
 /// first all-digit `-` segment and the repo the segments before it, joined.
 /// `None` for a `director-` or `general-` name, and when there is no such
-/// segment or no repo before it (the caller files the work under
-/// "Unlinked"). Prefixes match in any case. A prefix with no repo after it
-/// (`ticket-51`) is an untyped name, as lib.mjs's legacy form reads it.
+/// segment, no repo before it, or a repo GitHub cannot name (a character
+/// outside `[A-Za-z0-9._-]`, as in a pasted `claude -n …` line; nothing is
+/// stripped to guess one); the caller files the work under "Unlinked".
+/// Prefixes match in any case. A prefix with no repo after it (`ticket-51`)
+/// is an untyped name, as lib.mjs's legacy form reads it.
 pub fn parse_name(name: &str) -> Option<ParsedName> {
     let (kind, rest) = name.split_once('-').unwrap_or((name, ""));
     let typed = |k: &str| kind.eq_ignore_ascii_case(k) && !rest.is_empty();
@@ -38,7 +40,7 @@ fn parse_untyped(name: &str) -> Option<ParsedName> {
     let segments: Vec<&str> = name.split('-').collect();
     let at = segments.iter().position(|s| all_digits(s))?;
     let repo = segments[..at].join("-");
-    if repo.is_empty() {
+    if !github_repo_name(&repo) {
         return None;
     }
     let issue = segments[at].parse().ok()?;
@@ -54,6 +56,14 @@ fn parse_untyped(name: &str) -> Option<ParsedName> {
         issue,
         rotation,
     })
+}
+
+/// Whether `repo` is non-empty and only uses GitHub repo-name characters.
+fn github_repo_name(repo: &str) -> bool {
+    !repo.is_empty()
+        && repo
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 fn all_digits(s: &str) -> bool {
