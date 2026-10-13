@@ -23,6 +23,7 @@ pub fn run() {
             commands::needs_you,
             commands::live_graph,
             commands::audit_rollup,
+            commands::audit_timeline,
             commands::audit_refresh,
         ])
         .setup(|app| {

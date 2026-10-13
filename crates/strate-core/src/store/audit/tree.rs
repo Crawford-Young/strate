@@ -46,6 +46,14 @@ pub(crate) struct Step {
 }
 
 impl Step {
+    /// When an epic, issue or PR closed or merged, if GitHub gave a time.
+    pub(crate) fn closed_at(&self) -> Option<i64> {
+        match self.end {
+            End::Closed(at) => Some(at),
+            _ => None,
+        }
+    }
+
     fn new(kind: NodeKind, key: String, label: String, order: String) -> Self {
         Self {
             kind,

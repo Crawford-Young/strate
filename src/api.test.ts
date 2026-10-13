@@ -5,6 +5,7 @@ import {
   STORE_CHANGED,
   auditRefresh,
   auditRollup,
+  auditTimeline,
   liveGraph,
   needsYou,
   onStoreChanged,
@@ -13,7 +14,9 @@ import {
   workstreams,
   type Audit,
   type AuditFilter,
+  type AuditPath,
   type LiveGraph,
+  type TimelineDay,
 } from './api'
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
@@ -110,6 +113,33 @@ describe('commands', () => {
     invokeMock.mockResolvedValueOnce(audit)
     await expect(auditRollup(filter)).resolves.toEqual(audit)
     expect(invokeMock).toHaveBeenCalledWith('audit_rollup', { filter })
+  })
+
+  it('audit_timeline passes the filter and node path and returns the days', async () => {
+    const filter: AuditFilter = {
+      from: '2026-10-01',
+      to: '2026-10-31',
+      repos: [],
+      groupBy: 'hierarchy',
+    }
+    const path: AuditPath = [
+      ['repo', 'demo'],
+      ['issue', '9'],
+    ]
+    const days: TimelineDay[] = [
+      {
+        day: '2026-10-05',
+        spans: [
+          { startMs: 300000, endMs: 310000, kind: 'active' },
+          { startMs: 300000, endMs: 305000, kind: 'agent' },
+          { startMs: 310000, endMs: 320000, kind: 'wait' },
+        ],
+        marks: [{ atMs: 25200000, label: 'PR #12 merged' }],
+      },
+    ]
+    invokeMock.mockResolvedValueOnce(days)
+    await expect(auditTimeline(filter, path)).resolves.toEqual(days)
+    expect(invokeMock).toHaveBeenCalledWith('audit_timeline', { filter, path })
   })
 
   it('audit_refresh asks for a GitHub refresh and resolves with nothing', async () => {
