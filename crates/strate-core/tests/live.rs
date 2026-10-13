@@ -253,6 +253,100 @@ fn a_registry_entry_shows_before_its_transcript_and_waiting_is_needs_you() {
     );
 }
 
+fn registry_row(reader: &Connection, key: &str) -> (i64, i64) {
+    reader
+        .query_row(
+            "SELECT gone, last_seen_ms FROM registry WHERE key = ?1",
+            [key],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("registry row")
+}
+
+#[test]
+fn a_baseline_marks_gone_the_live_rows_it_does_not_list() {
+    let temp = Temp::new("registry-baseline");
+    let (mut store, reader) = temp.open();
+    let alpha = with_status(&waiting_alpha(), "busy");
+    let stale = entry(
+        r#"{"pid":4102,"cwd":"/work/gamma","kind":"interactive","startedAt":1791000001000,
+            "sessionId":"s-gamma","name":"gamma-1","status":"idle"}"#,
+    );
+    // An earlier run stored both; this run's first poll lists only alpha.
+    store
+        .apply_registry(&[
+            RegistryEvent::Appeared {
+                entry: alpha.clone(),
+                at_ms: 1000,
+            },
+            RegistryEvent::Appeared {
+                entry: stale.clone(),
+                at_ms: 1000,
+            },
+        ])
+        .expect("earlier run");
+    store
+        .apply_registry(&[
+            RegistryEvent::Appeared {
+                entry: alpha.clone(),
+                at_ms: 9000,
+            },
+            RegistryEvent::Baseline {
+                keys: vec![alpha.key()],
+            },
+        ])
+        .expect("first poll");
+
+    assert_eq!(registry_row(&reader, &alpha.key()), (0, 9000));
+    assert_eq!(
+        registry_row(&reader, &stale.key()),
+        (1, 1000),
+        "gone keeps the last poll that saw it"
+    );
+    assert_eq!(
+        orchestrator(&reader, "s-gamma"),
+        Some((Some("gamma-1".into()), Some("gone".into())))
+    );
+    assert_eq!(
+        orchestrator(&reader, "s-alpha"),
+        Some((Some("alpha-1".into()), Some("busy".into())))
+    );
+}
+
+#[test]
+fn a_finished_background_entry_is_stored_but_not_live() {
+    let temp = Temp::new("registry-finished");
+    let (mut store, reader) = temp.open();
+    let done = entry(
+        r#"{"id":"bg-2","cwd":"/work/beta","kind":"background","startedAt":1791000000600,
+            "sessionId":"s-beta","name":"beta-3","state":"done"}"#,
+    );
+    store
+        .apply_registry(&[
+            RegistryEvent::Appeared {
+                entry: done.clone(),
+                at_ms: 10,
+            },
+            RegistryEvent::Baseline {
+                keys: vec![done.key()],
+            },
+        ])
+        .expect("apply");
+    assert_eq!(registry_row(&reader, "id:bg-2"), (1, 10));
+    let state: String = reader
+        .query_row(
+            "SELECT state FROM registry WHERE key = 'id:bg-2'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("state");
+    assert_eq!(state, "done");
+    assert_eq!(
+        orchestrator(&reader, "s-beta"),
+        Some((Some("beta-3".into()), Some("gone".into())))
+    );
+}
+
 #[test]
 fn background_entries_keep_their_state_and_unnamed_sessions_still_list() {
     let temp = Temp::new("registry-background");

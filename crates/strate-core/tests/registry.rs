@@ -124,12 +124,13 @@ fn label(event: &RegistryEvent) -> String {
         RegistryEvent::Appeared { entry, .. } => format!("appeared {}", entry.key()),
         RegistryEvent::Changed { entry, .. } => format!("changed {}", entry.key()),
         RegistryEvent::Gone { entry, .. } => format!("gone {}", entry.key()),
+        RegistryEvent::Baseline { keys } => format!("baseline {}", keys.join(" ")),
         RegistryEvent::Error { .. } => "error".into(),
     }
 }
 
 #[test]
-fn the_poller_emits_appeared_changed_gone_and_error_by_diffing_snapshots() {
+fn the_poller_emits_appeared_baseline_changed_gone_and_error_by_diffing_snapshots() {
     let busy_to_waiting = INTERACTIVE.replace(
         r#""status":"busy""#,
         r#""status":"waiting","waitingFor":"permission""#,
@@ -147,7 +148,7 @@ fn the_poller_emits_appeared_changed_gone_and_error_by_diffing_snapshots() {
     let (poller, events) = RegistryPoller::start(runner, fast()).expect("start");
     let started = Instant::now();
     let mut got = Vec::new();
-    while got.len() < 6 {
+    while got.len() < 7 {
         let left = PATIENCE.saturating_sub(started.elapsed());
         got.push(events.recv_timeout(left).expect("event in time"));
     }
@@ -167,13 +168,14 @@ fn the_poller_emits_appeared_changed_gone_and_error_by_diffing_snapshots() {
         [
             "appeared id:bg-1",
             "appeared pid:4101:1791000000000",
+            "baseline id:bg-1 pid:4101:1791000000000",
             "changed pid:4101:1791000000000",
             "error",
             "error",
             "gone pid:4101:1791000000000",
         ]
     );
-    match &got[2] {
+    match &got[3] {
         RegistryEvent::Changed { entry, at_ms } => {
             assert_eq!(entry.status, Some(Status::Waiting));
             assert_eq!(entry.waiting_for.as_deref(), Some("permission"));
@@ -181,11 +183,11 @@ fn the_poller_emits_appeared_changed_gone_and_error_by_diffing_snapshots() {
         }
         other => panic!("{other:?}"),
     }
-    match &got[3] {
+    match &got[4] {
         RegistryEvent::Error { message, .. } => assert!(!message.is_empty()),
         other => panic!("{other:?}"),
     }
-    match (&got[2], &got[5]) {
+    match (&got[3], &got[6]) {
         (RegistryEvent::Changed { at_ms, .. }, RegistryEvent::Gone { last_seen_ms, .. }) => {
             assert!(
                 last_seen_ms >= at_ms,
@@ -194,6 +196,45 @@ fn the_poller_emits_appeared_changed_gone_and_error_by_diffing_snapshots() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn a_failed_first_poll_emits_no_baseline_until_a_good_one() {
+    let (runner, _calls) = scripted(vec![
+        Err(io::Error::other("spawn failed")),
+        Ok(b"garbage".to_vec()),
+        Ok(snapshot(&[INTERACTIVE])),
+        Ok(snapshot(&[])),
+    ]);
+    let (poller, events) = RegistryPoller::start(runner, fast()).expect("start");
+    let started = Instant::now();
+    let mut got = Vec::new();
+    while got.len() < 5 {
+        let left = PATIENCE.saturating_sub(started.elapsed());
+        got.push(label(&events.recv_timeout(left).expect("event in time")));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    poller.stop();
+    assert!(events.try_recv().is_err(), "one baseline per run");
+    assert_eq!(
+        got,
+        [
+            "error",
+            "error",
+            "appeared pid:4101:1791000000000",
+            "baseline pid:4101:1791000000000",
+            "gone pid:4101:1791000000000",
+        ]
+    );
+}
+
+#[test]
+fn a_background_entry_that_is_done_is_finished() {
+    let done = r#"{"id":"bg-2","cwd":"/work/beta","kind":"background","startedAt":1791000000600,
+        "name":"beta-3","state":"done"}"#;
+    let entries = parse_snapshot(&snapshot(&[INTERACTIVE, BACKGROUND, done])).expect("parse");
+    let finished: Vec<_> = entries.iter().map(|e| e.finished()).collect();
+    assert_eq!(finished, [false, false, true]);
 }
 
 #[test]

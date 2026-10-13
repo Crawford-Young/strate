@@ -3,8 +3,9 @@
 //! [`RegistryPoller::start`] returns at once. A worker thread runs the
 //! command every [`PollOptions::every`], parses the output at the boundary
 //! ([`parse_snapshot`]), and emits what changed since the last good poll as
-//! [`RegistryEvent`]s over a bounded channel. A failed or malformed poll is
-//! an [`RegistryEvent::Error`] and keeps the last snapshot. The command
+//! [`RegistryEvent`]s over a bounded channel. The first good poll also
+//! emits a [`RegistryEvent::Baseline`]. A failed or malformed poll is an
+//! [`RegistryEvent::Error`] and keeps the last snapshot. The command
 //! runner is injected, so tests never spawn the real CLI. The registry
 //! lists sessions, never subagents (those arrive through the tail first).
 
@@ -107,6 +108,12 @@ impl Status {
 }
 
 impl RegistryEntry {
+    /// A finished background session: `--all` keeps listing it (no `pid`,
+    /// no `status`), but it is not running.
+    pub fn finished(&self) -> bool {
+        self.state.as_deref() == Some("done")
+    }
+
     /// The entry's identity across polls: a background `id`, else the
     /// process (`pid` with its start, as pids are reused), else the
     /// `sessionId`, else its start and cwd.
@@ -137,6 +144,10 @@ pub enum RegistryEvent {
         entry: RegistryEntry,
         last_seen_ms: i64,
     },
+    /// Every key the first good poll listed, after that poll's other
+    /// events. An entry an earlier run stored and absent here ended while
+    /// nothing polled.
+    Baseline { keys: Vec<String> },
     /// The command failed or printed something unparseable.
     Error { message: String, at_ms: i64 },
 }
@@ -263,6 +274,7 @@ fn poll_loop(
     };
     let mut last: BTreeMap<String, RegistryEntry> = BTreeMap::new();
     let mut last_ms = 0;
+    let mut baselined = false;
     let ticker = tick(every);
     loop {
         let at_ms = now_ms();
@@ -272,7 +284,12 @@ fn poll_loop(
         let events = match polled {
             Ok(entries) => {
                 let next: BTreeMap<_, _> = entries.into_iter().map(|e| (e.key(), e)).collect();
-                let events = diff(&last, &next, at_ms, last_ms);
+                let mut events = diff(&last, &next, at_ms, last_ms);
+                if !baselined {
+                    let keys = next.keys().cloned().collect();
+                    events.push(RegistryEvent::Baseline { keys });
+                    baselined = true;
+                }
                 (last, last_ms) = (next, at_ms);
                 events
             }
