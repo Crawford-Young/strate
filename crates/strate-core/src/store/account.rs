@@ -165,17 +165,25 @@ fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// What the stored fields and cells hold, under meta `rollup`. Bump it when
+/// [`fields`] or the cells gain something a store accounted by an older
+/// build lacks: the next open re-reads and recomputes everything once.
+/// 2: `audit_cells.ask_ms` (v8).
+const ROLLUP_VERSION: &str = "2";
+
 /// Recomputes every rollup and audit cell unless the store was last
-/// accounted at the vendored prices and in `zone` (an IANA name). A new
-/// price list also re-reads every event's accounting fields from `raw`. A
-/// store from before v3 (no prices) or v6 (no zone) is filled here too.
+/// accounted at the vendored prices, in `zone` (an IANA name) and at
+/// [`ROLLUP_VERSION`]. A new price list or rollup version also re-reads
+/// every event's accounting fields from `raw`. A store from before v3 (no
+/// prices) or v6 (no zone) is filled here too.
 pub(super) fn refresh(conn: &Connection, zone: &str) -> Result<()> {
     let repriced = meta(conn, "prices")?.as_deref() != Some(cost::PRICES_JSON);
     let rezoned = meta(conn, "tz")?.as_deref() != Some(zone);
-    if !repriced && !rezoned {
+    let reversioned = meta(conn, "rollup")?.as_deref() != Some(ROLLUP_VERSION);
+    if !repriced && !rezoned && !reversioned {
         return Ok(());
     }
-    if repriced {
+    if repriced || reversioned {
         reread_fields(conn)?;
     }
     set_meta(conn, "tz", zone)?;
@@ -184,6 +192,7 @@ pub(super) fn refresh(conn: &Connection, zone: &str) -> Result<()> {
         .query_map([], |r| r.get(0))?
         .collect::<Result<_>>()?;
     rollup(conn, ids.iter().map(String::as_str))?;
+    set_meta(conn, "rollup", ROLLUP_VERSION)?;
     set_meta(conn, "prices", cost::PRICES_JSON)
 }
 
@@ -316,8 +325,8 @@ struct Requests {
 /// One (agent, window, day) bucket: its time and its requests per model.
 #[derive(Default)]
 struct Bucket {
-    /// Wall, active and wait ms.
-    time: [i64; 3],
+    /// Wall, active, wait and ask ms.
+    time: [i64; 4],
     models: BTreeMap<Option<String>, Requests>,
 }
 
@@ -326,6 +335,7 @@ impl Bucket {
         self.time[0] += split.wall_ms;
         self.time[1] += split.active_ms();
         self.time[2] += split.user_ms;
+        self.time[3] += split.ask_ms;
     }
 
     /// Adds request number `n` (in time order).
@@ -351,7 +361,7 @@ impl Bucket {
     /// One cell per model, the time on the model that took the most
     /// requests (the latest winning ties); a bucket with no requests is one
     /// cell with no model.
-    fn cells(&self) -> Vec<(Option<&str>, [i64; 3], Option<&Requests>)> {
+    fn cells(&self) -> Vec<(Option<&str>, [i64; 4], Option<&Requests>)> {
         let dominant = self
             .models
             .iter()
@@ -366,7 +376,7 @@ impl Bucket {
                 let time = if Some(model) == dominant {
                     self.time
                 } else {
-                    [0; 3]
+                    [0; 4]
                 };
                 (model.as_deref(), time, Some(r))
             })
@@ -381,6 +391,7 @@ fn add(a: Split, b: &Split) -> Split {
         model_ms: a.model_ms + b.model_ms,
         tools_ms: a.tools_ms + b.tools_ms,
         user_ms: a.user_ms + b.user_ms,
+        ask_ms: a.ask_ms + b.ask_ms,
         other_ms: a.other_ms + b.other_ms,
     }
 }
@@ -602,12 +613,12 @@ fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
         .execute([session_id])?;
     let mut insert = conn.prepare_cached(
         "INSERT INTO audit_cells (session_id, agent_id, segment_id, day, wall_ms, active_ms,
-             wait_ms, cost_usd, unpriced, input_tokens, output_tokens, cache_read_tokens,
-             cache_write_tokens, model)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             wait_ms, ask_ms, cost_usd, unpriced, input_tokens, output_tokens,
+             cache_read_tokens, cache_write_tokens, model)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
     )?;
     for ((agent, window, day), bucket) in &buckets {
-        for (model, [wall, active, wait], r) in bucket.cells() {
+        for (model, [wall, active, wait, ask], r) in bucket.cells() {
             let [input, output, cache_read, cache_write] = r.map_or([0; 4], |r| r.tokens);
             insert.execute(params![
                 session_id,
@@ -617,6 +628,7 @@ fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
                 wall,
                 active,
                 wait,
+                ask,
                 r.and_then(|r| r.cost_usd),
                 r.map_or(0, |r| r.unpriced),
                 input,

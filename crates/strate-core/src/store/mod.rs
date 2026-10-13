@@ -89,8 +89,8 @@ impl Store {
         if version == 1 {
             store.regroup_all()?;
         }
-        // A store from before v3 or v6, or accounted with another price list
-        // or in another zone.
+        // A store from before v3 or v6, or accounted with another price list,
+        // in another zone or at another rollup version.
         let tx = store.transaction()?;
         account::refresh(&tx.tx, zone)?;
         tx.commit()?;
@@ -326,6 +326,63 @@ impl Ingest<'_> {
 mod tests {
     use super::*;
     use crate::tail::test_dir;
+
+    #[test]
+    fn a_new_rollup_version_recomputes_every_cell_once() {
+        let dir = test_dir("store-v7-upgrade");
+        let db = dir.join("strate.db");
+        let mut v7 = Connection::open(&db).expect("v7 db");
+        migrate::migrate(&mut v7, &migrate::MIGRATIONS[..7]).expect("v7");
+        // Accounted at today's prices and zone, by a build before ask_ms.
+        v7.execute(
+            "INSERT INTO meta (key, value) VALUES ('prices', ?1), ('tz', 'UTC')",
+            [crate::cost::PRICES_JSON],
+        )
+        .expect("meta");
+        v7.execute_batch(
+            r#"INSERT INTO sessions (session_id, path) VALUES ('s1', '/p/s1.jsonl');
+               INSERT INTO agents (session_id, kind) VALUES ('s1', 'orchestrator');
+               INSERT INTO events (session_id, type, uuid, timestamp, file, byte_offset, raw,
+                       request_key, tool_uses, tool_results, prompt)
+               VALUES ('s1', 'user', 'u1', '2026-10-03T10:00:00.000Z', '/p/s1.jsonl', 0,
+                       '{"type":"user","message":{"content":"Lorem."}}', NULL, NULL, NULL, 1),
+                      ('s1', 'assistant', 'u2', '2026-10-03T10:00:05.000Z', '/p/s1.jsonl', 50,
+                       '{"type":"assistant","requestId":"req_1","message":{"content":[
+                         {"type":"tool_use","id":"toolu_1","name":"AskUserQuestion"}]}}',
+                       'req_1', '[["toolu_1","AskUserQuestion"]]', NULL, NULL),
+                      ('s1', 'user', 'u3', '2026-10-03T10:01:05.000Z', '/p/s1.jsonl', 300,
+                       '{"type":"user","message":{"content":[
+                         {"type":"tool_result","tool_use_id":"toolu_1"}]}}',
+                       NULL, NULL, '["toolu_1"]', NULL);
+               INSERT INTO audit_cells (session_id, day, wall_ms, active_ms, wait_ms,
+                       unpriced, input_tokens, output_tokens, cache_read_tokens,
+                       cache_write_tokens)
+               VALUES ('s1', '2026-10-03', 65000, 65000, 60000, 0, 0, 0, 0, 0);"#,
+        )
+        .expect("v7 rows");
+        drop(v7);
+
+        let ask = |store: &Store| -> i64 {
+            store
+                .conn
+                .query_row("SELECT sum(ask_ms) FROM audit_cells", [], |r| r.get(0))
+                .expect("ask_ms")
+        };
+        // The question ran 10:00:05 -> 10:01:05.
+        let store = Store::open_in(&db, "UTC").expect("upgrade");
+        assert_eq!(ask(&store), 60_000);
+
+        // Once recomputed at this version, open leaves the cells alone.
+        store
+            .conn
+            .execute("UPDATE audit_cells SET ask_ms = 99", [])
+            .expect("marker");
+        drop(store);
+        let store = Store::open_in(&db, "UTC").expect("reopen");
+        assert_eq!(ask(&store), 99);
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
 
     #[test]
     fn the_writer_runs_wal_with_synchronous_normal_and_foreign_keys() {

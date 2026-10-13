@@ -44,7 +44,8 @@ pub struct Timed {
     pub record: Record,
 }
 
-/// A timeline's wall time and where it went. The buckets sum to `wall_ms`.
+/// A timeline's wall time and where it went. The buckets other than
+/// `ask_ms` (a part of `user_ms`) sum to `wall_ms`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Split {
     pub wall_ms: i64,
@@ -53,6 +54,8 @@ pub struct Split {
     pub tools_ms: i64,
     /// Questions to the user plus waits for a typed prompt: waiting time.
     pub user_ms: i64,
+    /// The questions alone (`Ask` spans): `user_ms` less the prompt waits.
+    pub ask_ms: i64,
     pub other_ms: i64,
 }
 
@@ -147,7 +150,8 @@ pub fn split_at(
 /// The same timeline as `split_at` reads it, as the runs of one category
 /// each, in time order: they tile `[first, last]`, and a run ends at each
 /// cut strictly inside it. A run sums into its bucket of `split_at`:
-/// `Ask` and `Wait` are `user_ms`. `None` when there are no records.
+/// `Ask` and `Wait` are `user_ms`, and `Ask` is `ask_ms` too. `None` when
+/// there are no records.
 pub fn runs(records: &[Timed], also: &[i64], idle_gap_ms: i64, cuts: &[i64]) -> Option<Vec<Span>> {
     let (intervals, first, last) = intervals(records, also, idle_gap_ms)?;
     Some(sweep(&intervals, last, &starts(first, last, cuts)))
@@ -342,6 +346,9 @@ fn buckets(starts: &[i64], last: i64, runs: &[Span]) -> Vec<(i64, Split)> {
         .collect();
     for &(from, to, cat) in runs {
         let bucket = &mut out[starts.partition_point(|&c| c <= from) - 1].1;
+        if cat == Cat::Ask {
+            bucket.ask_ms += to - from;
+        }
         let slot = match cat {
             Cat::Idle => &mut bucket.idle_ms,
             Cat::Ask | Cat::Wait => &mut bucket.user_ms,
@@ -470,6 +477,7 @@ mod tests {
                 model_ms: 26_000,
                 tools_ms: 185_000,
                 user_ms: 240_000,
+                ask_ms: 120_000,
                 other_ms: 0,
             }
         );
@@ -561,6 +569,7 @@ mod tests {
             model_ms: a.model_ms + b.model_ms,
             tools_ms: a.tools_ms + b.tools_ms,
             user_ms: a.user_ms + b.user_ms,
+            ask_ms: a.ask_ms + b.ask_ms,
             other_ms: a.other_ms + b.other_ms,
         })
     }
@@ -657,6 +666,9 @@ mod tests {
                 assert!(to <= end, "fixture {i}: run {n} crosses a cut");
                 let split = &mut sums[b].1;
                 split.wall_ms += to - from;
+                if cat == Cat::Ask {
+                    split.ask_ms += to - from;
+                }
                 *match cat {
                     Cat::Idle => &mut split.idle_ms,
                     Cat::Ask | Cat::Wait => &mut split.user_ms,
@@ -735,6 +747,34 @@ mod tests {
         // Ask [8,128] = 120 s sits wholly before the cut.
         assert_eq!(buckets[0].1.user_ms, 120_000 + 60_000);
         assert_eq!(buckets[1].1.user_ms, 60_000);
+        assert_eq!((buckets[0].1.ask_ms, buckets[1].1.ask_ms), (120_000, 0));
+    }
+
+    #[test]
+    fn an_ask_straddling_a_cut_is_ask_time_on_both_sides() {
+        // AskUserQuestion [8,128]; cut at 50 s.
+        let cut = T0 + 50_000;
+        let buckets = split_at(&session(), &[], IDLE_GAP_MS, &[cut]).expect("records");
+        assert_eq!((buckets[0].1.ask_ms, buckets[1].1.ask_ms), (42_000, 78_000));
+        assert_eq!(buckets[0].1.user_ms, 42_000);
+    }
+
+    #[test]
+    fn an_ask_over_ten_minutes_of_silence_is_idle_not_ask() {
+        // The question waits 15 min with no record between: the gap is idle,
+        // and idle beats ask. A plan approval answered in 5 min stays ask.
+        let run = [
+            prompt(0, true),
+            reply(5, "req_a", Some(("toolu_a", "AskUserQuestion"))),
+            result(905, "toolu_a"),
+            reply(910, "req_b", Some(("toolu_b", "ExitPlanMode"))),
+            result(1210, "toolu_b"),
+            reply(1215, "req_c", None),
+        ];
+        let split = split(&run, &[], IDLE_GAP_MS).expect("records");
+        assert_eq!(split.idle_ms, 900_000);
+        assert_eq!(split.ask_ms, 300_000);
+        assert_eq!(split.user_ms, 300_000);
     }
 
     #[test]

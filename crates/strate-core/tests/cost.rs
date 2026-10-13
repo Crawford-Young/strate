@@ -290,6 +290,17 @@ fn time_rollups_match_hand_computed_values() {
     // it, so it waits 0.
     assert_eq!(agent_row::<i64>(&db, "run_ms", K1, Some(SUB)), 180_000);
     assert_eq!(agent_row::<i64>(&db, "wait_ms", K1, Some(SUB)), 0);
+    // Of that waiting, only the AskUserQuestion's 120 s is a question.
+    let ask = |agent: Option<&str>, sid: &str| -> i64 {
+        db.query_row(
+            "SELECT sum(ask_ms) FROM audit_cells WHERE session_id = ?1 AND agent_id IS ?2",
+            params![sid, agent],
+            |r| r.get(0),
+        )
+        .expect("ask_ms")
+    };
+    assert_eq!(ask(None, K1), 120_000);
+    assert_eq!(ask(Some(SUB), K1), 0);
     // K2, seconds from 09:00:00: records at 0, 3, 60, 62, no gap. Wall and
     // active 62 s; waiting for the 60 s prompt since the reply at 3 = 57 s;
     // no subagents.
@@ -297,6 +308,7 @@ fn time_rollups_match_hand_computed_values() {
     assert_eq!(session("run_ms"), 62_000);
     assert_eq!(session("active_ms"), 62_000);
     assert_eq!(session("wait_ms"), 57_000);
+    assert_eq!(ask(None, K2), 0, "a wait for a prompt is not a question");
     assert_eq!(session("agent_ms"), 0);
 }
 

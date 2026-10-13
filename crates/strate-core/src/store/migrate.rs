@@ -10,6 +10,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
     include_str!("0005_github.sql"),
     include_str!("0006_audit.sql"),
     include_str!("0007_audit_review.sql"),
+    include_str!("0008_performance.sql"),
 ];
 
 /// Applies every migration past the db's `user_version`, each in its own
