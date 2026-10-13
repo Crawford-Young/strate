@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   STORE_CHANGED,
+  auditPerformance,
   auditRefresh,
   auditRollup,
   auditTimeline,
@@ -17,6 +18,7 @@ import {
   type AuditFilter,
   type AuditPath,
   type LiveGraph,
+  type Performance,
   type TimelineDay,
 } from './api'
 
@@ -141,6 +143,124 @@ describe('commands', () => {
     invokeMock.mockResolvedValueOnce(days)
     await expect(auditTimeline(filter, path)).resolves.toEqual(days)
     expect(invokeMock).toHaveBeenCalledWith('audit_timeline', { filter, path })
+  })
+
+  it('audit_performance passes the filter and returns the four sections', async () => {
+    const filter: AuditFilter = {
+      from: '2026-10-06',
+      to: '2026-10-13',
+      repos: ['perf'],
+      groupBy: 'hierarchy',
+    }
+    const tokens = { input: 2000, output: 200, cacheRead: 20000, cacheWrite: 0 }
+    const performance: Performance = {
+      outcome: {
+        weeks: [
+          {
+            week: '2026-10-05',
+            days: 6,
+            issuesClosed: 1,
+            usdPerClosedIssue: 0.05,
+            activeMsPerClosedIssue: 900000,
+            prsMerged: 1,
+            usdPerMergedPr: 0.05,
+            spendUsd: 0.04,
+          },
+          {
+            week: '2026-10-12',
+            days: 2,
+            issuesClosed: 0,
+            usdPerClosedIssue: null,
+            activeMsPerClosedIssue: null,
+            prsMerged: 0,
+            usdPerMergedPr: null,
+            spendUsd: 0.02,
+          },
+        ],
+        unlinkedUsd: 0,
+        unlinkedWorkstreams: 0,
+        openUsd: 0.02,
+        openIssues: 1,
+      },
+      agents: [
+        {
+          agentType: 'orchestrator',
+          model: 'claude-opus-5-5',
+          orchestrator: true,
+          dispatches: 0,
+          completed: 0,
+          blocked: 0,
+          failed: 0,
+          noReport: 0,
+          running: 0,
+          followups: 0,
+          costUsd: 0.016,
+          usdPerDispatch: null,
+          tokens,
+          cacheHitPct: 90.9,
+        },
+        {
+          agentType: 'implementer',
+          model: 'claude-sonnet-5-5',
+          orchestrator: false,
+          dispatches: 8,
+          completed: 2,
+          blocked: 1,
+          failed: 2,
+          noReport: 2,
+          running: 1,
+          followups: 3,
+          costUsd: 0.028,
+          usdPerDispatch: 0.0035,
+          tokens,
+          cacheHitPct: 90.9,
+        },
+      ],
+      bottleneck: {
+        days: [
+          {
+            day: '2026-10-06',
+            repo: 'perf',
+            askMs: 60000,
+            promptWaitMs: 60000,
+            blockedMs: 535000,
+            activeMs: 120000,
+            blockedReports: 1,
+          },
+          {
+            day: '2026-10-13',
+            repo: null,
+            askMs: 0,
+            promptWaitMs: 0,
+            blockedMs: 0,
+            activeMs: 60000,
+            blockedReports: 0,
+          },
+        ],
+        permissionWaits: 'not_recorded',
+      },
+      waste: {
+        followups: 3,
+        sendMessages: 4,
+        blocked: 1,
+        dispatches: 8,
+        noReport: 2,
+        noReportTop: { agentType: 'implementer', model: 'claude-sonnet-5-5', count: 2 },
+        compactions: 1,
+        clears: 1,
+        contextPeaksOver80: 1,
+        deepestPeak: { pct: 85, model: 'claude-sonnet-5-5' },
+        apiRetries: 1,
+        apiErrors: 2,
+        promptTooLong: 1,
+        reopenedIssues: 1,
+        revertedPrs: 1,
+        repos: 1,
+      },
+    }
+    invokeMock.mockResolvedValueOnce(performance)
+    await expect(auditPerformance(filter)).resolves.toEqual(performance)
+    expect(invokeMock).toHaveBeenCalledWith('audit_performance', { filter })
   })
 
   it('audit_refresh asks for a GitHub refresh and resolves with nothing', async () => {

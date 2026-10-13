@@ -25,6 +25,7 @@ pub fn run() {
             commands::live_graph,
             commands::audit_rollup,
             commands::audit_timeline,
+            commands::audit_performance,
             commands::audit_refresh,
             commands::write_export,
         ])

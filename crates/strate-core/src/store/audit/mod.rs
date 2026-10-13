@@ -1,5 +1,5 @@
-//! The Audit rollups (#26): a tree over `audit_cells`, plus a headline, read
-//! on a reader connection.
+//! The Audit rollups (#26): a tree over `audit_cells`, plus a headline and
+//! the performance read, on a reader connection.
 //!
 //! Levels: Repo > Epic > Issue > PR > Session > Agent. A Session node is one
 //! `/rename` window. Its name (`<repo>-<issue>[-sN]`) places it under its
@@ -26,11 +26,13 @@
 //! Modules: `gh` reads the GitHub cache, `cells` the cells in a filter and
 //! the windows and subagents they belong to, `tree` builds each cell's path
 //! and the rollup tree over them, `headline` the closed-issue and merged-PR
-//! figures, and `timeline` one node's per-day spans and marks.
+//! figures, `timeline` one node's per-day spans and marks, and
+//! `performance` the outcome, agent, bottleneck and waste measures (#51).
 
 mod cells;
 mod gh;
 mod headline;
+mod performance;
 mod timeline;
 mod tree;
 
@@ -40,6 +42,10 @@ use serde::{Deserialize, Serialize};
 use super::Result;
 use cells::Cells;
 use gh::Gh;
+pub use performance::{
+    AgentRow, Bottleneck, BottleneckDay, LaneCount, Outcome, OutcomeWeek, Peak, Performance,
+    PermissionWaits, Waste, performance,
+};
 pub use timeline::{SpanKind, TimelineDay, TimelineMark, TimelineSpan, audit_timeline};
 
 /// How the tree's top level groups the cells.

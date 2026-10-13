@@ -26,6 +26,8 @@ pub(crate) struct GhIssue {
     pub(crate) completed: bool,
     pub(crate) parent: Option<i64>,
     pub(crate) progress: Option<Progress>,
+    /// Times reopened; `None` until a refresh since v8 fetched it.
+    pub(crate) reopened: Option<i64>,
 }
 
 pub(crate) struct GhPr {
@@ -44,7 +46,7 @@ impl Gh {
         let mut epics: HashSet<(String, i64)> = HashSet::new();
         let mut stmt = conn.prepare_cached(
             "SELECT repo, number, title, state, closed_at, parent, sub_total, sub_completed,
-                 state_reason
+                 state_reason, reopened
              FROM gh_issues",
         )?;
         let mut rows = stmt.query([])?;
@@ -71,6 +73,7 @@ impl Gh {
                         == Some("COMPLETED"),
                     parent,
                     progress: (total > 0).then_some(Progress { completed, total }),
+                    reopened: r.get("reopened")?,
                 },
             );
         }

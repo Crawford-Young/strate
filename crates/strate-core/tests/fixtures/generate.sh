@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ for #26). Field names come from
+# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ for #26, perf-home/ for #51). Field names come from
 # the "~/.claude format, as observed" comment on strate #10; every value is a placeholder.
 set -eu
 cd "$(dirname "$0")/.."
@@ -411,3 +411,35 @@ gfile() { echo "$GD/$G1/subagents/agent-$1.jsonl"; }
 { gsub $B6 32; areply $T:01:00 b6-2 req_q9 $SONNET "$US" '{"type":"text","text":"NEEDS_CONTEXT: lorem."}'; } > "$(gfile $B6)"
 for n in 1 3 4 5 6; do ameta implementer toolu_p$n > "$GD/$G1/subagents/agent-a600000000000000$n.meta.json"; done
 echo '{"agentType":"implementer","description":"Lorem task","toolUseId":"toolu_p2","spawnDepth":1,"requestShape":"agent","requestNonInteractive":true,"model":"claude-sonnet-5-5","name":"perf-helper"}' > "$GD/$G1/subagents/agent-$B2.meta.json"
+# The performance read (#51; gh JSON: github/perf-home.json, issue #1 closed
+# 2026-10-06T12:00Z with PR #2, reopened once; #3 open; PR #4 reverts #2).
+# G2, window perf-1 on 2026-10-05: issue #1's earlier work, outside a range
+# from 10-06 but inside its whole-life cost. G3, window perf-3 on 2026-10-13
+# (w/c 10-12): b7 never notified and last heard 09:01 (no report), b8 last
+# heard 10:05 with an 850k-token request (85%), within 30 min of the store's
+# newest record (G4's 10:31), so running; one API retry. G4, never named
+# (Unlinked), is G3's /clear successor (one process root).
+G2=5e55e1e1-0000-4000-8000-0000000000e2
+G3=5e55e1e1-0000-4000-8000-0000000000e3
+G4=5e55e1e1-0000-4000-8000-0000000000e4
+B7=a6000000000000007; B8=a6000000000000008
+mkdir -p "$GD/$G3/subagents"
+aat $G2 /work/perf '"isSidechain":false'
+{ atitle perf-1; aprompt 2026-10-05T09:00:00 j-01; areply 2026-10-05T09:00:30 j-02 req_t1 $OPUS "$UO" "$TEXT"; } > "$GD/$G2.jsonl"
+U=2026-10-13T09
+aat $G3 /work/perf "\"isSidechain\":false,\"session_id\":\"$G3\""
+{ atitle perf-3
+  aprompt $U:00:00 h-01
+  gdispatch $U:00:05 h-02 req_r1 toolu_r7; aresult $U:00:06 h-03 toolu_r7
+  aenv $U:30:00 h-04; echo "{$AE,\"type\":\"system\",\"subtype\":\"api_error\",\"level\":\"error\",\"error\":{\"status\":529},\"retryInMs\":500,\"retryAttempt\":1,\"maxRetries\":10}"
+  gdispatch $U:59:00 h-05 req_r2 toolu_r8; aresult $U:59:01 h-06 toolu_r8
+  areply 2026-10-13T10:20:00 h-07 req_r3 $OPUS "$UO" "$TEXT"
+} > "$GD/$G3.jsonl"
+aat $G3 /work/perf "\"isSidechain\":true,\"agentId\":\"$B7\""
+{ atask $U:00:07 b7-1; areply $U:01:00 b7-2 req_r4 $SONNET "$US" "$TEXT"; } > "$GD/$G3/subagents/agent-$B7.jsonl"
+aat $G3 /work/perf "\"isSidechain\":true,\"agentId\":\"$B8\""
+{ atask $U:59:02 b8-1; areply 2026-10-13T10:05:00 b8-2 req_r5 $SONNET "$(ku 1000 0 849000 50)" "$TEXT"; } > "$GD/$G3/subagents/agent-$B8.jsonl"
+ameta implementer toolu_r7 > "$GD/$G3/subagents/agent-$B7.meta.json"
+ameta implementer toolu_r8 > "$GD/$G3/subagents/agent-$B8.meta.json"
+aat $G4 /work/perf "\"isSidechain\":false,\"session_id\":\"$G3\""
+{ aprompt 2026-10-13T10:30:00 i-01; areply 2026-10-13T10:31:00 i-02 req_s1 $OPUS "$UO" "$TEXT"; } > "$GD/$G4.jsonl"

@@ -57,6 +57,8 @@ pub(crate) struct Share {
 pub(crate) struct Time {
     pub(crate) active_ms: i64,
     pub(crate) wait_ms: i64,
+    /// Of `wait_ms`, on questions to you rather than the next prompt.
+    pub(crate) ask_ms: i64,
 }
 
 /// One `audit_cells` row, read by column name.
@@ -86,6 +88,7 @@ impl CellRow {
             own: Time {
                 active_ms: r.get("active_ms")?,
                 wait_ms: r.get("wait_ms")?,
+                ask_ms: r.get("ask_ms")?,
             },
             cost_usd: r.get("cost_usd")?,
             unpriced: r.get("unpriced")?,
@@ -120,7 +123,7 @@ impl Cells {
         // no range: `day BETWEEN` is never true for NULL.
         let mut stmt = conn.prepare_cached(
             "SELECT session_id, agent_id, segment_id, day, model, wall_ms, active_ms, wait_ms,
-                 cost_usd, unpriced, input_tokens, output_tokens, cache_read_tokens,
+                 ask_ms, cost_usd, unpriced, input_tokens, output_tokens, cache_read_tokens,
                  cache_write_tokens
              FROM audit_cells WHERE day BETWEEN ?1 AND ?2
                  AND NOT (active_ms = 0 AND wait_ms = 0 AND cost_usd IS NULL AND unpriced = 0
@@ -189,7 +192,7 @@ impl Cells {
 }
 
 /// `s` when it is a `YYYY-MM-DD` day.
-fn day(s: &str) -> Result<&str> {
+pub(crate) fn day(s: &str) -> Result<&str> {
     match s.parse::<jiff::civil::Date>() {
         Ok(d) if d.to_string() == s => Ok(s),
         _ => Err(rusqlite::Error::ToSqlConversionFailure(
@@ -213,7 +216,7 @@ pub(crate) struct Window {
     pub(crate) key: String,
     pub(crate) label: String,
     /// The repo its name parses to, linked or not.
-    repo: Option<String>,
+    pub(crate) repo: Option<String>,
     /// Named `-sN`, any N: a rotation is a `-sN` window, not "windows - 1".
     rotation: bool,
     pub(crate) place: Place,
