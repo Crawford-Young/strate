@@ -184,9 +184,9 @@ fn record(
             "INSERT OR IGNORE INTO events (session_id, agent_id, type, subtype, uuid, parent_uuid,
                  request_id, timestamp, file, byte_offset, raw, cwd, git_branch, custom_title,
                  request_key, model, usage, output_tokens, cost_usd, tool_uses, tool_results,
-                 prompt)
+                 prompt, notification_task, notification_status, message_to, api_error)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                 ?18, ?19, ?20, ?21, ?22)",
+                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
         )?
         .execute(params![
             owner.session_id,
@@ -211,6 +211,10 @@ fn record(
             acct.tool_uses,
             acct.tool_results,
             acct.prompt,
+            acct.notification_task,
+            acct.notification_status,
+            acct.message_to,
+            acct.api_error,
         ])? > 0;
     if !inserted {
         return Ok(None);
