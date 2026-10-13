@@ -228,9 +228,13 @@ export const auditRollup = (filter: AuditFilter) => invoke<Audit>('audit_rollup'
 export const auditTimeline = (filter: AuditFilter, path: AuditPath) =>
   invoke<TimelineDay[]>('audit_timeline', { filter, path })
 
-/** Writes `text` to exactly `path` (one the user picked in the save dialog); rejects with the I/O message. */
-export const writeExport = (path: string, text: string): Promise<void> =>
-  invoke('write_export', { path, text })
+/**
+ * The Audit CSV export: the app asks where to save it in a native dialog, offering
+ * `suggestedName`, and writes `text` there. The webview never names a path. False when the
+ * user cancels; rejects with the I/O message.
+ */
+export const writeExport = (text: string, suggestedName: string) =>
+  invoke<boolean>('write_export', { text, suggestedName })
 
 /**
  * Asks the engine to refresh the GitHub cache and resolves at once; refetch

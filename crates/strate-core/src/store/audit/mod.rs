@@ -22,7 +22,6 @@
 //! its agents run in parallel. Elapsed and epic progress are per level.
 //! Cells with no activity, requests or subagent run (a window sitting open
 //! overnight) are left out, so they put no node on a day.
-
 //!
 //! Modules: `gh` reads the GitHub cache, `cells` the cells in a filter and
 //! the windows and subagents they belong to, `tree` builds each cell's path

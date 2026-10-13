@@ -2,7 +2,7 @@
 // stays last under any sort, and a row's name selects it (by path) for the row detail (#27 U2).
 import { Badge, DataTable } from '@crawfordyoung/ui'
 import type { ColumnDef, Row } from '@tanstack/react-table'
-import type { ReactNode } from 'react'
+import { memo, useMemo, type ReactNode } from 'react'
 import type { AuditNode, AuditPath, Metrics } from './api'
 import { compact } from './audit'
 import { duration, money } from './format'
@@ -16,11 +16,12 @@ const pathOf = (row: Row<AuditNode>): AuditPath =>
 const samePath = (a: AuditPath | null, b: AuditPath) => JSON.stringify(a) === JSON.stringify(b)
 
 /**
- * A row id is its node path, so expanded rows stay put when a refresh inserts or reorders
- * siblings, and an id from another grouping simply matches nothing.
+ * A row id is its node path as JSON, so expanded rows stay put when a refresh inserts or
+ * reorders siblings, an id from another grouping simply matches nothing, and no key can read
+ * as two steps (a slug may hold `/` or `:`).
  */
-const rowId = (n: AuditNode, _index: number, parent?: Row<AuditNode>) =>
-  `${parent ? `${parent.id}/` : ''}${n.kind}:${n.key}`
+const rowId = (n: AuditNode, _index: number, parent?: Row<AuditNode>): string =>
+  JSON.stringify([...(parent ? (JSON.parse(parent.id) as AuditPath) : []), [n.kind, n.key]])
 
 const tokenTotal = ({ tokens: t }: Metrics) => t.input + t.output + t.cacheRead + t.cacheWrite
 
@@ -51,10 +52,38 @@ interface AuditTableProps {
   nodes: AuditNode[]
   selected: AuditPath | null
   onSelect: (path: AuditPath, label: string) => void
+  /** Rows can't be picked: the tree on screen is an older filter's, being replaced. */
+  disabled?: boolean
 }
 
-export function AuditTable({ nodes, selected, onSelect }: AuditTableProps) {
-  const columns: ColumnDef<AuditNode>[] = [
+/** Memoized: Audit rerenders on every store change, which leaves these props alone. */
+export const AuditTable = memo(function AuditTable({
+  nodes,
+  selected,
+  onSelect,
+  disabled = false,
+}: AuditTableProps) {
+  const columns = useMemo(
+    () => columnsFor(selected, onSelect, disabled),
+    [selected, onSelect, disabled],
+  )
+  return (
+    <DataTable
+      columns={columns}
+      data={nodes}
+      getSubRows={(n) => (n.children.length ? n.children : undefined)}
+      getRowId={rowId}
+      getRowLabel={(n) => `${n.kind} ${n.label}`}
+    />
+  )
+})
+
+function columnsFor(
+  selected: AuditPath | null,
+  onSelect: AuditTableProps['onSelect'],
+  disabled: boolean,
+): ColumnDef<AuditNode>[] {
+  return [
     {
       id: 'Name',
       header: 'Name',
@@ -68,6 +97,8 @@ export function AuditTable({ nodes, selected, onSelect }: AuditTableProps) {
             <button
               type="button"
               aria-pressed={samePath(selected, path)}
+              data-path={JSON.stringify(path)}
+              disabled={disabled}
               onClick={() => onSelect(path, node.label)}
               className="rounded text-left hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-ring aria-pressed:font-semibold aria-pressed:text-accent"
             >
@@ -117,13 +148,4 @@ export function AuditTable({ nodes, selected, onSelect }: AuditTableProps) {
       (m) => (m.progress ? `${m.progress.completed}/${m.progress.total}` : '—'),
     ),
   ]
-  return (
-    <DataTable
-      columns={columns}
-      data={nodes}
-      getSubRows={(n) => (n.children.length ? n.children : undefined)}
-      getRowId={rowId}
-      getRowLabel={(n) => `${n.kind} ${n.label}`}
-    />
-  )
 }

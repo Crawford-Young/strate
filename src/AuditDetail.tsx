@@ -3,13 +3,16 @@
 import { Alert, AlertDescription, Button, DayTimeline, EmptyState } from '@crawfordyoung/ui'
 import { X } from 'lucide-react'
 import type { AuditFilter, AuditPath } from './api'
-import { parseDay } from './audit'
+import { shortDay } from './audit'
 import { useTimeline } from './useTimeline'
 
-const dayLabel = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' })
-
-// The timeline's agent spans are non-idle subagent time, not the table column's wall time.
-const KIND_LABELS = { active: 'Active', wait: 'Waiting on you', agent: 'Agent (non-idle)' }
+// Legend order, which also sets each kind's colour. The agent spans are non-idle subagent time,
+// not the table column's wall time, and run in the sub lane under the orchestrator's.
+const KINDS = [
+  { key: 'active', label: 'Active' },
+  { key: 'wait', label: 'Waiting on you' },
+  { key: 'agent', label: 'Agent (non-idle)', lane: 'sub' },
+] as const
 
 interface AuditDetailProps {
   filter: AuditFilter
@@ -60,8 +63,8 @@ export function AuditDetail({
         ) : (
           <DayTimeline
             days={days}
-            dayFormat={(day) => dayLabel.format(parseDay(day))}
-            kindLabels={KIND_LABELS}
+            dayFormat={shortDay}
+            kinds={KINDS}
             emptyMessage="No activity in this range."
           />
         )}

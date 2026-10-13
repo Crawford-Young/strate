@@ -14,8 +14,11 @@ import type { ReactNode } from 'react'
 import type { GroupBy } from './api'
 import { localDay, parseDay, type Measure } from './audit'
 
-export const PRESETS = ['7d', '14d', '30d'] as const
-export type Range = (typeof PRESETS)[number] | 'custom'
+/** The range presets, each the last that many local days. */
+export const PRESET_DAYS = { '7d': 7, '14d': 14, '30d': 30 } as const
+type Preset = keyof typeof PRESET_DAYS
+const PRESETS = Object.keys(PRESET_DAYS) as Preset[]
+export type Range = Preset | 'custom'
 
 export interface Controls {
   range: Range

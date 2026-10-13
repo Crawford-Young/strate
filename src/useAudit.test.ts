@@ -42,7 +42,7 @@ function setup(filter: AuditFilter, active: boolean) {
   })
   const rerender = (next: Partial<Props>) => hook.rerender((props = { ...props, ...next }))
   const storeChanged = () => rerender({ version: props.version + 1 })
-  return { result: hook.result, rerender, storeChanged }
+  return { result: hook.result, unmount: hook.unmount, rerender, storeChanged }
 }
 
 describe('useAudit', () => {
@@ -131,6 +131,83 @@ describe('useAudit', () => {
     await settle()
     expect(rollupMock).toHaveBeenCalledTimes(2)
     expect(shown(result)).toBe('hierarchy#2')
+  })
+
+  it('keeps a newer rollup when an older read of the same filter lands after it', async () => {
+    let landOld!: () => void
+    rollupMock.mockImplementationOnce(
+      () => new Promise((r) => (landOld = () => r(audit([node('repo', 'old')])))),
+    )
+    const { result, rerender, storeChanged } = setup(week, true)
+    await settle()
+    // Away to another filter while the first read hangs, a store change, then back: a new read.
+    rerender({ filter: byDay })
+    await settle()
+    act(() => storeChanged())
+    await act(() => vi.advanceTimersByTimeAsync(1_000))
+    rerender({ filter: week })
+    await settle()
+    expect(shown(result)).toBe('hierarchy#4')
+    await act(async () => landOld())
+    expect(shown(result)).toBe('hierarchy#4')
+    expect(result.current.pending).toBe(false)
+    await settle()
+    expect(rollupMock).toHaveBeenCalledTimes(4)
+  })
+
+  it('caches the 8 filters read most recently, rereading one dropped from it', async () => {
+    const day = (d: number): AuditFilter => ({ ...week, from: `2026-10-0${d}` })
+    const { rerender } = setup(day(1), true)
+    await settle()
+    for (let d = 2; d <= 9; d++) {
+      rerender({ filter: day(d) })
+      await settle()
+    }
+    expect(rollupMock).toHaveBeenCalledTimes(9)
+    rerender({ filter: day(2) })
+    await settle()
+    expect(rollupMock).toHaveBeenCalledTimes(9)
+    rerender({ filter: day(1) })
+    await settle()
+    expect(rollupMock).toHaveBeenCalledTimes(10)
+  })
+
+  describe('a reread queued behind a slow read', () => {
+    /** A read in flight, with a store change queued behind it. */
+    async function queued() {
+      let land!: () => void
+      rollupMock.mockImplementationOnce(
+        (f) => new Promise((r) => (land = () => r(audit([node('repo', f.groupBy)])))),
+      )
+      const hook = setup(week, true)
+      await settle()
+      act(() => hook.storeChanged())
+      await act(() => vi.advanceTimersByTimeAsync(1_000))
+      return { ...hook, land: () => act(async () => land()) }
+    }
+
+    it('runs once the read lands while still active', async () => {
+      const { land } = await queued()
+      await land()
+      await settle()
+      expect(rollupMock).toHaveBeenCalledTimes(2)
+    })
+
+    it('is dropped when the view goes inactive first', async () => {
+      const { rerender, land } = await queued()
+      rerender({ active: false })
+      await land()
+      await settle()
+      expect(rollupMock).toHaveBeenCalledTimes(1)
+    })
+
+    it('is dropped when the view unmounts first', async () => {
+      const { unmount, land } = await queued()
+      unmount()
+      await land()
+      await settle()
+      expect(rollupMock).toHaveBeenCalledTimes(1)
+    })
   })
 
   it('reports a failed read for its own filter only', async () => {
