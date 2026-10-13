@@ -189,6 +189,17 @@ fn invariants(db: &Connection) {
         [],
     );
     assert!(!sessions.is_empty(), "nothing stored");
+    let asks_past_wait: i64 = db
+        .query_row(
+            "SELECT count(*) FROM audit_cells WHERE ask_ms < 0 OR ask_ms > wait_ms",
+            [],
+            |r| r.get(0),
+        )
+        .expect("ask_ms");
+    assert_eq!(
+        asks_past_wait, 0,
+        "a cell's questions are part of its waiting"
+    );
     for session in sessions {
         let sid = session.id.expect("session id");
         let (cost, unpriced) = (session.cost_usd, session.unpriced);
