@@ -75,3 +75,41 @@ fn the_value_type_compares() {
     };
     assert_eq!(parse_name("a-1"), Some(p));
 }
+
+// claude-config's typed names (scripts/lib.mjs, TYPED_RE): `ticket-` and
+// `epic-` name a repo and issue; `director-` and `general-` are Unlinked.
+
+#[test]
+fn a_ticket_or_epic_name_is_its_repo_and_issue() {
+    assert_eq!(parsed("ticket-lorem-51"), ("lorem".into(), 51, None));
+    assert_eq!(parsed("epic-dolor-sit-7"), ("dolor-sit".into(), 7, None));
+    assert_eq!(parsed("Ticket-lorem-51"), ("lorem".into(), 51, None));
+}
+
+#[test]
+fn a_typed_name_keeps_its_rotation_and_agent_suffixes() {
+    assert_eq!(parsed("ticket-lorem-51-s2"), ("lorem".into(), 51, Some(2)));
+    assert_eq!(
+        parsed("ticket-lorem-51-impl-parser-2"),
+        ("lorem".into(), 51, None)
+    );
+}
+
+#[test]
+fn director_and_general_names_are_unlinked_even_with_digits() {
+    for name in [
+        "director-lorem",
+        "director-wave-3",
+        "general-fix-5-things",
+        "General-lorem-12",
+    ] {
+        assert_eq!(parse_name(name), None, "{name:?}");
+    }
+}
+
+#[test]
+fn a_typed_prefix_with_no_repo_left_is_an_untyped_name() {
+    // Like lib.mjs's legacy form: `ticket-51` is repo `ticket`, issue 51.
+    assert_eq!(parsed("ticket-51"), ("ticket".into(), 51, None));
+    assert_eq!(parsed("epic-9-s1"), ("epic".into(), 9, Some(1)));
+}

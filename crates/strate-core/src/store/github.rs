@@ -237,17 +237,17 @@ mod tests {
                  INSERT INTO workstreams (id, name, fallback) VALUES
                      (1, 'demo-9', 0), (2, 'demo-9-s2', 0), (3, 'other-lab-3', 0),
                      (4, 'plain', 0), (5, 'cwd-5', 1), (6, 'merged-4', 0),
-                     (7, 'unused-8', 0);
+                     (7, 'unused-8', 0), (8, 'ticket-typed-4', 0), (9, 'director-wave-3', 0);
                  UPDATE workstreams SET merged_into = 3 WHERE id = 6;
                  INSERT INTO segments (session_id, start_offset, workstream_id) VALUES
                      ('s1', 0, 1), ('s1', 10, 2), ('s1', 20, 3), ('s1', 30, 4),
-                     ('s1', 40, 5), ('s1', 50, 6);",
+                     ('s1', 40, 5), ('s1', 50, 6), ('s1', 60, 8), ('s1', 70, 9);",
             )
             .expect("rows");
         assert_eq!(
             store.window_slugs().expect("slugs"),
-            ["demo", "other-lab"],
-            "a fallback name, an unparsed name and a workstream with no window add none; a merge reads as its root"
+            ["demo", "other-lab", "typed"],
+            "a fallback name, an unparsed or director name and a workstream with no window add none; a merge reads as its root; a ticket name adds its repo"
         );
         drop(store);
         std::fs::remove_dir_all(dir).expect("cleanup");
