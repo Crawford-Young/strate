@@ -1,8 +1,9 @@
-// The top bar: the app name, one tab per live orchestrator, and the panel toggles on the right.
+// The top bar: the app name, one tab per live orchestrator, then the panel toggles and the Audit
+// button on the right.
 // Must render inside a `Tabs` (the strip is a TabsList).
-import { TabsList, Toggle } from '@crawfordyoung/ui'
-import { SlidersVertical, Terminal } from 'lucide-react'
-import { useEffect, useRef, type ReactNode } from 'react'
+import { Button, TabsList, Toggle } from '@crawfordyoung/ui'
+import { ChartColumnStacked, SlidersVertical, Terminal } from 'lucide-react'
+import { useEffect, useRef, type ReactNode, type RefObject } from 'react'
 import type { Workstream } from './api'
 import { OrchestratorTab } from './OrchestratorTab'
 import type { LayoutPrefs } from './layout'
@@ -15,9 +16,19 @@ interface HeaderProps {
   activeKey: string | null
   prefs: LayoutPrefs
   onTogglePanel: (id: TogglePanel) => void
+  /** Focus returns here when the Audit view closes. */
+  auditButtonRef: RefObject<HTMLButtonElement | null>
+  onOpenAudit: () => void
 }
 
-export function Header({ liveSessions, activeKey, prefs, onTogglePanel }: HeaderProps) {
+export function Header({
+  liveSessions,
+  activeKey,
+  prefs,
+  onTogglePanel,
+  auditButtonRef,
+  onOpenAudit,
+}: HeaderProps) {
   const stripRef = useRef<HTMLDivElement>(null)
   // Keep the selected tab visible in the (scrollbar-less) strip.
   useEffect(() => {
@@ -61,6 +72,16 @@ export function Header({ liveSessions, activeKey, prefs, onTogglePanel }: Header
       <div className="flex items-center gap-1.5">
         {panelToggle('harness', 'Harness', <SlidersVertical aria-hidden className="size-3.5" />)}
         {panelToggle('terminal', 'Terminal', <Terminal aria-hidden className="size-3.5" />)}
+        <Button
+          ref={auditButtonRef}
+          variant="outline"
+          size="sm"
+          onClick={onOpenAudit}
+          className="gap-1.5"
+        >
+          <ChartColumnStacked aria-hidden className="size-3.5" />
+          Audit
+        </Button>
       </div>
     </header>
   )
