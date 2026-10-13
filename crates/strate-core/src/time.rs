@@ -302,6 +302,10 @@ fn sweep(intervals: &[Span], last: i64, starts: &[i64]) -> Vec<Span> {
     let mut runs: Vec<Span> = Vec::new();
     for pair in points.windows(2) {
         if let Some((cat, delta)) = pair[0].1 {
+            // An interval is never `Other` (that is what no interval covers),
+            // and `PRIORITY` lists the rest in declaration order, so a
+            // category's discriminant is its index in `live`.
+            debug_assert!(cat != Cat::Other && PRIORITY[cat as usize] == cat);
             live[cat as usize] += delta;
         }
         let (from, to) = (pair[0].0, pair[1].0);

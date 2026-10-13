@@ -1010,6 +1010,32 @@ fn a_window_across_local_midnight_draws_on_both_days() {
 }
 
 #[test]
+fn a_day_rows_timeline_keeps_to_its_own_day() {
+    let t = Temp::new("timeline-day-group");
+    let db = build(&t);
+    let oct = filter("2026-10-01", "2026-10-31", &[], GroupBy::Day);
+    // demo-9 works on Oct 4 and 5 (local); its PR merges and the issue closes
+    // on Oct 5. The Oct 4 row holds neither, and draws nothing on Oct 5.
+    let oct4 =
+        audit_timeline(&db, &oct, &steps(&[(NodeKind::Group, "2026-10-04")])).expect("timeline");
+    assert!(!oct4.is_empty());
+    assert!(oct4.iter().all(|d| d.day == "2026-10-04"), "{oct4:?}");
+    assert!(oct4.iter().all(|d| d.marks.is_empty()), "{oct4:?}");
+    // The Oct 5 row keeps both marks.
+    let oct5 =
+        audit_timeline(&db, &oct, &steps(&[(NodeKind::Group, "2026-10-05")])).expect("timeline");
+    let marks: Vec<_> = oct5.iter().flat_map(|d| d.marks.clone()).collect();
+    assert_eq!(
+        marks,
+        [
+            mark(7 * 3600 * S, "PR #12 merged"),
+            mark(8 * 3600 * S, "#9 closed"),
+        ]
+    );
+    assert!(oct5.iter().all(|d| d.day == "2026-10-05"), "{oct5:?}");
+}
+
+#[test]
 fn an_unknown_path_has_no_timeline_and_a_bad_day_is_an_error() {
     let t = Temp::new("timeline-unknown");
     let db = build(&t);

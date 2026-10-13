@@ -11,7 +11,8 @@ use strate_core::store::views::{
     self, Audit, AuditFilter, LiveGraph, NeedsYou, NodeKind, TimelineDay, Workstream,
     WorkstreamCost,
 };
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_dialog::DialogExt;
 
 use crate::engine::{Progress, Refresher, Status};
 
@@ -107,11 +108,27 @@ pub fn audit_refresh(refresher: State<'_, Refresher>) {
     refresher.request();
 }
 
-/// Writes `text` to exactly `path`, which the user picked in the save
-/// dialog: the Audit CSV export. Replaces the file; the error is the I/O
-/// message.
+/// The Audit CSV export: asks where to save it in a native save dialog
+/// (offering `suggested_name`), then writes `text` there, replacing the
+/// file. False when the user cancels. The webview never names a path: it
+/// only ever reaches the file the user picked. The error is the I/O message.
 #[tauri::command(async)]
-pub fn write_export(path: String, text: String) -> Result<(), String> {
+pub fn write_export(app: AppHandle, text: String, suggested_name: String) -> Result<bool, String> {
+    let Some(picked) = app
+        .dialog()
+        .file()
+        .add_filter("CSV", &["csv"])
+        .set_file_name(suggested_name)
+        .blocking_save_file()
+    else {
+        return Ok(false);
+    };
+    write_to(&picked.into_path().map_err(|e| e.to_string())?, &text)?;
+    Ok(true)
+}
+
+/// Writes `text` to exactly `path`, replacing it.
+fn write_to(path: &Path, text: &str) -> Result<(), String> {
     std::fs::write(path, text).map_err(|e| e.to_string())
 }
 
@@ -159,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn write_export_writes_exactly_the_given_path_and_reports_failures() {
+    fn write_to_writes_exactly_the_given_path_and_reports_failures() {
         let dir = std::env::temp_dir().join(format!("strate-export-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
@@ -168,17 +185,16 @@ mod tests {
 \"x, y\",2
 ";
 
-        write_export(file.to_str().expect("utf-8").into(), text.into()).expect("written");
+        write_to(&file, text).expect("written");
         assert_eq!(std::fs::read_to_string(&file).expect("read"), text);
         let names: Vec<_> = std::fs::read_dir(&dir).expect("ls").collect();
         assert_eq!(names.len(), 1, "nothing but the given path");
 
-        write_export(file.to_str().expect("utf-8").into(), "new".into()).expect("replaced");
+        write_to(&file, "new").expect("replaced");
         assert_eq!(std::fs::read_to_string(&file).expect("read"), "new");
 
         let missing = dir.join("no-such-dir").join("audit.csv");
-        let err = write_export(missing.to_str().expect("utf-8").into(), text.into())
-            .expect_err("a missing folder is an error");
+        let err = write_to(&missing, text).expect_err("a missing folder is an error");
         assert!(!err.is_empty());
         std::fs::remove_dir_all(dir).expect("cleanup");
     }

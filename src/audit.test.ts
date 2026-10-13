@@ -1,6 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import { audit, node } from '../tests/audit-fixtures'
-import { compact, dailyChart, dayRange, hoursLabel, lastDays, localDay, repoOptions } from './audit'
+import {
+  compact,
+  dailyChart,
+  dayRange,
+  hasPath,
+  hoursLabel,
+  lastDays,
+  localDay,
+  repoOptions,
+  shortDay,
+} from './audit'
 
 const HOUR = 3_600_000
 
@@ -16,6 +26,13 @@ describe('local days', () => {
     expect(lastDays(1, new Date(2026, 9, 13))).toEqual({ from: '2026-10-13', to: '2026-10-13' })
   })
 
+  it('labels a day by its local date', () => {
+    const want = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' }).format(
+      new Date(2026, 9, 5),
+    )
+    expect(shortDay('2026-10-05')).toBe(want)
+  })
+
   it('lists every day from..=to, across a month end', () => {
     expect(dayRange('2026-09-29', '2026-10-02')).toEqual([
       '2026-09-29',
@@ -24,6 +41,34 @@ describe('local days', () => {
       '2026-10-02',
     ])
     expect(dayRange('2026-10-02', '2026-10-02')).toEqual(['2026-10-02'])
+  })
+})
+
+describe('node paths', () => {
+  const tree = audit([
+    node('repo', 'acme/web', {}, [node('issue', '11')]),
+    node('repo', 'acme/api'),
+  ])
+
+  it('finds a path step by step from the root', () => {
+    expect(hasPath(tree.root, [['repo', 'acme/web']])).toBe(true)
+    expect(
+      hasPath(tree.root, [
+        ['repo', 'acme/web'],
+        ['issue', '11'],
+      ]),
+    ).toBe(true)
+  })
+
+  it('misses a path when any step is gone, or matches on kind or key alone', () => {
+    expect(
+      hasPath(tree.root, [
+        ['repo', 'acme/api'],
+        ['issue', '11'],
+      ]),
+    ).toBe(false)
+    expect(hasPath(tree.root, [['epic', 'acme/web']])).toBe(false)
+    expect(hasPath(tree.root, [['repo', 'acme/x']])).toBe(false)
   })
 })
 

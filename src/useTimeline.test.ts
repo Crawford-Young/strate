@@ -17,7 +17,7 @@ const filter: AuditFilter = {
 const repo: AuditPath = [['repo', 'acme/web']]
 const issue: AuditPath = [
   ['repo', 'acme/web'],
-  ['issue', 'acme/web#11'],
+  ['issue', '11'],
 ]
 const day = (d: string): TimelineDay => ({ day: d, spans: [], marks: [] })
 

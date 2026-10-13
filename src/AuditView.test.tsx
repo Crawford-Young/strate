@@ -1,6 +1,5 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { save } from '@tauri-apps/plugin-dialog'
 import { audit, headline, node } from '../tests/audit-fixtures'
 import {
   auditRefresh,
@@ -12,6 +11,7 @@ import {
   type AuditFilter,
   type TimelineDay,
 } from './api'
+import { compact, dailyChart } from './audit'
 import { AuditView } from './AuditView'
 
 vi.mock('./api', () => ({
@@ -21,7 +21,11 @@ vi.mock('./api', () => ({
   writeExport: vi.fn(),
   onStoreChanged: vi.fn(),
 }))
-vi.mock('@tauri-apps/plugin-dialog', () => ({ save: vi.fn() }))
+// Spied, to see what a store change while hidden recomputes.
+vi.mock('./audit', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./audit')>()
+  return { ...real, dailyChart: vi.fn(real.dailyChart), compact: vi.fn(real.compact) }
+})
 // happy-dom has no layout, so the panels are the stand-in group; the panel also shows its
 // default size, which the stand-in ignores.
 vi.mock('@crawfordyoung/ui', async (importOriginal) => ({
@@ -38,7 +42,9 @@ const rollupMock = vi.mocked(auditRollup)
 const refreshMock = vi.mocked(auditRefresh)
 const timelineMock = vi.mocked(auditTimeline)
 const writeMock = vi.mocked(writeExport)
-const saveMock = vi.mocked(save)
+// Every store-changed listener; the event reaches them all.
+let listeners: (() => void)[] = []
+const storeChanged = () => act(() => listeners.forEach((listener) => listener()))
 
 const HOUR = 3_600_000
 const DAY = 24 * HOUR
@@ -54,12 +60,12 @@ const tree: Audit = audit(
       [
         node(
           'epic',
-          'acme/web#10',
+          '10',
           { costUsd: 4, progress: { completed: 1, total: 2 }, elapsedMs: 2 * DAY, open: true },
-          [node('issue', 'acme/web#11', { costUsd: 4 }, [], { label: '#11 Fix', github: true })],
+          [node('issue', '11', { costUsd: 4 }, [], { label: '#11 Fix', github: true })],
           { label: '#10 Epic', github: true },
         ),
-        node('issue', 'acme/web#13', { costUsd: 2.5 }, [], { label: '#13 Guess' }),
+        node('issue', '13', { costUsd: 2.5 }, [], { label: '#13 Guess' }),
       ],
     ),
     node('repo', 'acme/api', {
@@ -117,9 +123,12 @@ beforeEach(() => {
     .mockImplementation((f) => Promise.resolve(f.groupBy === 'day' ? byDay : tree))
   refreshMock.mockReset().mockResolvedValue()
   timelineMock.mockReset().mockResolvedValue(timelineDays)
-  writeMock.mockReset().mockResolvedValue()
-  saveMock.mockReset().mockResolvedValue(null)
-  vi.mocked(onStoreChanged).mockResolvedValue(() => {})
+  writeMock.mockReset().mockResolvedValue(true)
+  listeners = []
+  vi.mocked(onStoreChanged).mockImplementation((listener) => {
+    listeners.push(listener)
+    return Promise.resolve(() => {})
+  })
 })
 
 afterEach(() => {
@@ -133,6 +142,11 @@ async function show(props: Partial<Parameters<typeof AuditView>[0]> = {}) {
 }
 
 const region = (name: string) => screen.getByRole('region', { name })
+/** Clicks the sort button in the table's column header `name`. */
+const sortBy = (name: string) =>
+  fireEvent.click(
+    within(within(region('Breakdown')).getByRole('columnheader', { name })).getByRole('button'),
+  )
 const tableRow = (name: RegExp) => within(region('Breakdown')).getByRole('row', { name })
 const pick = (name: string) => fireEvent.click(screen.getByRole('radio', { name }))
 
@@ -162,6 +176,16 @@ const tableRows = () =>
     .map((r) => r.querySelector('[aria-pressed]')?.textContent)
 
 describe('loading', () => {
+  it('recomputes no chart or table on store changes while hidden', async () => {
+    const { rerender } = await show()
+    rerender(<AuditView hidden onBack={() => {}} />)
+    const charts = vi.mocked(dailyChart).mock.calls.length
+    const cells = vi.mocked(compact).mock.calls.length
+    for (let i = 0; i < 3; i++) storeChanged()
+    expect(vi.mocked(dailyChart).mock.calls.length).toBe(charts)
+    expect(vi.mocked(compact).mock.calls.length).toBe(cells)
+  })
+
   it('reads nothing while hidden', async () => {
     render(<AuditView hidden onBack={() => {}} />)
     await act(() => Promise.resolve())
@@ -316,11 +340,31 @@ describe('headline', () => {
     fireEvent.click(within(banner).getByRole('button', { name: 'Refresh' }))
     expect(refreshMock).toHaveBeenCalledOnce()
   })
+
+  it('turns Refresh off while it is asked for, and reports a failure', async () => {
+    rollupMock.mockImplementation((f) =>
+      Promise.resolve(
+        f.groupBy === 'day'
+          ? byDay
+          : { ...tree, githubErrors: [{ repo: 'acme/web', error: 'gh: not logged in' }] },
+      ),
+    )
+    let fail!: (e: string) => void
+    refreshMock.mockReturnValue(new Promise((_, reject) => (fail = reject)))
+    render(<AuditView hidden={false} onBack={() => {}} />)
+    const refresh = await screen.findByRole('button', { name: 'Refresh' })
+    fireEvent.click(refresh)
+    expect(screen.getByRole('button', { name: 'Refreshing…' })).toBeDisabled()
+    await act(async () => fail('no engine'))
+    expect(screen.getByText('Refresh failed: no engine')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled()
+  })
 })
 
 describe('daily chart', () => {
   it('stacks $ by repo, a row per day of the range, from an every-repo by-day rollup', async () => {
     await show()
+    expect(within(region('Per day')).getByRole('columnheader', { name: 'Day' })).toBeInTheDocument()
     expect(calls((g) => g === 'day').at(-1)).toEqual({
       from: '2026-10-07',
       to: '2026-10-13',
@@ -343,6 +387,13 @@ describe('daily chart', () => {
       'Agent-hours per day, stacked by repo',
     )
     expect(chartRows().at(-2)?.slice(1)).toEqual(['0.5h', '3h'])
+  })
+
+  it('shares one read with the table when it too is by day over every repo', async () => {
+    await show()
+    await choose('Group by', 'Day')
+    expect(calls((g) => g === 'day')).toHaveLength(1)
+    expect(tableRows()).toEqual(['2026-10-12', '2026-10-13'])
   })
 
   it('keeps only the picked repo, without a new by-day read', async () => {
@@ -398,27 +449,24 @@ describe('tree table', () => {
   it('puts Unlinked last, whichever way a column sorts', async () => {
     await show()
     expect(tableRows()).toEqual(['acme/web', 'acme/api', 'Unlinked'])
-    const cost = within(region('Breakdown')).getByRole('columnheader', { name: '$' })
-    fireEvent.click(cost)
+    sortBy('$')
     expect(tableRows().at(-1)).toBe('Unlinked')
-    fireEvent.click(cost)
+    sortBy('$')
     expect(tableRows().at(-1)).toBe('Unlinked')
-    const name = within(region('Breakdown')).getByRole('columnheader', { name: 'Name' })
-    fireEvent.click(name)
+    sortBy('Name')
     expect(tableRows()).toEqual(['acme/api', 'acme/web', 'Unlinked'])
   })
 
   it('sorts by elapsed, agent-hours and progress, a missing value lowest', async () => {
     await show()
-    const header = (name: string) => within(region('Breakdown')).getByRole('columnheader', { name })
-    fireEvent.click(header('Elapsed'))
+    sortBy('Elapsed')
     expect(tableRows()).toEqual(['acme/api', 'acme/web', 'Unlinked'])
-    fireEvent.click(header('Agent-hours (wall)'))
+    sortBy('Agent-hours (wall)')
     expect(tableRows()).toEqual(['acme/web', 'acme/api', 'Unlinked'])
     fireEvent.click(screen.getByRole('button', { name: 'Expand repo acme/web' }))
-    fireEvent.click(header('Progress'))
+    sortBy('Progress')
     expect(tableRows().slice(1, 3)).toEqual(['#10 Epic', '#13 Guess'])
-    fireEvent.click(header('Progress'))
+    sortBy('Progress')
     expect(tableRows().slice(1, 3)).toEqual(['#13 Guess', '#10 Epic'])
   })
 
@@ -471,6 +519,32 @@ describe('tree table', () => {
     expect(fix()).toHaveAttribute('aria-pressed', 'false')
   })
 
+  it('lets no row be picked while a new filter is read over the old tree', async () => {
+    await show()
+    rollupMock.mockImplementation(() => new Promise(() => {}))
+    pick('14d')
+    expect(screen.getByRole('button', { name: 'acme/web' })).toBeDisabled()
+  })
+
+  it('drops the selection once its row is gone from the new rollup', async () => {
+    rollupMock.mockImplementation((f) =>
+      Promise.resolve(
+        f.groupBy === 'day'
+          ? byDay
+          : f.repos.length
+            ? audit(tree.root.children.filter((n) => n.key === f.repos[0]))
+            : tree,
+      ),
+    )
+    await show()
+    fireEvent.click(screen.getByRole('button', { name: 'acme/web' }))
+    expect(screen.getByRole('complementary', { name: 'Row detail' })).toBeInTheDocument()
+    await choose('Repo', 'acme/api')
+    await screen.findByRole('button', { name: 'acme/api' })
+    await vi.waitFor(() => expect(tableRows()).toEqual(['acme/api']))
+    expect(screen.queryByRole('complementary', { name: 'Row detail' })).toBeNull()
+  })
+
   it('keeps rows expanded by node, not position, across a change of grouping', async () => {
     await show()
     fireEvent.click(screen.getByRole('button', { name: 'Expand repo acme/web' }))
@@ -502,8 +576,8 @@ describe('row detail', () => {
       { from: '2026-10-07', to: '2026-10-13', repos: [], groupBy: 'hierarchy' },
       [
         ['repo', 'acme/web'],
-        ['epic', 'acme/web#10'],
-        ['issue', 'acme/web#11'],
+        ['epic', '10'],
+        ['issue', '11'],
       ],
     )
     expect(within(detail()).getByRole('heading', { name: '#11 Fix' })).toBeInTheDocument()
@@ -518,6 +592,15 @@ describe('row detail', () => {
     expect((await within(detail()).findAllByText('Agent (non-idle)')).length).toBeGreaterThan(0)
   })
 
+  it('names each span kind in its legend: active, wait, then agent', async () => {
+    await show()
+    selectFix()
+    await within(detail()).findAllByText('Agent (non-idle)')
+    for (const label of ['Active', 'Waiting on you']) {
+      expect(within(detail()).getAllByText(label).length).toBeGreaterThan(0)
+    }
+  })
+
   it('follows the selection to another row', async () => {
     await show()
     selectFix()
@@ -526,7 +609,7 @@ describe('row detail', () => {
     await act(() => Promise.resolve())
     expect(timelineMock.mock.lastCall?.[1]).toEqual([
       ['repo', 'acme/web'],
-      ['issue', 'acme/web#13'],
+      ['issue', '13'],
     ])
   })
 
@@ -540,6 +623,17 @@ describe('row detail', () => {
     expect(detail()).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '#11 Fix' }))
     expect(screen.queryByRole('complementary', { name: 'Row detail' })).toBeNull()
+  })
+
+  it('hands focus back to the selected row on close, or to the table when it is hidden', async () => {
+    await show()
+    selectFix()
+    fireEvent.click(within(detail()).getByRole('button', { name: 'Close row detail' }))
+    expect(screen.getByRole('button', { name: '#11 Fix' })).toHaveFocus()
+    fireEvent.click(screen.getByRole('button', { name: '#11 Fix' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse repo acme/web' }))
+    fireEvent.click(within(detail()).getByRole('button', { name: 'Close row detail' }))
+    expect(region('Breakdown')).toHaveFocus()
   })
 
   it('closes when the grouping changes, since its path means nothing there', async () => {
@@ -604,37 +698,29 @@ describe('export', () => {
     expect(exportButton()).toBeDisabled()
   })
 
-  it('asks where to save, then writes the whole tree under the filter there', async () => {
-    saveMock.mockResolvedValue('C:/out/audit.csv')
+  it('hands the whole tree under the filter to the app, which asks where to save it', async () => {
     await show()
     fireEvent.click(exportButton())
     await vi.waitFor(() => expect(writeMock).toHaveBeenCalledOnce())
-    expect(saveMock).toHaveBeenCalledWith({
-      defaultPath: 'strate-audit-2026-10-07_2026-10-13.csv',
-      filters: [{ name: 'CSV', extensions: ['csv'] }],
-    })
-    const [path, text] = writeMock.mock.calls[0] as [string, string]
-    expect(path).toBe('C:/out/audit.csv')
+    const [text, name] = writeMock.mock.calls[0] as [string, string]
+    expect(name).toBe('strate-audit-2026-10-07_2026-10-13.csv')
     // Collapsed rows are in it too.
     const rows = text.split('\r\n')
-    expect(rows[0]).toMatch(/^Kind,Level 1,Level 2,Level 3,GitHub,/)
-    expect(rows.filter((r) => r.startsWith('issue,acme/web,#10 Epic,#11 Fix,true,'))).toHaveLength(
-      1,
-    )
+    expect(rows[0]).toMatch(/^\uFEFFKind,Level 1,Level 2,Level 3,Path,GitHub,/)
+    expect(rows.filter((r) => r.startsWith('issue,acme/web,#10 Epic,#11 Fix,'))).toHaveLength(1)
     expect(rows.filter((r) => r.startsWith('unlinked,Unlinked,'))).toHaveLength(1)
   })
 
-  it('writes nothing when the dialog is cancelled', async () => {
+  it('shows nothing when the save dialog is cancelled', async () => {
+    writeMock.mockResolvedValue(false)
     await show()
     fireEvent.click(exportButton())
-    await vi.waitFor(() => expect(saveMock).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(writeMock).toHaveBeenCalledOnce())
     await act(() => Promise.resolve())
-    expect(writeMock).not.toHaveBeenCalled()
     expect(screen.queryByRole('alert')).toBeNull()
   })
 
   it('reports a failed write, and clears the report on the next export', async () => {
-    saveMock.mockResolvedValue('C:/out/audit.csv')
     writeMock.mockRejectedValueOnce('Access is denied. (os error 5)')
     await show()
     fireEvent.click(exportButton())

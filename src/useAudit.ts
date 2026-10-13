@@ -15,6 +15,9 @@ export function useTrailing(value: number, ms: number): number {
   return settled
 }
 
+/** How many filters the cache holds; the one read longest ago goes first. */
+export const CACHE_SIZE = 8
+
 interface Cached {
   /** The (debounced) store version it was read at; older is stale. */
   version: number
@@ -22,7 +25,7 @@ interface Cached {
 }
 
 /**
- * The rollup for `filter`, cached per filter. A store change marks every cached filter stale,
+ * The rollup for `filter`, cached per filter (the last `CACHE_SIZE` read). A store change marks every cached filter stale,
  * and the shown one is reread once the store has been quiet for 1 s; a stale one still shows
  * until its reread lands. A filter not read yet shows the last rollup that landed meanwhile,
  * with `pending` set. Nothing is read while `active` is false: a filter that went stale
@@ -45,7 +48,15 @@ export function useAudit(
   const pending = cached?.version !== version
   const loaded = useLoad(active && pending ? key : null, version, async () => {
     const audit = await auditRollup(filter)
-    setCache((c) => ({ byKey: new Map(c.byKey).set(key, { version, audit }), last: audit }))
+    setCache((c) => {
+      // A slow read can land after a newer one of the same filter; the newer one stays.
+      if ((c.byKey.get(key)?.version ?? -1) > version) return c
+      const byKey = new Map(c.byKey)
+      byKey.delete(key)
+      byKey.set(key, { version, audit })
+      for (const old of byKey.keys()) if (byKey.size > CACHE_SIZE) byKey.delete(old)
+      return { byKey, last: audit }
+    })
     return audit
   })
   const error = loaded?.target === key && 'error' in loaded ? loaded.error : null

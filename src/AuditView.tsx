@@ -12,12 +12,20 @@ import {
   ResizablePanelGroup,
   StackedBarChart,
 } from '@crawfordyoung/ui'
-import { save } from '@tauri-apps/plugin-dialog'
 import { ChevronLeft } from 'lucide-react'
-import { useEffect, useRef, useState } from 'react'
-import { auditRefresh, writeExport, type Audit, type AuditPath, type Headline } from './api'
-import { dailyChart, hoursLabel, lastDays, repoOptions } from './audit'
-import { AuditControls, type Controls } from './AuditControls'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { flushSync } from 'react-dom'
+import {
+  auditRefresh,
+  writeExport,
+  type Audit,
+  type AuditFilter,
+  type AuditPath,
+  type GithubError,
+  type Headline,
+} from './api'
+import { dailyChart, hasPath, hoursLabel, lastDays, repoOptions, shortDay } from './audit'
+import { AuditControls, PRESET_DAYS, type Controls } from './AuditControls'
 import { AuditDetail } from './AuditDetail'
 import { AuditTable } from './AuditTable'
 import { toCsv } from './csv'
@@ -38,7 +46,7 @@ const START: Controls = {
   measure: 'usd',
 }
 
-const dayLabel = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' })
+const samePath = (a: AuditPath, b: AuditPath) => JSON.stringify(a) === JSON.stringify(b)
 
 export function AuditView({ hidden, onBack }: AuditViewProps) {
   const headingRef = useRef<HTMLHeadingElement>(null)
@@ -49,10 +57,12 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
   const [controls, setControls] = useState(START)
   // The selected row, for the row detail. A path means nothing under another grouping.
   const [selected, setSelected] = useState<{ path: AuditPath; label: string } | null>(null)
-  const select = (path: AuditPath, label: string) =>
-    setSelected((s) =>
-      s && JSON.stringify(s.path) === JSON.stringify(path) ? null : { path, label },
-    )
+  // Stable, so the memoized table skips the rerender a store change brings.
+  const select = useCallback(
+    (path: AuditPath, label: string) =>
+      setSelected((s) => (s && samePath(s.path, path) ? null : { path, label })),
+    [],
+  )
   const [exportError, setExportError] = useState<string | null>(null)
   const change = (patch: Partial<Controls>) => {
     if (patch.groupBy !== undefined && patch.groupBy !== controls.groupBy) setSelected(null)
@@ -63,25 +73,45 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
   const days =
     controls.range === 'custom'
       ? controls.custom
-      : lastDays(Number.parseInt(controls.range), new Date())
-  const repos = controls.repo === null ? [] : [controls.repo]
+      : lastDays(PRESET_DAYS[controls.range], new Date())
   const storeVersion = useStoreVersion()
-  const filter = { ...days, repos, groupBy: controls.groupBy }
-  const main = useAudit(filter, !hidden, storeVersion)
+  const filter: AuditFilter = {
+    ...days,
+    repos: controls.repo === null ? [] : [controls.repo],
+    groupBy: controls.groupBy,
+  }
   // Every repo, so the repo select lists them all; the chart narrows to the picked one itself.
   const daily = useAudit({ ...days, repos: [], groupBy: 'day' }, !hidden, storeVersion)
-  const chart =
-    daily.audit && dailyChart(daily.audit, controls.measure, controls.repo, days.from, days.to)
+  // By day over every repo, the table's rollup is the chart's, so one read serves both.
+  const sameRead = controls.groupBy === 'day' && controls.repo === null
+  const own = useAudit(filter, !hidden && !sameRead, storeVersion)
+  const main = sameRead ? daily : own
+  const chart = useMemo(
+    () =>
+      daily.audit && dailyChart(daily.audit, controls.measure, controls.repo, days.from, days.to),
+    [daily.audit, controls.measure, controls.repo, days.from, days.to],
+  )
+  const repos = useMemo(() => (daily.audit ? repoOptions(daily.audit) : []), [daily.audit])
+  // A row a new repo or range no longer holds is no longer selected.
+  const shown = selected && main.audit && hasPath(main.audit.root, selected.path) ? selected : null
 
-  // The full tree under the current filter, saved wherever the user picks.
+  const breakdownRef = useRef<HTMLElement>(null)
+  // Focus goes back to the row the detail showed, or to the table when that row is collapsed.
+  // Looked up after the close renders, since the table redraws its rows on a selection change.
+  const closeDetail = () => {
+    const path = JSON.stringify((shown as NonNullable<typeof shown>).path)
+    flushSync(() => setSelected(null))
+    const breakdown = breakdownRef.current as HTMLElement
+    const rows = breakdown.querySelectorAll<HTMLElement>('button[data-path]')
+    const row = [...rows].find((b) => b.dataset.path === path)
+    ;(row ?? breakdown).focus()
+  }
+
+  // The full tree under the current filter; the app asks where to save it.
   const exportCsv = async () => {
     setExportError(null)
     try {
-      const path = await save({
-        defaultPath: `strate-audit-${days.from}_${days.to}.csv`,
-        filters: [{ name: 'CSV', extensions: ['csv'] }],
-      })
-      if (path !== null) await writeExport(path, toCsv(main.audit as Audit))
+      await writeExport(toCsv(main.audit as Audit), `strate-audit-${days.from}_${days.to}.csv`)
     } catch (e) {
       setExportError(String(e))
     }
@@ -106,7 +136,7 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
         value={controls}
         days={days}
         onChange={change}
-        repos={daily.audit ? repoOptions(daily.audit) : []}
+        repos={repos}
         actions={
           <Button
             variant="outline"
@@ -139,15 +169,7 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
             ) : (
               <>
                 {main.audit.githubErrors.length > 0 && (
-                  <Alert variant="warning" className="flex items-start gap-3">
-                    <AlertDescription className="flex-1">
-                      GitHub data is missing or stale for{' '}
-                      {main.audit.githubErrors.map((e) => `${e.repo}: ${e.error}`).join('; ')}.
-                    </AlertDescription>
-                    <Button variant="outline" size="sm" onClick={() => void auditRefresh()}>
-                      Refresh
-                    </Button>
-                  </Alert>
+                  <GithubBanner errors={main.audit.githubErrors} />
                 )}
                 <Kpis headline={main.audit.headline} />
                 {chart && (
@@ -159,39 +181,75 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
                       data={chart.data}
                       series={chart.series}
                       xKey="day"
-                      xFormat={(day) => dayLabel.format(new Date(`${day}T00:00`))}
+                      xLabel="Day"
+                      xFormat={shortDay}
                       format={controls.measure === 'usd' ? money : hoursLabel}
                     />
                   </section>
                 )}
-                <section aria-label="Breakdown">
+                <section
+                  ref={breakdownRef}
+                  aria-label="Breakdown"
+                  tabIndex={-1}
+                  className="outline-none"
+                >
                   <AuditTable
                     nodes={main.audit.root.children}
-                    selected={selected?.path ?? null}
+                    selected={shown?.path ?? null}
                     onSelect={select}
+                    // The tree on screen may be the last filter's while this one is read.
+                    disabled={main.pending}
                   />
                 </section>
               </>
             )}
           </main>
         </ResizablePanel>
-        {selected && (
+        {shown && (
           <>
             <ResizableHandle />
             <ResizablePanel id="audit-detail" defaultSize="38%" minSize="15%">
               <AuditDetail
                 filter={filter}
-                path={selected.path}
-                label={selected.label}
+                path={shown.path}
+                label={shown.label}
                 active={!hidden}
                 storeVersion={storeVersion}
-                onClose={() => setSelected(null)}
+                onClose={closeDetail}
               />
             </ResizablePanel>
           </>
         )}
       </ResizablePanelGroup>
     </div>
+  )
+}
+
+/** The repos whose GitHub data is missing or stale, and a Refresh that asks for it again. */
+function GithubBanner({ errors }: { errors: GithubError[] }) {
+  const [refresh, setRefresh] = useState<{ busy: boolean; error: string | null }>({
+    busy: false,
+    error: null,
+  })
+  const ask = async () => {
+    setRefresh({ busy: true, error: null })
+    try {
+      await auditRefresh()
+      setRefresh({ busy: false, error: null })
+    } catch (e) {
+      setRefresh({ busy: false, error: String(e) })
+    }
+  }
+  return (
+    <Alert variant="warning" className="flex items-start gap-3">
+      <AlertDescription className="flex-1">
+        GitHub data is missing or stale for {errors.map((e) => `${e.repo}: ${e.error}`).join('; ')}.
+        {refresh.error !== null && <span>{` Refresh failed: ${refresh.error}`}</span>}
+      </AlertDescription>
+      <Button variant="outline" size="sm" disabled={refresh.busy} onClick={() => void ask()}>
+        {refresh.busy ? 'Refreshing…' : 'Refresh'}
+      </Button>
+    </Alert>
   )
 }
 

@@ -1,6 +1,6 @@
 // Pure helpers for the Audit view: local-day ranges, number labels, and the daily chart's rows.
 import type { StackedBarDatum, StackedBarSeries } from '@crawfordyoung/ui'
-import type { Audit, AuditNode } from './api'
+import type { Audit, AuditNode, AuditPath } from './api'
 
 const HOUR = 3_600_000
 
@@ -29,6 +29,11 @@ export function lastDays(n: number, now: Date): { from: string; to: string } {
   return { from: localDay(addDays(now, 1 - n)), to: localDay(now) }
 }
 
+const shortDayFormat = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' })
+
+/** A `YYYY-MM-DD` day as a short local date: `Oct 5`. */
+export const shortDay = (day: string) => shortDayFormat.format(parseDay(day))
+
 /** Every local day `from..=to`. */
 export function dayRange(from: string, to: string): string[] {
   const days: string[] = []
@@ -45,6 +50,13 @@ export function compact(n: number): string {
 
 /** Hours to at most one decimal: `1.3h`, `12h`. */
 export const hoursLabel = (h: number) => `${Number(h.toFixed(1))}h`
+
+/** Whether `root` holds a node at `path` (its `[kind, key]` steps down from `root`). */
+export function hasPath(root: AuditNode, path: AuditPath): boolean {
+  let at: AuditNode | undefined = root
+  for (const [kind, key] of path) at = at?.children.find((n) => n.kind === kind && n.key === key)
+  return at !== undefined
+}
 
 const measured = (node: AuditNode, measure: Measure) =>
   measure === 'usd' ? node.metrics.costUsd : node.metrics.agentMs / HOUR
@@ -80,7 +92,7 @@ export function dailyChart(
 
   const days = new Map(byDay.root.children.map((day) => [day.key, day]))
   const data = dayRange(from, to).map((day) => {
-    const row: Record<string, unknown> = { day }
+    const row: Record<string, string | number> = { day }
     for (const n of days.get(day)?.children ?? []) {
       const key = keys.get(id(n))
       if (key) row[key] = measured(n, measure)

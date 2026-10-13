@@ -15,7 +15,7 @@ use serde::Serialize;
 use super::cells::{Cell, Cells};
 use super::gh::Gh;
 use super::tree::Step;
-use super::{AuditFilter, NodeKind};
+use super::{AuditFilter, GroupBy, NodeKind};
 use crate::store::Result;
 use crate::store::account::{self, Run};
 use crate::time::{self, Cat};
@@ -118,12 +118,22 @@ pub fn audit_timeline(
             }
         }
     }
+    // A day row's marks are that day's only: its cells' issues and PRs may
+    // close on another day, which is another row.
+    let own_day = match (filter.group_by, path.first()) {
+        (GroupBy::Day, Some((NodeKind::Group, day))) => Some(day.as_str()),
+        _ => None,
+    };
     for (at, label) in marks {
         let (Some(day), Some(midnight)) = (time::local_day(&tz, at), time::day_start(&tz, at))
         else {
             continue;
         };
-        if (filter.from.as_str()..=filter.to.as_str()).contains(&day.as_str()) {
+        let shown = match own_day {
+            Some(own) => day == own,
+            None => (filter.from.as_str()..=filter.to.as_str()).contains(&day.as_str()),
+        };
+        if shown {
             entry(&mut days, &day).marks.push(TimelineMark {
                 at_ms: at - midnight,
                 label,

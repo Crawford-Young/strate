@@ -149,13 +149,14 @@ describe('commands', () => {
     expect(invokeMock).toHaveBeenCalledWith('audit_refresh')
   })
 
-  it('write_export hands the picked path and the text over', async () => {
-    invokeMock.mockResolvedValueOnce(undefined)
-    await expect(writeExport('C:/out/audit.csv', 'a,b\r\n')).resolves.toBeUndefined()
+  it('write_export hands over the text and a suggested name, never a path', async () => {
+    invokeMock.mockResolvedValueOnce(true).mockResolvedValueOnce(false)
+    await expect(writeExport('a,b\r\n', 'audit.csv')).resolves.toBe(true)
     expect(invokeMock).toHaveBeenCalledWith('write_export', {
-      path: 'C:/out/audit.csv',
       text: 'a,b\r\n',
+      suggestedName: 'audit.csv',
     })
+    await expect(writeExport('a,b\r\n', 'audit.csv')).resolves.toBe(false)
   })
 
   it('a command error rejects with the message', async () => {

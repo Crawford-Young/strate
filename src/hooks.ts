@@ -29,7 +29,7 @@ type Loaded<T> = { target: string; value: T } | { target: string; error: string 
  * to 4 times a second, and dropping would starve a read slower than that.
  * Instead bumps coalesce into one rerun after the read in flight lands, so at
  * most one read per target is in flight and results land in order. A null
- * `target` loads nothing.
+ * `target` loads nothing and, like an unmount, drops a queued rerun.
  */
 export function useLoad<T>(
   target: string | null,
@@ -39,9 +39,20 @@ export function useLoad<T>(
   const [loaded, setLoaded] = useState<Loaded<T> | null>(null)
   const run = useEffectEvent(load)
   const reads = useRef({ generation: 0, target: null as string | null, busy: false, rerun: false })
+  // A rerun queued behind a read in flight is dropped on unmount, as it is
+  // when the target goes null: nothing reads for a view that is gone.
   useEffect(() => {
-    if (target === null) return
     const r = reads.current
+    return () => {
+      r.rerun = false
+    }
+  }, [])
+  useEffect(() => {
+    const r = reads.current
+    if (target === null) {
+      r.rerun = false
+      return
+    }
     if (r.busy && r.target === target) {
       r.rerun = true
       return
