@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rusqlite::Connection;
 use strate_core::store::Store;
 use strate_core::store::views::{
-    self, Audit, AuditFilter, LiveGraph, NeedsYou, NodeKind, TimelineDay, Workstream,
+    self, Audit, AuditFilter, LiveGraph, NeedsYou, NodeKind, Performance, TimelineDay, Workstream,
     WorkstreamCost,
 };
 use tauri::{AppHandle, State};
@@ -99,6 +99,21 @@ fn timeline(
     reader.read(|conn| views::audit_timeline(conn, filter, path))
 }
 
+/// The Audit performance read for `filter` (its group-by is ignored):
+/// outcome per ISO week, agents per type and model, bottleneck per day and
+/// repo, and waste. A bad day in the filter is an error.
+#[tauri::command(async)]
+pub fn audit_performance(
+    reader: State<'_, Reader>,
+    filter: AuditFilter,
+) -> Result<Performance, String> {
+    performance(&reader, &filter)
+}
+
+fn performance(reader: &Reader, filter: &AuditFilter) -> Result<Performance, String> {
+    reader.read(|conn| views::performance(conn, filter))
+}
+
 /// Asks the engine to refresh the GitHub cache and resolves once the fetch
 /// covering the request is stored (at once with GitHub off or no repos), so
 /// the webview rereads Audit then. Requests during a refresh coalesce into
@@ -169,6 +184,11 @@ mod tests {
         let path = vec![(NodeKind::Repo, "demo".to_string())];
         assert_eq!(timeline(&reader, &filter("2026-10-01"), &path), Ok(vec![]));
         let err = timeline(&reader, &filter("October"), &path).expect_err("a bad day");
+        assert!(!err.is_empty());
+        let perf = performance(&reader, &filter("2026-10-01")).expect("an empty store reads");
+        assert!(perf.agents.is_empty() && perf.bottleneck.days.is_empty());
+        assert_eq!(perf.outcome.weeks.len(), 5, "w/c 09-28 to w/c 10-26");
+        let err = performance(&reader, &filter("October")).expect_err("a bad day");
         assert!(!err.is_empty());
 
         assert!(Reader::open(&dir.join("missing.db")).is_err());

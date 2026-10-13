@@ -209,6 +209,136 @@ export interface TimelineDay {
   marks: TimelineMark[]
 }
 
+/**
+ * One ISO week of the range: the issues closed as completed and the PRs merged in it,
+ * each at its whole-life cost (all its `<repo>-<issue>` work, in the range or not).
+ */
+export interface OutcomeWeek {
+  /** Its Monday, `YYYY-MM-DD`. */
+  week: string
+  /** Its days inside the range: fewer than 7 at either end. */
+  days: number
+  issuesClosed: number
+  usdPerClosedIssue: number | null
+  /** Orchestrator active time, not subagent time. */
+  activeMsPerClosedIssue: number | null
+  /** With linked work; a PR closing several issues counts once. */
+  prsMerged: number
+  usdPerMergedPr: number | null
+  /** Everything spent on its days in the range. */
+  spendUsd: number
+}
+
+export interface Outcome {
+  /** Every ISO week the range touches, in order. */
+  weeks: OutcomeWeek[]
+  /** The range's $ in windows with no `<repo>-<issue>` name. */
+  unlinkedUsd: number
+  unlinkedWorkstreams: number
+  /** The range's $ on issues not closed (or not in the GitHub cache). */
+  openUsd: number
+  openIssues: number
+}
+
+/** One agent type on one model, or the orchestrator on one model. */
+export interface AgentRow {
+  /** `orchestrator` on an orchestrator row; `""` when unknown. */
+  agentType: string
+  /** `""` when unknown. */
+  model: string
+  /** An orchestrator row: no dispatches, so every count is 0. */
+  orchestrator: boolean
+  /** Each dispatch with a cell in the range, once. */
+  dispatches: number
+  /** Completed with no `NEEDS_CONTEXT:` line in the final report. */
+  completed: number
+  blocked: number
+  /** Failed or killed. */
+  failed: number
+  /** Never notified, and quiet for over 30 minutes before the store's newest record. */
+  noReport: number
+  /** Never notified, last heard within those 30 minutes: no outcome yet. */
+  running: number
+  /** SendMessage calls to these dispatches. */
+  followups: number
+  costUsd: number
+  usdPerDispatch: number | null
+  tokens: Tokens
+  /** Cache reads over all input: fresh, read and written. */
+  cacheHitPct: number | null
+}
+
+/** Your time on one local day in one repo's windows (`null`: Unlinked). */
+export interface BottleneckDay {
+  day: string
+  repo: string | null
+  /** Answering questions and plan approvals. */
+  askMs: number
+  /** From the last reply to your next prompt. */
+  promptWaitMs: number
+  /** Proxy: a blocked dispatch's last record to its parent's next prompt or dispatch. */
+  blockedMs: number
+  /** The orchestrator's active time. */
+  activeMs: number
+  blockedReports: number
+}
+
+export interface Bottleneck {
+  /** By day, then repo; Unlinked last. */
+  days: BottleneckDay[]
+  /** No source until hooks record permission prompts (#52). */
+  permissionWaits: 'not_recorded'
+}
+
+export interface LaneCount {
+  agentType: string
+  model: string
+  count: number
+}
+
+export interface Peak {
+  pct: number
+  model: string
+}
+
+export interface Waste {
+  /** SendMessage calls to a dispatch, of `sendMessages` in all. */
+  followups: number
+  sendMessages: number
+  /** Of `dispatches`. */
+  blocked: number
+  dispatches: number
+  noReport: number
+  /** The agent type and model with the most no-report dispatches. */
+  noReportTop: LaneCount | null
+  compactions: number
+  /** `/clear` successors started in the range. */
+  clears: number
+  /** Agents, orchestrators too, whose deepest request reached 80% of the window. */
+  contextPeaksOver80: number
+  deepestPeak: Peak | null
+  /** Requests retried after an API error. */
+  apiRetries: number
+  /** API error messages, prompt-too-long ones included. */
+  apiErrors: number
+  promptTooLong: number
+  /** Issues with work in the range that GitHub saw reopened. */
+  reopenedIssues: number
+  /** Merged revert PRs, merged in the range. */
+  revertedPrs: number
+  /** The repos with GitHub data the two counts above cover. */
+  repos: number
+}
+
+/** The Audit performance read: every section under the same filter (days, repos). */
+export interface Performance {
+  outcome: Outcome
+  /** Orchestrator rows first, then by $ (most first). */
+  agents: AgentRow[]
+  bottleneck: Bottleneck
+  waste: Waste
+}
+
 export const status = () => invoke<Status>('status')
 
 export const workstreams = () => invoke<Workstream[]>('workstreams')
@@ -227,6 +357,10 @@ export const auditRollup = (filter: AuditFilter) => invoke<Audit>('audit_rollup'
 /** The node's days in the filter; empty for an unknown path, rejects on a bad day. */
 export const auditTimeline = (filter: AuditFilter, path: AuditPath) =>
   invoke<TimelineDay[]>('audit_timeline', { filter, path })
+
+/** The performance read under `filter` (its `groupBy` is ignored); rejects on a bad day. */
+export const auditPerformance = (filter: AuditFilter) =>
+  invoke<Performance>('audit_performance', { filter })
 
 /**
  * The Audit CSV export: the app asks where to save it in a native dialog, offering

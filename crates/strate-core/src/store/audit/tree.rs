@@ -303,7 +303,9 @@ impl Node {
         m.tokens.add(&s.tokens);
         m.agent_ms += s.agent_ms;
         m.approximate |= s.approximate;
-        let Time { active_ms, wait_ms } = if self.step.kind == NodeKind::Agent {
+        let Time {
+            active_ms, wait_ms, ..
+        } = if self.step.kind == NodeKind::Agent {
             s.own
         } else {
             s.line
@@ -352,7 +354,7 @@ impl Node {
 }
 
 impl Tokens {
-    fn add(&mut self, other: &Self) {
+    pub(super) fn add(&mut self, other: &Self) {
         self.input += other.input;
         self.output += other.output;
         self.cache_read += other.cache_read;

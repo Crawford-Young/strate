@@ -16,6 +16,11 @@ ALTER TABLE events ADD COLUMN message_to TEXT;
 ALTER TABLE events ADD COLUMN api_error TEXT;
 CREATE INDEX events_notification ON events (session_id, notification_task)
     WHERE notification_task IS NOT NULL;
+-- The records the performance read counts as waste: SendMessage calls, API
+-- errors, compactions and retries.
+CREATE INDEX events_waste ON events (session_id)
+    WHERE message_to IS NOT NULL OR api_error IS NOT NULL
+        OR subtype IN ('compact_boundary', 'api_error');
 
 -- A dispatch's outcome: the worst status its notifications carry (failed,
 -- then killed, then completed), and blocked when it completed with a

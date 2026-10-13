@@ -1,6 +1,6 @@
 //! Read views for the app: workstream tabs, needs-you, per-workstream $,
-//! the live graph, and the Audit rollups and row timeline ([`audit()`],
-//! [`audit_timeline()`], from `store/audit/`).
+//! the live graph, and the Audit rollups, row timeline and performance read
+//! ([`audit()`], [`audit_timeline()`], [`performance()`], from `store/audit/`).
 //! Each runs on a read-only connection from
 //! [`super::Store::open_reader`] and serializes in camelCase for the
 //! webview.
@@ -19,8 +19,10 @@ use serde::Serialize;
 
 use super::Result;
 pub use super::audit::{
-    Audit, AuditFilter, AuditNode, GithubError, GroupBy, Headline, Metrics, NodeKind, Progress,
-    SpanKind, TimelineDay, TimelineMark, TimelineSpan, Tokens, audit, audit_timeline,
+    AgentRow, Audit, AuditFilter, AuditNode, Bottleneck, BottleneckDay, GithubError, GroupBy,
+    Headline, LaneCount, Metrics, NodeKind, Outcome, OutcomeWeek, Peak, Performance,
+    PermissionWaits, Progress, SpanKind, TimelineDay, TimelineMark, TimelineSpan, Tokens, Waste,
+    audit, audit_timeline, performance,
 };
 
 /// An agent's state, as the canvas and tabs show it.
