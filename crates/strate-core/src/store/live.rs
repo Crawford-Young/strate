@@ -1,7 +1,11 @@
 //! Writes live state: registry poll events and hook events. Every function
 //! runs inside the caller's transaction. Rows are created the way ingest
 //! creates them (a stub session, its orchestrator, the agent), so a later
-//! discovery or tail of the same session or agent fills the same rows.
+//! discovery or tail of the same session or agent fills the same rows. A
+//! registry row is live while `gone = 0`: listed by the latest poll and not
+//! a finished background session.
+
+use std::collections::HashSet;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -23,8 +27,29 @@ pub(super) fn registry(conn: &Connection, event: &RegistryEvent) -> Result<()> {
                 .execute(params![entry.key(), last_seen_ms])?;
             refresh(conn, entry.session_id.as_deref())
         }
+        RegistryEvent::Baseline { keys } => reconcile(conn, keys),
         RegistryEvent::Error { .. } => Ok(()),
     }
+}
+
+/// Marks gone every live row the baseline does not list: entries an
+/// earlier run stored that ended while nothing polled. Each keeps the last
+/// poll that saw it.
+fn reconcile(conn: &Connection, keys: &[String]) -> Result<()> {
+    let listed: HashSet<&str> = keys.iter().map(String::as_str).collect();
+    let live: Vec<(String, Option<String>)> = conn
+        .prepare_cached("SELECT key, session_id FROM registry WHERE gone = 0")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (key, session_id) in &live {
+        if listed.contains(key.as_str()) {
+            continue;
+        }
+        conn.prepare_cached("UPDATE registry SET gone = 1 WHERE key = ?1")?
+            .execute([key])?;
+        refresh(conn, session_id.as_deref())?;
+    }
+    Ok(())
 }
 
 fn upsert_entry(conn: &Connection, entry: &RegistryEntry, at_ms: i64) -> Result<()> {
@@ -40,13 +65,13 @@ fn upsert_entry(conn: &Connection, entry: &RegistryEntry, at_ms: i64) -> Result<
     }
     conn.prepare_cached(
         "INSERT INTO registry (key, kind, session_id, pid, bg_id, name, cwd, started_at_ms,
-             status, waiting_for, state, first_seen_ms, last_seen_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+             status, waiting_for, state, first_seen_ms, last_seen_ms, gone)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13)
          ON CONFLICT (key) DO UPDATE SET kind = excluded.kind,
              session_id = excluded.session_id, pid = excluded.pid, bg_id = excluded.bg_id,
              name = excluded.name, cwd = excluded.cwd, started_at_ms = excluded.started_at_ms,
              status = excluded.status, waiting_for = excluded.waiting_for,
-             state = excluded.state, last_seen_ms = excluded.last_seen_ms, gone = 0",
+             state = excluded.state, last_seen_ms = excluded.last_seen_ms, gone = excluded.gone",
     )?
     .execute(params![
         key,
@@ -61,6 +86,7 @@ fn upsert_entry(conn: &Connection, entry: &RegistryEntry, at_ms: i64) -> Result<
         entry.waiting_for,
         entry.state,
         at_ms,
+        entry.finished(),
     ])?;
     // The registry is the orchestrator's truth: once it is not waiting, a
     // PermissionRequest hook on the orchestrator is answered.

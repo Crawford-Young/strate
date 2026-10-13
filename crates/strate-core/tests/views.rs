@@ -463,6 +463,36 @@ fn a_workstream_with_no_live_session_draws_its_latest_session_as_done() {
 }
 
 #[test]
+fn stale_and_finished_registry_entries_are_not_live() {
+    let temp = Temp::new("not-live");
+    let (mut store, reader) = temp.open();
+    fill(&mut store);
+    // A new run's first poll lists beta-2 and a finished background run in
+    // alpha's session; alpha-1's process ended while nothing polled.
+    let finished = appeared(
+        r#"{"id":"bg-9","cwd":"/work/alpha","kind":"background","startedAt":1791000003000,
+            "sessionId":"s-alpha","name":"alpha-1","state":"done"}"#,
+    );
+    store
+        .apply_registry(&[
+            finished,
+            RegistryEvent::Baseline {
+                keys: vec!["id:bg-9".into(), "pid:4102:1791000000000".into()],
+            },
+        ])
+        .expect("first poll");
+
+    let rows = views::workstreams(&reader).expect("workstreams");
+    let alpha = by_name(&rows, "alpha-1");
+    assert!(!alpha.live);
+    assert!(by_name(&rows, "beta-2").live);
+    let graph = views::live_graph(&reader, alpha.id)
+        .expect("query")
+        .expect("a graph");
+    assert!(!graph.live);
+}
+
+#[test]
 fn registry_states_map_to_agent_states() {
     let temp = Temp::new("states");
     let (mut store, reader) = temp.open();
