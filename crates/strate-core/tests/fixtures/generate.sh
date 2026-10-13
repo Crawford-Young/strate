@@ -305,3 +305,109 @@ aat $A5 /work/scratch '"isSidechain":false'
 # A6, window demo-8 (the epic itself), 2026-10-05 10:00:00..10:00:20Z: direct work.
 aat $A6 /work/demo '"isSidechain":false'
 { atitle demo-8; aprompt 2026-10-05T10:00:00 a6-01; areply 2026-10-05T10:00:20 a6-02 req_h1 $OPUS "$UO" "$TEXT"; } > "$AD/$A6.jsonl"
+
+# ---- perf-home: dispatch outcomes, follow-ups, API errors (#51); hand values in tests/performance.rs ----
+# One orchestrator (window perf-1) and six background dispatches, 2026-10-06 10:00..10:15Z.
+# Outcomes: b1 completed (its notification repeated across queue-operation,
+# attachment and user records), b2 failed (completed then failed: the worst
+# wins), b3 killed, b4 blocked (completed, its SubagentHandback report has a
+# NEEDS_CONTEXT: line), b5 completed (NEEDS_CONTEXT only quoted mid-line), b6
+# no notification (only quoted in a Bash command and its output). A
+# background shell's failed notification matches no agent.
+G=fixtures/perf-home
+G1=5e55e1e1-0000-4000-8000-0000000000e1
+GD="$G/projects/-work-perf"
+rm -rf "$G"
+mkdir -p "$GD/$G1/subagents"
+B1=a6000000000000001; B2=a6000000000000002; B3=a6000000000000003
+B4=a6000000000000004; B5=a6000000000000005; B6=a6000000000000006
+note() { # taskId toolUseId status: a <task-notification> body, JSON-escaped
+  echo "<task-notification>\\n<task-id>$1</task-id>\\n<tool-use-id>$2</tool-use-id>\\n<output-file>/work/tmp/$1.output</output-file>\\n<status>$3</status>\\n<summary>Lorem ipsum $3</summary>\\n</task-notification>"
+}
+gqueue() { # time operation note
+  echo "{\"type\":\"queue-operation\",\"operation\":\"$2\",\"timestamp\":\"$1.000Z\",\"sessionId\":\"$G1\",\"content\":\"$3\"}"
+}
+gattach() { # time uuid note
+  aenv "$1" "$2"; echo "{$AE,\"type\":\"attachment\",\"attachment\":{\"type\":\"queued_command\",\"prompt\":\"$3\",\"commandMode\":\"task-notification\"}}"
+}
+gnotice() { # time uuid note [origin]: the notification as a prompt
+  aenv "$1" "$2"
+  ORIGIN=""; if [ -n "${4:-}" ]; then ORIGIN=",\"origin\":{\"kind\":\"$4\"}"; fi
+  echo "{$AE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"$3\"}$ORIGIN}"
+}
+gdispatch() { # time uuid requestId toolUseId [name]
+  INPUT="{\"subagent_type\":\"implementer\",\"description\":\"Lorem\",\"prompt\":\"Lorem ipsum.\",\"run_in_background\":true"
+  if [ -n "${5:-}" ]; then INPUT="$INPUT,\"name\":\"$5\""; fi
+  areply "$1" "$2" "$3" $OPUS "$UO" "$(ktool "$4" Agent "$INPUT}")"
+}
+gsend() { # to...: SendMessage tool_use blocks
+  B=""; i=0
+  for to in "$@"; do
+    i=$((i + 1)); [ -n "$B" ] && B="$B,"
+    B="$B$(ktool "toolu_send_${to}_$i" SendMessage "{\"to\":\"$to\",\"message\":\"Lorem ipsum.\",\"summary\":\"Lorem\"}")"
+  done
+  echo "$B"
+}
+ghandback() { # message (JSON-escaped)
+  ktool toolu_handback SubagentHandback "{\"message\":\"$1\"}"
+}
+gapierror() { # time uuid error text
+  aenv "$1" "$2"; echo "{$AE,\"type\":\"assistant\",\"isApiErrorMessage\":true,\"error\":\"$3\",\"message\":{\"role\":\"assistant\",\"id\":\"msg_$2\",\"model\":\"<synthetic>\",\"content\":[{\"type\":\"text\",\"text\":\"$4\"}],\"usage\":$(ku 0 0 0 0)}}"
+}
+T=2026-10-06T10
+aat $G1 /work/perf '"isSidechain":false'
+{ atitle perf-1
+  aprompt $T:00:00 g-01
+  gdispatch $T:00:05 g-02 req_p1 toolu_p1; aresult $T:00:06 g-03 toolu_p1
+  gdispatch $T:00:10 g-04 req_p2 toolu_p2 perf-helper; aresult $T:00:11 g-05 toolu_p2
+  gdispatch $T:00:15 g-06 req_p3 toolu_p3; aresult $T:00:16 g-07 toolu_p3
+  gdispatch $T:00:20 g-08 req_p4 toolu_p4; aresult $T:00:21 g-09 toolu_p4
+  gdispatch $T:00:25 g-10 req_p5 toolu_p5; aresult $T:00:26 g-11 toolu_p5
+  gdispatch $T:00:30 g-12 req_p6 toolu_p6; aresult $T:00:31 g-13 toolu_p6
+  # quoted, not delivered: b6 stays without a notification
+  areply $T:00:40 g-14 req_p7 $OPUS "$UO" "$(ktool toolu_p7 Bash "{\"command\":\"echo '$(note $B6 toolu_p6 failed)'\"}")"
+  aenv $T:00:41 g-15; echo "{$AE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_p7\",\"content\":\"$(note $B6 toolu_p6 failed)\"}]}}"
+  gqueue $T:05:00 enqueue "$(note $B1 toolu_p1 completed)"
+  gqueue $T:05:01 remove "$(note $B1 toolu_p1 completed)"
+  gattach $T:05:01 g-16 "$(note $B1 toolu_p1 completed)"
+  gnotice $T:05:02 g-17 "$(note $B1 toolu_p1 completed)" task-notification
+  areply $T:05:05 g-18 req_p8 $OPUS "$UO" "$TEXT"
+  gqueue $T:06:00 enqueue "$(note $B2 toolu_p2 completed)"
+  gattach $T:06:01 g-19 "$(note $B2 toolu_p2 failed)"
+  gnotice $T:07:00 g-20 "$(note $B3 toolu_p3 killed)"
+  gqueue $T:08:00 enqueue "$(note $B4 toolu_p4 completed)"
+  gqueue $T:09:00 enqueue "$(note $B5 toolu_p5 completed)"
+  gqueue $T:09:30 enqueue "$(note bshell001 toolu_p0 failed)"
+  areply $T:10:00 g-21 req_p9 $OPUS "$UO" "$(gsend $B1)"
+  aresult $T:10:01 g-22 toolu_send_${B1}_1
+  areply $T:10:05 g-23 req_p10 $OPUS "$UO" "$(gsend perf-helper nobody)"
+  gapierror $T:11:00 g-24 invalid_request "Prompt is too long: 210000 tokens > 200000 maximum"
+  gapierror $T:11:30 g-25 rate_limit "API Error: lorem ipsum"
+  aenv $T:12:00 g-26; echo "{$AE,\"type\":\"system\",\"subtype\":\"compact_boundary\",\"content\":\"Conversation compacted\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":1000}}"
+  areply $T:13:00 g-27 req_p11 $OPUS "$UO" "$(ktool toolu_p11 AskUserQuestion '{"questions":[{"question":"Lorem?"}]}')"
+  aresult $T:14:00 g-28 toolu_p11
+  aprompt $T:15:00 g-29
+  areply $T:15:05 g-30 req_p12 $OPUS "$UO" "$TEXT"
+} > "$GD/$G1.jsonl"
+gsub() { # agentId start-second: a subagent's envelope and task prompt
+  aat $G1 /work/perf "\"isSidechain\":true,\"agentId\":\"$1\""
+  atask $T:00:$2 "$1-1"
+}
+gfile() { echo "$GD/$G1/subagents/agent-$1.jsonl"; }
+# b1: two requests, the first the deeper (100k vs 10k); a follow-up to b2 by name.
+{ gsub $B1 07
+  areply $T:01:00 b1-2 req_q1 $SONNET "$(ku 1000 0 99000 50)" "$(gsend perf-helper)"
+  areply $T:01:10 b1-3 req_q2 $SONNET "$(ku 500 0 9500 50)" "$(ghandback "RESULT: lorem ipsum.")"; } > "$(gfile $B1)"
+{ gsub $B2 12; areply $T:01:00 b2-2 req_q3 $SONNET "$US" "$(ghandback "RESULT: lorem.")"; } > "$(gfile $B2)"
+{ gsub $B3 17; areply $T:01:00 b3-2 req_q4 $SONNET "$US" "$TEXT"; } > "$(gfile $B3)"
+# b4: the handback is the report even with a text record after it.
+{ gsub $B4 22
+  areply $T:01:00 b4-2 req_q5 $SONNET "$US" "$(ghandback "RESULT: lorem.\\n- NEEDS_CONTEXT: lorem ipsum dolor.")"
+  areply $T:01:05 b4-3 req_q6 $SONNET "$US" "$TEXT"; } > "$(gfile $B4)"
+# b5: no handback, so the last text is the report; only an earlier one is blocked.
+{ gsub $B5 27
+  areply $T:01:00 b5-2 req_q7 $SONNET "$US" '{"type":"text","text":"NEEDS_CONTEXT: an earlier draft."}'
+  areply $T:01:05 b5-3 req_q8 $SONNET "$US" '{"type":"text","text":"RESULT: done, no NEEDS_CONTEXT: raised."}'; } > "$(gfile $B5)"
+{ gsub $B6 32; areply $T:01:00 b6-2 req_q9 $SONNET "$US" '{"type":"text","text":"NEEDS_CONTEXT: lorem."}'; } > "$(gfile $B6)"
+for n in 1 3 4 5 6; do ameta implementer toolu_p$n > "$GD/$G1/subagents/agent-a600000000000000$n.meta.json"; done
+echo '{"agentType":"implementer","description":"Lorem task","toolUseId":"toolu_p2","spawnDepth":1,"requestShape":"agent","requestNonInteractive":true,"model":"claude-sonnet-5-5","name":"perf-helper"}' > "$GD/$G1/subagents/agent-$B2.meta.json"

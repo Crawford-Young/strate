@@ -16,7 +16,8 @@ use super::Result;
 use crate::cost::{self, SYNTHETIC, Usage, truthy};
 use crate::time::{self, Cat, IDLE_GAP_MS, Record, Split, Timed};
 
-/// The accounting columns of one event (see `0003_cost_time.sql`).
+/// The accounting columns of one event (see `0003_cost_time.sql` and
+/// `0008_performance.sql`).
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct Fields {
     pub request_key: Option<String>,
@@ -27,53 +28,129 @@ pub(super) struct Fields {
     pub tool_uses: Option<String>,
     pub tool_results: Option<String>,
     pub prompt: Option<bool>,
+    pub notification_task: Option<String>,
+    pub notification_status: Option<String>,
+    pub message_to: Option<String>,
+    pub api_error: Option<String>,
+}
+
+impl Fields {
+    fn notified(text: Option<&str>) -> Self {
+        let (task, status) = text.and_then(notification).unzip();
+        Self {
+            notification_task: task,
+            notification_status: status,
+            ..Self::default()
+        }
+    }
 }
 
 /// Reads one record's accounting fields, as audit-lib's `add` and
-/// `timeRecord` read them.
+/// `timeRecord` read them, plus its task notification, SendMessage targets
+/// and API error.
 pub(super) fn fields(value: &Value) -> Fields {
-    let message = &value["message"];
-    let blocks = message["content"].as_array().map_or(&[][..], Vec::as_slice);
-    let of_type = |kind: &'static str| blocks.iter().filter(move |b| b["type"] == kind);
     match value["type"].as_str() {
-        Some("assistant") => {
-            let request_key = [&value["requestId"], &message["id"], &value["uuid"]]
-                .into_iter()
-                .find_map(|v| v.as_str().filter(|s| !s.is_empty()))
-                .map(str::to_string);
-            let tool_uses: Vec<Value> = of_type("tool_use")
-                .filter_map(|b| {
-                    let id = b["id"].as_str().filter(|s| !s.is_empty())?;
-                    Some(json!([id, b["name"].as_str()]))
-                })
-                .collect();
-            let usage = &message["usage"];
-            let model = message["model"]
-                .as_str()
-                .filter(|m| !m.is_empty() && *m != SYNTHETIC && usage.is_object());
-            let tokens = Usage::from_json(usage);
-            Fields {
-                request_key,
-                model: model.map(str::to_string),
-                usage: model.map(|_| usage.to_string()),
-                output_tokens: model.map(|_| tokens.output as i64),
-                cost_usd: model.and_then(|m| cost::prices().price(&tokens, m)),
-                tool_uses: (!tool_uses.is_empty()).then(|| Value::from(tool_uses).to_string()),
-                ..Fields::default()
-            }
-        }
-        Some("user") => {
-            let results: Vec<Option<&str>> = of_type("tool_result")
-                .map(|b| b["tool_use_id"].as_str())
-                .collect();
-            let prompt = (results.is_empty() && !truthy(&value["isMeta"])).then(|| is_human(value));
-            Fields {
-                tool_results: (!results.is_empty()).then(|| json!(results).to_string()),
-                prompt,
-                ..Fields::default()
-            }
+        Some("assistant") => assistant_fields(value),
+        Some("user") => user_fields(value),
+        Some("queue-operation") => Fields::notified(value["content"].as_str()),
+        Some("attachment") if value["attachment"]["type"] == "queued_command" => {
+            Fields::notified(value["attachment"]["prompt"].as_str())
         }
         _ => Fields::default(),
+    }
+}
+
+fn blocks(value: &Value) -> &[Value] {
+    value["message"]["content"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice)
+}
+
+fn assistant_fields(value: &Value) -> Fields {
+    let message = &value["message"];
+    let tool_uses = || blocks(value).iter().filter(|b| b["type"] == "tool_use");
+    let request_key = [&value["requestId"], &message["id"], &value["uuid"]]
+        .into_iter()
+        .find_map(|v| v.as_str().filter(|s| !s.is_empty()))
+        .map(str::to_string);
+    let uses: Vec<Value> = tool_uses()
+        .filter_map(|b| {
+            let id = b["id"].as_str().filter(|s| !s.is_empty())?;
+            Some(json!([id, b["name"].as_str()]))
+        })
+        .collect();
+    let to: Vec<&str> = tool_uses()
+        .filter(|b| b["name"] == "SendMessage")
+        .filter_map(|b| b["input"]["to"].as_str().filter(|s| !s.is_empty()))
+        .collect();
+    let usage = &message["usage"];
+    let model = message["model"]
+        .as_str()
+        .filter(|m| !m.is_empty() && *m != SYNTHETIC && usage.is_object());
+    let tokens = Usage::from_json(usage);
+    Fields {
+        request_key,
+        model: model.map(str::to_string),
+        usage: model.map(|_| usage.to_string()),
+        output_tokens: model.map(|_| tokens.output as i64),
+        cost_usd: model.and_then(|m| cost::prices().price(&tokens, m)),
+        tool_uses: (!uses.is_empty()).then(|| Value::from(uses).to_string()),
+        message_to: (!to.is_empty()).then(|| json!(to).to_string()),
+        api_error: truthy(&value["isApiErrorMessage"]).then(|| api_error(value).to_string()),
+        ..Fields::default()
+    }
+}
+
+/// An API error's kind, by its text: Claude Code reports an over-long
+/// context as "Prompt is too long".
+fn api_error(value: &Value) -> &'static str {
+    let text = message_text(value).to_ascii_lowercase();
+    if text.contains("prompt is too long") {
+        "prompt_too_long"
+    } else {
+        "other"
+    }
+}
+
+fn user_fields(value: &Value) -> Fields {
+    let results: Vec<Option<&str>> = blocks(value)
+        .iter()
+        .filter(|b| b["type"] == "tool_result")
+        .map(|b| b["tool_use_id"].as_str())
+        .collect();
+    let prompt = (results.is_empty() && !truthy(&value["isMeta"])).then(|| is_human(value));
+    // A prompt nobody typed may be a task notification.
+    let text = (prompt == Some(false)).then(|| message_text(value));
+    Fields {
+        tool_results: (!results.is_empty()).then(|| json!(results).to_string()),
+        prompt,
+        ..Fields::notified(text.as_deref())
+    }
+}
+
+/// The `<task-id>` and `<status>` of a text that is a task notification
+/// (starts with one); `None` for anything else, a notification quoted in
+/// prose or one with no status.
+fn notification(text: &str) -> Option<(String, String)> {
+    let body = text.trim_start().strip_prefix("<task-notification>")?;
+    let body = body.split("</task-notification>").next().unwrap_or(body);
+    let tag = |name: &str| {
+        let (_, rest) = body.split_once(&format!("<{name}>"))?;
+        let (inner, _) = rest.split_once(&format!("</{name}>"))?;
+        Some(inner.trim().to_string()).filter(|s| !s.is_empty())
+    };
+    Some((tag("task-id")?, tag("status")?))
+}
+
+/// A record's message text: its string content, or its text parts joined.
+fn message_text(value: &Value) -> String {
+    match &value["message"]["content"] {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .map(|p| p.as_str().or_else(|| p["text"].as_str()).unwrap_or(""))
+            .collect(),
+        _ => String::new(),
     }
 }
 
@@ -84,16 +161,9 @@ fn is_human(value: &Value) -> bool {
     if truthy(kind) {
         return kind == "human";
     }
-    let content = &value["message"]["content"];
-    let text = match content {
-        Value::String(s) => s.clone(),
-        Value::Array(parts) => parts
-            .iter()
-            .map(|p| p.as_str().or_else(|| p["text"].as_str()).unwrap_or(""))
-            .collect(),
-        _ => String::new(),
-    };
-    !text.trim_start().starts_with("<task-notification")
+    !message_text(value)
+        .trim_start()
+        .starts_with("<task-notification")
 }
 
 /// The sessions a batch of `session_id` can change: its own, and any other
@@ -168,8 +238,9 @@ fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
 /// What the stored fields and cells hold, under meta `rollup`. Bump it when
 /// [`fields`] or the cells gain something a store accounted by an older
 /// build lacks: the next open re-reads and recomputes everything once.
-/// 2: `audit_cells.ask_ms` (v8).
-const ROLLUP_VERSION: &str = "2";
+/// 2: `audit_cells.ask_ms`. 3: the notification, SendMessage and API-error
+/// event columns and the agents' outcome, follow-ups and context peak (v8).
+const ROLLUP_VERSION: &str = "3";
 
 /// Recomputes every rollup and audit cell unless the store was last
 /// accounted at the vendored prices, in `zone` (an IANA name) and at
@@ -202,7 +273,8 @@ fn reread_fields(conn: &Connection) -> Result<()> {
     loop {
         let rows: Vec<(i64, String)> = conn
             .prepare_cached(
-                "SELECT id, raw FROM events WHERE id > ?1 AND type IN ('assistant', 'user')
+                "SELECT id, raw FROM events
+                 WHERE id > ?1 AND type IN ('assistant', 'user', 'queue-operation', 'attachment')
                  ORDER BY id LIMIT 1000",
             )?
             .query_map([after], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -214,7 +286,9 @@ fn reread_fields(conn: &Connection) -> Result<()> {
             let f = fields(&serde_json::from_str(&raw).unwrap_or(Value::Null));
             conn.prepare_cached(
                 "UPDATE events SET request_key = ?2, model = ?3, usage = ?4, output_tokens = ?5,
-                     cost_usd = ?6, tool_uses = ?7, tool_results = ?8, prompt = ?9
+                     cost_usd = ?6, tool_uses = ?7, tool_results = ?8, prompt = ?9,
+                     notification_task = ?10, notification_status = ?11, message_to = ?12,
+                     api_error = ?13
                  WHERE id = ?1",
             )?
             .execute(params![
@@ -226,7 +300,11 @@ fn reread_fields(conn: &Connection) -> Result<()> {
                 f.cost_usd,
                 f.tool_uses,
                 f.tool_results,
-                f.prompt
+                f.prompt,
+                f.notification_task,
+                f.notification_status,
+                f.message_to,
+                f.api_error
             ])?;
         }
         after = last;
@@ -590,9 +668,12 @@ fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
     )?;
     let mut rows = stmt.query([session_id])?;
     let mut n = 0;
+    // Each agent's deepest request, as a % of its model's window.
+    let mut peaks: BTreeMap<Option<String>, f64> = BTreeMap::new();
     while let Some(r) = rows.next()? {
         let agent: Option<String> = r.get(0)?;
         let at: Option<String> = r.get(1)?;
+        let model: Option<String> = r.get(2)?;
         let usage: String = r.get(3)?;
         let window = match &agent {
             None => window_of(windows, r.get(5)?),
@@ -603,10 +684,17 @@ fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
             .and_then(time::parse_timestamp)
             .and_then(|ms| time::local_day(tz, ms));
         let usage = Usage::from_json(&serde_json::from_str(&usage).unwrap_or(Value::Null));
+        if let Some(pct) = model
+            .as_deref()
+            .and_then(|m| cost::context_pct(usage.depth(), m))
+        {
+            let peak = peaks.entry(agent.clone()).or_insert(pct);
+            *peak = peak.max(pct);
+        }
         buckets
             .entry((agent, window, day))
             .or_default()
-            .request(n, r.get(2)?, &usage, r.get(4)?);
+            .request(n, model, &usage, r.get(4)?);
         n += 1;
     }
     conn.prepare_cached("DELETE FROM audit_cells WHERE session_id = ?1")?
@@ -656,11 +744,11 @@ fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
         agent_ms
     ])?;
 
-    let agents: Vec<(i64, Option<String>)> = conn
-        .prepare_cached("SELECT id, agent_id FROM agents WHERE session_id = ?1")?
-        .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+    let agents: Vec<(i64, Option<String>, Option<String>)> = conn
+        .prepare_cached("SELECT id, agent_id, name FROM agents WHERE session_id = ?1")?
+        .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<Result<_>>()?;
-    for (id, agent_id) in agents {
+    for (id, agent_id, name) in agents {
         // The orchestrator runs over its own records and waits as long as
         // its session; a subagent's run is its own.
         let (run_ms, wait_ms) = match &agent_id {
@@ -704,8 +792,110 @@ fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
             depth.map(|d| d.0),
             depth.and_then(|d| d.1)
         ])?;
+        let (outcome, followups) = match &agent_id {
+            None => (None, None),
+            Some(a) => (
+                outcome(conn, session_id, a)?,
+                Some(followups(conn, session_id, a, name.as_deref())?),
+            ),
+        };
+        conn.prepare_cached(
+            "UPDATE agents SET outcome = ?2, followups = ?3, context_peak_pct = ?4 WHERE id = ?1",
+        )?
+        .execute(params![id, outcome, followups, peaks.get(&agent_id)])?;
     }
     Ok(())
+}
+
+/// A subagent's outcome: the worst status of its task notifications in its
+/// session (failed, then killed, then completed), and `blocked` when it
+/// completed with a `NEEDS_CONTEXT:` line in its final report. `None`
+/// when it was never notified (a background shell's notifications match no
+/// agent).
+fn outcome(conn: &Connection, session_id: &str, agent_id: &str) -> Result<Option<&'static str>> {
+    const WORST_FIRST: [&str; 3] = ["failed", "killed", "completed"];
+    let statuses: BTreeSet<String> = conn
+        .prepare_cached(
+            "SELECT DISTINCT notification_status FROM events
+             WHERE session_id = ?1 AND notification_task = ?2",
+        )?
+        .query_map([session_id, agent_id], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    let worst = WORST_FIRST.into_iter().find(|s| statuses.contains(*s));
+    if worst != Some("completed") {
+        return Ok(worst);
+    }
+    let blocked = final_report(conn, session_id, agent_id)?.is_some_and(|r| reports_blocked(&r));
+    Ok(Some(if blocked { "blocked" } else { "completed" }))
+}
+
+/// A subagent's final report: its last SubagentHandback message, else its
+/// last assistant text.
+fn final_report(conn: &Connection, session_id: &str, agent_id: &str) -> Result<Option<String>> {
+    let handback: Option<String> = conn
+        .prepare_cached(
+            r#"SELECT raw FROM events
+               WHERE session_id = ?1 AND agent_id = ?2 AND type = 'assistant'
+                 AND tool_uses LIKE '%"SubagentHandback"%'
+               ORDER BY byte_offset DESC LIMIT 1"#,
+        )?
+        .query_row([session_id, agent_id], |r| r.get(0))
+        .optional()?;
+    if let Some(raw) = handback {
+        let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+        let message = blocks(&value)
+            .iter()
+            .rev()
+            .filter(|b| b["type"] == "tool_use" && b["name"] == "SubagentHandback")
+            .find_map(|b| b["input"]["message"].as_str());
+        if let Some(m) = message {
+            return Ok(Some(m.to_string()));
+        }
+    }
+    let mut stmt = conn.prepare_cached(
+        r#"SELECT raw FROM events
+           WHERE session_id = ?1 AND agent_id = ?2 AND type = 'assistant'
+             AND raw LIKE '%"type":"text"%'
+           ORDER BY byte_offset DESC"#,
+    )?;
+    let mut rows = stmt.query([session_id, agent_id])?;
+    while let Some(r) = rows.next()? {
+        let value: Value = serde_json::from_str(&r.get::<_, String>(0)?).unwrap_or(Value::Null);
+        let text: String = blocks(&value)
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .filter_map(|b| b["text"].as_str())
+            .collect();
+        if !text.is_empty() {
+            return Ok(Some(text));
+        }
+    }
+    Ok(None)
+}
+
+/// A report with a line opening (past list, quote and emphasis marks) on
+/// `NEEDS_CONTEXT:`, the harness's blocked marker. A mention mid-line is
+/// not one.
+fn reports_blocked(report: &str) -> bool {
+    report.lines().any(|line| {
+        line.trim_start_matches(|c: char| c.is_whitespace() || "-*>_`#".contains(c))
+            .strip_prefix("NEEDS_CONTEXT")
+            .is_some_and(|rest| rest.trim_start_matches(['*', '_', '`']).starts_with(':'))
+    })
+}
+
+/// SendMessage calls anywhere in the session to the agent's id or name.
+fn followups(
+    conn: &Connection,
+    session_id: &str,
+    agent_id: &str,
+    name: Option<&str>,
+) -> Result<i64> {
+    conn.prepare_cached(
+        "SELECT count(*) FROM events AS e, json_each(e.message_to) AS t
+         WHERE e.session_id = ?1 AND e.message_to IS NOT NULL AND t.value IN (?2, ?3)",
+    )?
+    .query_row(params![session_id, agent_id, name], |r| r.get(0))
 }
 
 #[cfg(test)]
@@ -812,5 +1002,97 @@ mod tests {
             fields(&json!({"type": "system", "uuid": "u"})),
             Fields::default()
         );
+    }
+
+    const NOTE: &str = "<task-notification>\n<task-id>a1</task-id>\n<tool-use-id>toolu_1\
+        </tool-use-id>\n<status>failed</status>\n<summary>Lorem</summary>\n</task-notification>";
+
+    fn notified(v: Value) -> (Option<String>, Option<String>) {
+        let f = fields(&v);
+        (f.notification_task, f.notification_status)
+    }
+
+    #[test]
+    fn a_task_notification_is_read_from_each_of_its_carriers() {
+        let want = (Some("a1".to_string()), Some("failed".to_string()));
+        let queued = json!({"type": "queue-operation", "operation": "enqueue", "content": NOTE});
+        assert_eq!(notified(queued), want);
+        let attached = json!({"type": "attachment",
+            "attachment": {"type": "queued_command", "prompt": NOTE}});
+        assert_eq!(notified(attached), want);
+        let prompt = json!({"type": "user", "origin": {"kind": "task-notification"},
+            "message": {"content": NOTE}});
+        assert_eq!(notified(prompt), want);
+        let parts =
+            json!({"type": "user", "message": {"content": [{"type": "text", "text": NOTE}]}});
+        assert_eq!(notified(parts), want, "no origin: the text decides");
+    }
+
+    #[test]
+    fn a_quoted_or_incomplete_notification_is_not_one() {
+        let none = (None, None);
+        let snapshot = json!({"type": "attachment",
+            "attachment": {"type": "prompt_snapshot", "prompt": NOTE}});
+        assert_eq!(notified(snapshot), none);
+        let result = json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": NOTE}]}});
+        assert_eq!(notified(result), none);
+        let typed = json!({"type": "user", "origin": {"kind": "human"},
+            "message": {"content": format!("Lorem {NOTE}")}});
+        assert_eq!(notified(typed), none);
+        let quoted = json!({"type": "queue-operation", "content": format!("Lorem {NOTE}")});
+        assert_eq!(notified(quoted), none);
+        let no_status = "<task-notification>\n<task-id>a1</task-id>\n<summary>Lorem</summary>";
+        assert_eq!(
+            notified(json!({"type": "queue-operation", "content": no_status})),
+            none
+        );
+        let tool_use = json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": NOTE}}]}});
+        assert_eq!(notified(tool_use), none);
+    }
+
+    #[test]
+    fn send_messages_and_api_errors_are_read_from_assistant_records() {
+        let f = fields(&json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "SendMessage", "input": {"to": "a1"}},
+            {"type": "tool_use", "id": "toolu_2", "name": "SendMessage", "input": {"to": ""}},
+            {"type": "tool_use", "id": "toolu_3", "name": "Bash", "input": {"to": "a2"}},
+            {"type": "tool_use", "id": "toolu_4", "name": "SendMessage", "input": {"to": "lorem"}}
+        ]}}));
+        assert_eq!(f.message_to.as_deref(), Some(r#"["a1","lorem"]"#));
+        assert_eq!(f.api_error, None);
+        let error = |text: &str| {
+            fields(
+                &json!({"type": "assistant", "isApiErrorMessage": true, "error": "lorem",
+                "message": {"model": SYNTHETIC, "content": [{"type": "text", "text": text}]}}),
+            )
+            .api_error
+        };
+        assert_eq!(
+            error("Prompt is too long: 9 tokens > 8 maximum").as_deref(),
+            Some("prompt_too_long")
+        );
+        assert_eq!(error("API Error: lorem").as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn a_report_is_blocked_by_a_needs_context_line() {
+        for blocked in [
+            "NEEDS_CONTEXT: lorem",
+            "RESULT: lorem.\n- NEEDS_CONTEXT: lorem",
+            "  > **NEEDS_CONTEXT**: lorem",
+            "`NEEDS_CONTEXT: lorem`",
+        ] {
+            assert!(reports_blocked(blocked), "{blocked:?}");
+        }
+        for not in [
+            "RESULT: lorem, no NEEDS_CONTEXT: raised",
+            "NEEDS_CONTEXT lorem",
+            "NEEDS_CONTEXTUAL: lorem",
+            "",
+        ] {
+            assert!(!reports_blocked(not), "{not:?}");
+        }
     }
 }
