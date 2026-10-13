@@ -113,3 +113,18 @@ fn a_typed_prefix_with_no_repo_left_is_an_untyped_name() {
     assert_eq!(parsed("ticket-51"), ("ticket".into(), 51, None));
     assert_eq!(parsed("epic-9-s1"), ("epic".into(), 9, Some(1)));
 }
+
+#[test]
+fn a_repo_github_cannot_hold_does_not_parse() {
+    // A pasted launch line as a window name: no guessing at the repo.
+    for name in [
+        "claude -n ticket-lorem-dolor-180",
+        "claude -n lorem-180",
+        "ticket-lorem ipsum-3",
+        "lorem/ipsum-4",
+        "lörem-5",
+    ] {
+        assert_eq!(parse_name(name), None, "{name:?}");
+    }
+    assert_eq!(parsed("Lorem_ip.sum-6"), ("Lorem_ip.sum".into(), 6, None));
+}
