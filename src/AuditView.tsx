@@ -1,7 +1,8 @@
-// The full-screen Audit view (#27): its own header with "‹ Live", the control bar, the headline
-// KPIs, a daily chart stacked by repo, the tree table and, docked below, the selected row's
-// timeline. It stays mounted while hidden, like LiveShell, reads nothing then, and takes focus
-// each time it is shown.
+// The full-screen Audit view (#27): one bar (the "Audit" heading, the controls, Refresh GitHub,
+// Export CSV and "‹ Live"), the headline KPIs, a daily chart stacked by repo, the tree table and,
+// docked below, the selected row's timeline. It stays mounted while hidden, like LiveShell, reads
+// nothing then, and takes focus each time it is shown. It reads when shown, when a control changes
+// and after Refresh GitHub, never on a store change or a timer.
 import {
   Alert,
   AlertDescription,
@@ -30,7 +31,6 @@ import { AuditDetail } from './AuditDetail'
 import { AuditTable } from './AuditTable'
 import { toCsv } from './csv'
 import { duration, money } from './format'
-import { useStoreVersion } from './hooks'
 import { useAudit } from './useAudit'
 
 interface AuditViewProps {
@@ -53,11 +53,30 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
   useEffect(() => {
     if (!hidden) (headingRef.current as HTMLHeadingElement).focus()
   }, [hidden])
+  // Moving it rereads what is shown: each time Audit is shown, and after a GitHub refresh.
+  const [version, setVersion] = useState(0)
+  const [wasHidden, setWasHidden] = useState(hidden)
+  if (hidden !== wasHidden) {
+    setWasHidden(hidden)
+    if (!hidden) setVersion((v) => v + 1)
+  }
+  const [github, setGithub] = useState({ busy: false, error: null as string | null })
+  // auditRefresh resolves once the fetch is stored, so the reread after it sees the new rows.
+  const refreshGithub = async () => {
+    setGithub({ busy: true, error: null })
+    try {
+      await auditRefresh()
+      setGithub({ busy: false, error: null })
+      setVersion((v) => v + 1)
+    } catch (e) {
+      setGithub({ busy: false, error: String(e) })
+    }
+  }
 
   const [controls, setControls] = useState(START)
   // The selected row, for the row detail. A path means nothing under another grouping.
   const [selected, setSelected] = useState<{ path: AuditPath; label: string } | null>(null)
-  // Stable, so the memoized table skips the rerender a store change brings.
+  // Stable, so the memoized table skips rerenders that change none of its props.
   const select = useCallback(
     (path: AuditPath, label: string) =>
       setSelected((s) => (s && samePath(s.path, path) ? null : { path, label })),
@@ -74,17 +93,16 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
     controls.range === 'custom'
       ? controls.custom
       : lastDays(PRESET_DAYS[controls.range], new Date())
-  const storeVersion = useStoreVersion()
   const filter: AuditFilter = {
     ...days,
     repos: controls.repo === null ? [] : [controls.repo],
     groupBy: controls.groupBy,
   }
   // Every repo, so the repo select lists them all; the chart narrows to the picked one itself.
-  const daily = useAudit({ ...days, repos: [], groupBy: 'day' }, !hidden, storeVersion)
+  const daily = useAudit({ ...days, repos: [], groupBy: 'day' }, !hidden, version)
   // By day over every repo, the table's rollup is the chart's, so one read serves both.
   const sameRead = controls.groupBy === 'day' && controls.repo === null
-  const own = useAudit(filter, !hidden && !sameRead, storeVersion)
+  const own = useAudit(filter, !hidden && !sameRead, version)
   const main = sameRead ? daily : own
   const chart = useMemo(
     () =>
@@ -119,33 +137,44 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
 
   return (
     <div hidden={hidden} className="flex h-screen flex-col bg-background text-foreground">
-      <header className="flex h-12 flex-none items-center gap-3 border-b border-border bg-surface px-3">
-        <Button variant="ghost" size="sm" onClick={onBack} className="gap-1">
-          <ChevronLeft aria-hidden className="size-4" />
-          Live
-        </Button>
-        <h1
-          ref={headingRef}
-          tabIndex={-1}
-          className="text-sm font-bold tracking-tight outline-none"
-        >
-          Audit
-        </h1>
-      </header>
       <AuditControls
+        title={
+          <h1
+            ref={headingRef}
+            tabIndex={-1}
+            className="pl-1 text-sm font-bold tracking-tight outline-none"
+          >
+            Audit
+          </h1>
+        }
         value={controls}
         days={days}
         onChange={change}
         repos={repos}
         actions={
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={main.audit === null || main.pending}
-            onClick={() => void exportCsv()}
-          >
-            Export CSV
-          </Button>
+          <>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={github.busy}
+              onClick={() => void refreshGithub()}
+            >
+              {github.busy ? 'Refreshing…' : 'Refresh GitHub'}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={main.audit === null || main.pending}
+              onClick={() => void exportCsv()}
+            >
+              Export CSV
+            </Button>
+            {/* "‹ Live" sits where the live header's Audit button does, so the two swap in place. */}
+            <Button variant="outline" size="sm" onClick={onBack} className="gap-1.5">
+              <ChevronLeft aria-hidden className="size-3.5" />
+              Live
+            </Button>
+          </>
         }
       />
       <ResizablePanelGroup id="strate-audit" orientation="vertical" className="min-h-0 flex-1">
@@ -157,6 +186,11 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
             {exportError !== null && (
               <Alert variant="destructive">
                 <AlertDescription>Export failed: {exportError}</AlertDescription>
+              </Alert>
+            )}
+            {github.error !== null && (
+              <Alert variant="destructive">
+                <AlertDescription>GitHub refresh failed: {github.error}</AlertDescription>
               </Alert>
             )}
             {main.error !== null && (
@@ -214,7 +248,7 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
                 path={shown.path}
                 label={shown.label}
                 active={!hidden}
-                storeVersion={storeVersion}
+                version={version}
                 onClose={closeDetail}
               />
             </ResizablePanel>
@@ -225,30 +259,13 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
   )
 }
 
-/** The repos whose GitHub data is missing or stale, and a Refresh that asks for it again. */
+/** The repos whose GitHub data is missing or stale; the control bar's Refresh GitHub asks again. */
 function GithubBanner({ errors }: { errors: GithubError[] }) {
-  const [refresh, setRefresh] = useState<{ busy: boolean; error: string | null }>({
-    busy: false,
-    error: null,
-  })
-  const ask = async () => {
-    setRefresh({ busy: true, error: null })
-    try {
-      await auditRefresh()
-      setRefresh({ busy: false, error: null })
-    } catch (e) {
-      setRefresh({ busy: false, error: String(e) })
-    }
-  }
   return (
-    <Alert variant="warning" className="flex items-start gap-3">
-      <AlertDescription className="flex-1">
+    <Alert variant="warning">
+      <AlertDescription>
         GitHub data is missing or stale for {errors.map((e) => `${e.repo}: ${e.error}`).join('; ')}.
-        {refresh.error !== null && <span>{` Refresh failed: ${refresh.error}`}</span>}
       </AlertDescription>
-      <Button variant="outline" size="sm" disabled={refresh.busy} onClick={() => void ask()}>
-        {refresh.busy ? 'Refreshing…' : 'Refresh'}
-      </Button>
     </Alert>
   )
 }

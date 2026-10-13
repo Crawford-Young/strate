@@ -99,13 +99,14 @@ fn timeline(
     reader.read(|conn| views::audit_timeline(conn, filter, path))
 }
 
-/// Asks the engine to refresh the GitHub cache and returns at once; the
-/// webview refetches on [`STORE_CHANGED`] when it lands. Requests during a
-/// refresh coalesce into one more after it, and no GitHub failure is an
-/// error here (it is stored per repo).
-#[tauri::command]
+/// Asks the engine to refresh the GitHub cache and resolves once the fetch
+/// covering the request is stored (at once with GitHub off or no repos), so
+/// the webview rereads Audit then. Requests during a refresh coalesce into
+/// one more after it, and no GitHub failure is an error here (it is stored
+/// per repo). The wait runs off the UI thread (`async`).
+#[tauri::command(async)]
 pub fn audit_refresh(refresher: State<'_, Refresher>) {
-    refresher.request();
+    refresher.refresh();
 }
 
 /// The Audit CSV export: asks where to save it in a native save dialog

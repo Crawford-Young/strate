@@ -34,15 +34,15 @@ interface Props {
   version: number
 }
 
-/** The hook under `props`, plus `storeChanged`, which bumps the store version as the event does. */
+/** The hook under `props`, plus `bump`, which moves `version` as Audit does on show and refresh. */
 function setup(filter: AuditFilter, active: boolean) {
   let props: Props = { filter, active, version: 0 }
   const hook = renderHook((p: Props) => useAudit(p.filter, p.active, p.version), {
     initialProps: props,
   })
   const rerender = (next: Partial<Props>) => hook.rerender((props = { ...props, ...next }))
-  const storeChanged = () => rerender({ version: props.version + 1 })
-  return { result: hook.result, unmount: hook.unmount, rerender, storeChanged }
+  const bump = () => rerender({ version: props.version + 1 })
+  return { result: hook.result, unmount: hook.unmount, rerender, bump }
 }
 
 describe('useAudit', () => {
@@ -66,11 +66,11 @@ describe('useAudit', () => {
     expect(result.current.pending).toBe(false)
   })
 
-  it('reads nothing while inactive, store changes included, and reads at once on activation', async () => {
-    const { result, rerender, storeChanged } = setup(week, false)
+  it('reads nothing while inactive, version bumps included, and reads at once on activation', async () => {
+    const { result, rerender, bump } = setup(week, false)
     await settle()
-    for (let i = 0; i < 5; i++) act(() => storeChanged())
-    await act(() => vi.advanceTimersByTimeAsync(5_000))
+    for (let i = 0; i < 5; i++) act(() => bump())
+    await settle()
     expect(rollupMock).not.toHaveBeenCalled()
     rerender({ filter: week, active: true })
     await settle()
@@ -78,19 +78,17 @@ describe('useAudit', () => {
     expect(shown(result)).toBe('hierarchy#1')
   })
 
-  it('turns a burst of store changes into one trailing read, 1 s after the last', async () => {
-    const { result, storeChanged } = setup(week, true)
+  it('rereads the shown filter at once when the version moves, and never on its own', async () => {
+    const { result, bump } = setup(week, true)
     await settle()
-    for (let i = 0; i < 10; i++) {
-      act(() => storeChanged())
-      await act(() => vi.advanceTimersByTimeAsync(100))
-    }
+    await act(() => vi.advanceTimersByTimeAsync(60_000))
     expect(rollupMock).toHaveBeenCalledTimes(1)
-    await act(() => vi.advanceTimersByTimeAsync(899))
-    expect(rollupMock).toHaveBeenCalledTimes(1)
-    await act(() => vi.advanceTimersByTimeAsync(1))
+    act(() => bump())
+    expect(result.current.pending).toBe(true)
+    await settle()
     expect(rollupMock).toHaveBeenCalledTimes(2)
     expect(shown(result)).toBe('hierarchy#2')
+    expect(result.current.pending).toBe(false)
   })
 
   it('serves a filter seen before from its cache, without a read', async () => {
@@ -106,12 +104,12 @@ describe('useAudit', () => {
   })
 
   it('shows a stale cached filter while it rereads', async () => {
-    const { result, rerender, storeChanged } = setup(week, true)
+    const { result, rerender, bump } = setup(week, true)
     await settle()
     rerender({ filter: byDay, active: true })
     await settle()
-    act(() => storeChanged())
-    await act(() => vi.advanceTimersByTimeAsync(1_000))
+    act(() => bump())
+    await settle()
     expect(rollupMock).toHaveBeenCalledTimes(3)
     rerender({ filter: week, active: true })
     expect(shown(result)).toBe('hierarchy#1')
@@ -121,11 +119,11 @@ describe('useAudit', () => {
   })
 
   it('rereads a filter that went stale while hidden as soon as it is shown again', async () => {
-    const { result, rerender, storeChanged } = setup(week, true)
+    const { result, rerender, bump } = setup(week, true)
     await settle()
     rerender({ filter: week, active: false })
-    act(() => storeChanged())
-    await act(() => vi.advanceTimersByTimeAsync(1_000))
+    act(() => bump())
+    await settle()
     expect(rollupMock).toHaveBeenCalledTimes(1)
     rerender({ filter: week, active: true })
     await settle()
@@ -138,13 +136,13 @@ describe('useAudit', () => {
     rollupMock.mockImplementationOnce(
       () => new Promise((r) => (landOld = () => r(audit([node('repo', 'old')])))),
     )
-    const { result, rerender, storeChanged } = setup(week, true)
+    const { result, rerender, bump } = setup(week, true)
     await settle()
-    // Away to another filter while the first read hangs, a store change, then back: a new read.
+    // Away to another filter while the first read hangs, a version bump, then back: a new read.
     rerender({ filter: byDay })
     await settle()
-    act(() => storeChanged())
-    await act(() => vi.advanceTimersByTimeAsync(1_000))
+    act(() => bump())
+    await settle()
     rerender({ filter: week })
     await settle()
     expect(shown(result)).toBe('hierarchy#4')
@@ -173,7 +171,7 @@ describe('useAudit', () => {
   })
 
   describe('a reread queued behind a slow read', () => {
-    /** A read in flight, with a store change queued behind it. */
+    /** A read in flight, with a version bump queued behind it. */
     async function queued() {
       let land!: () => void
       rollupMock.mockImplementationOnce(
@@ -181,8 +179,8 @@ describe('useAudit', () => {
       )
       const hook = setup(week, true)
       await settle()
-      act(() => hook.storeChanged())
-      await act(() => vi.advanceTimersByTimeAsync(1_000))
+      act(() => hook.bump())
+      await settle()
       return { ...hook, land: () => act(async () => land()) }
     }
 

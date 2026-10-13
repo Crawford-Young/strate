@@ -441,11 +441,9 @@ fn requests_during_a_refresh_coalesce_and_never_block_the_other_sources() {
     wait_for_window(&temp);
 
     let refresher = engine.refresher();
-    refresher.request();
+    let first = refresher.request();
     wait_for("the fetch to start", || queries.load(Ordering::SeqCst) == 1);
-    for _ in 0..5 {
-        refresher.request();
-    }
+    let during: Vec<_> = (0..5).map(|_| refresher.request()).collect();
     // The held fetch blocks neither ingest nor discovery.
     temp.write(
         "s-beta.jsonl",
@@ -456,6 +454,7 @@ fn requests_during_a_refresh_coalesce_and_never_block_the_other_sources() {
         views::workstreams(&reader).expect("workstreams").len() == 2
     });
     assert!(cached_repos(&temp).is_empty(), "still fetching");
+    assert!(first.try_recv().is_err(), "not done while its fetch runs");
 
     release.send(()).expect("release");
     wait_for("alpha cached", || {
@@ -465,7 +464,14 @@ fn requests_during_a_refresh_coalesce_and_never_block_the_other_sources() {
     });
     // The five requests made during the fetch run once more, after it.
     wait_for("the trailing fetch", || queries.load(Ordering::SeqCst) == 2);
+    assert!(
+        during.iter().all(|d| d.try_recv().is_err()),
+        "a request made during a fetch waits for the one after it"
+    );
     release.send(()).expect("release the trailing fetch");
+    let done = Duration::from_secs(10);
+    assert_eq!(first.recv_timeout(done), Ok(()));
+    assert!(during.iter().all(|d| d.recv_timeout(done) == Ok(())));
     thread::sleep(Duration::from_millis(300));
     assert_eq!(
         queries.load(Ordering::SeqCst),
@@ -547,13 +553,15 @@ fn a_failing_or_missing_gh_is_recorded_per_repo_and_the_engine_carries_on() {
     });
     engine.stop();
 
-    // No gh configured: a request is dropped quietly.
+    // No gh configured: a request is done at once, and one after the engine
+    // stopped never blocks.
     let off = Temp::new("gh-off");
     off.write("s-alpha.jsonl", &session_lines());
     let (_changes, on_change) = counter();
     let engine = Engine::start(off.config(None, None), on_change).expect("start");
     let refresher = engine.refresher();
-    refresher.request();
+    refresher.refresh();
     engine.stop();
-    refresher.request();
+    assert!(refresher.request().recv().is_err());
+    refresher.refresh();
 }

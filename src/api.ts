@@ -237,8 +237,8 @@ export const writeExport = (text: string, suggestedName: string) =>
   invoke<boolean>('write_export', { text, suggestedName })
 
 /**
- * Asks the engine to refresh the GitHub cache and resolves at once; refetch
- * on `store-changed` when it lands. A missing or failing `gh` is not an
+ * Asks the engine to refresh the GitHub cache and resolves once the fetch is
+ * stored, so a read after it sees the new rows. A missing or failing `gh` is not an
  * error: its repos show in `Audit.githubErrors`, their issues with no GitHub data.
  */
 export const auditRefresh = (): Promise<void> => invoke('audit_refresh')

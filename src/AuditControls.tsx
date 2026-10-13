@@ -1,5 +1,6 @@
-// The Audit control bar: date range, repo, group by and the chart's $ / hours toggle. `actions`
-// sits at its right end (Export CSV, #27 U2).
+// The Audit view's only bar: `title` at its left start, then date range, repo, group by and the
+// chart's $ / hours toggle, with `actions` at its right end (Refresh GitHub, Export CSV and
+// "‹ Live", #27 U2). Its box matches the live header's, so "‹ Live" lands where Audit was.
 import {
   DateRangePicker,
   Select,
@@ -47,12 +48,22 @@ interface AuditControlsProps {
   days: { from: string; to: string }
   onChange: (patch: Partial<Controls>) => void
   repos: string[]
+  /** The view's heading, first in the bar. */
+  title?: ReactNode
   actions?: ReactNode
 }
 
-export function AuditControls({ value, days, onChange, repos, actions }: AuditControlsProps) {
+export function AuditControls({
+  value,
+  days,
+  onChange,
+  repos,
+  title,
+  actions,
+}: AuditControlsProps) {
   return (
-    <div className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-2">
+    <div className="flex min-h-12 flex-none flex-wrap items-center gap-3 border-b border-border bg-surface px-3 py-2">
+      {title}
       <ToggleGroup
         type="single"
         variant="outline"

@@ -21,7 +21,7 @@ vi.mock('./api', () => ({
   writeExport: vi.fn(),
   onStoreChanged: vi.fn(),
 }))
-// Spied, to see what a store change while hidden recomputes.
+// Spied, to see what a rerender recomputes.
 vi.mock('./audit', async (importOriginal) => {
   const real = await importOriginal<typeof import('./audit')>()
   return { ...real, dailyChart: vi.fn(real.dailyChart), compact: vi.fn(real.compact) }
@@ -42,9 +42,11 @@ const rollupMock = vi.mocked(auditRollup)
 const refreshMock = vi.mocked(auditRefresh)
 const timelineMock = vi.mocked(auditTimeline)
 const writeMock = vi.mocked(writeExport)
-// Every store-changed listener; the event reaches them all.
+// Every store-changed listener; the event reaches them all. Audit should add none.
 let listeners: (() => void)[] = []
 const storeChanged = () => act(() => listeners.forEach((listener) => listener()))
+/** Lets settled reads land. */
+const flush = () => act(() => new Promise<void>((r) => setTimeout(r, 0)))
 
 const HOUR = 3_600_000
 const DAY = 24 * HOUR
@@ -176,14 +178,29 @@ const tableRows = () =>
     .map((r) => r.querySelector('[aria-pressed]')?.textContent)
 
 describe('loading', () => {
-  it('recomputes no chart or table on store changes while hidden', async () => {
-    const { rerender } = await show()
-    rerender(<AuditView hidden onBack={() => {}} />)
-    const charts = vi.mocked(dailyChart).mock.calls.length
-    const cells = vi.mocked(compact).mock.calls.length
+  it('reads each rollup once on show, and never again on a store change', async () => {
+    await show()
+    await flush()
+    expect(calls(() => true)).toHaveLength(2)
     for (let i = 0; i < 3; i++) storeChanged()
-    expect(vi.mocked(dailyChart).mock.calls.length).toBe(charts)
-    expect(vi.mocked(compact).mock.calls.length).toBe(cells)
+    await flush()
+    expect(onStoreChanged).not.toHaveBeenCalled()
+    expect(calls(() => true)).toHaveLength(2)
+  })
+
+  it('rereads each rollup, and the selected row, each time it is shown again', async () => {
+    const { rerender } = await show()
+    fireEvent.click(screen.getByRole('button', { name: 'acme/api' }))
+    await flush()
+    expect([calls(() => true).length, timelineMock.mock.calls.length]).toEqual([2, 1])
+    rerender(<AuditView hidden onBack={() => {}} />)
+    await flush()
+    expect([calls(() => true).length, timelineMock.mock.calls.length]).toEqual([2, 1])
+    rerender(<AuditView hidden={false} onBack={() => {}} />)
+    await flush()
+    expect(calls((g) => g === 'day')).toHaveLength(2)
+    expect(treeCalls()).toHaveLength(2)
+    expect(timelineMock).toHaveBeenCalledTimes(2)
   })
 
   it('reads nothing while hidden', async () => {
@@ -326,7 +343,7 @@ describe('headline', () => {
     expect(await screen.findByText(/Cloud sessions are not counted/)).toBeInTheDocument()
   })
 
-  it('warns about repos with no GitHub data and refreshes it on request', async () => {
+  it('warns about repos with no GitHub data', async () => {
     rollupMock.mockImplementation((f) =>
       Promise.resolve(
         f.groupBy === 'day'
@@ -335,29 +352,79 @@ describe('headline', () => {
       ),
     )
     render(<AuditView hidden={false} onBack={() => {}} />)
-    const banner = await screen.findByRole('alert')
-    expect(banner).toHaveTextContent('acme/web: gh: not logged in')
-    fireEvent.click(within(banner).getByRole('button', { name: 'Refresh' }))
-    expect(refreshMock).toHaveBeenCalledOnce()
+    expect(await screen.findByRole('alert')).toHaveTextContent('acme/web: gh: not logged in')
+  })
+})
+
+describe('GitHub refresh', () => {
+  const refreshButton = () => screen.getByRole('button', { name: /^Refresh(ing…| GitHub)$/ })
+
+  it('never asks on its own: not on show, window focus or showing again', async () => {
+    const { rerender } = await show()
+    act(() => void window.dispatchEvent(new Event('focus')))
+    rerender(<AuditView hidden onBack={() => {}} />)
+    rerender(<AuditView hidden={false} onBack={() => {}} />)
+    await flush()
+    expect(refreshMock).not.toHaveBeenCalled()
   })
 
-  it('turns Refresh off while it is asked for, and reports a failure', async () => {
-    rollupMock.mockImplementation((f) =>
-      Promise.resolve(
-        f.groupBy === 'day'
-          ? byDay
-          : { ...tree, githubErrors: [{ repo: 'acme/web', error: 'gh: not logged in' }] },
-      ),
-    )
+  it('is busy until the refresh is stored, then rereads each shown rollup and the row once', async () => {
+    await show()
+    fireEvent.click(screen.getByRole('button', { name: 'acme/api' }))
+    await flush()
+    let stored!: () => void
+    refreshMock.mockReturnValue(new Promise((r) => (stored = r)))
+    fireEvent.click(refreshButton())
+    expect(refreshMock).toHaveBeenCalledOnce()
+    expect(refreshButton()).toHaveTextContent('Refreshing…')
+    expect(refreshButton()).toBeDisabled()
+    await flush()
+    expect([calls(() => true).length, timelineMock.mock.calls.length]).toEqual([2, 1])
+    await act(async () => stored())
+    await flush()
+    expect(refreshButton()).toHaveTextContent('Refresh GitHub')
+    expect(refreshButton()).toBeEnabled()
+    expect(calls((g) => g === 'day')).toHaveLength(2)
+    expect(treeCalls()).toHaveLength(2)
+    expect(timelineMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('rereads the one shared rollup once when the table is by day over every repo', async () => {
+    await show()
+    await choose('Group by', 'Day')
+    await flush()
+    const before = calls(() => true).length
+    fireEvent.click(refreshButton())
+    await flush()
+    expect(calls(() => true)).toHaveLength(before + 1)
+  })
+
+  it('reports a failure, rereads nothing, and clears the report on the next try', async () => {
+    await show()
+    await flush()
     let fail!: (e: string) => void
-    refreshMock.mockReturnValue(new Promise((_, reject) => (fail = reject)))
-    render(<AuditView hidden={false} onBack={() => {}} />)
-    const refresh = await screen.findByRole('button', { name: 'Refresh' })
-    fireEvent.click(refresh)
-    expect(screen.getByRole('button', { name: 'Refreshing…' })).toBeDisabled()
+    refreshMock.mockReturnValueOnce(new Promise((_, reject) => (fail = reject)))
+    fireEvent.click(refreshButton())
     await act(async () => fail('no engine'))
-    expect(screen.getByText('Refresh failed: no engine')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled()
+    await flush()
+    expect(screen.getByRole('alert')).toHaveTextContent('GitHub refresh failed: no engine')
+    expect(refreshButton()).toBeEnabled()
+    expect(calls(() => true)).toHaveLength(2)
+    fireEvent.click(refreshButton())
+    await flush()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('recomputes no chart or table while it is busy', async () => {
+    await show()
+    await flush()
+    refreshMock.mockReturnValue(new Promise(() => {}))
+    const charts = vi.mocked(dailyChart).mock.calls.length
+    const cells = vi.mocked(compact).mock.calls.length
+    fireEvent.click(refreshButton())
+    expect(refreshButton()).toBeDisabled()
+    expect(vi.mocked(dailyChart).mock.calls.length).toBe(charts)
+    expect(vi.mocked(compact).mock.calls.length).toBe(cells)
   })
 })
 
@@ -732,10 +799,19 @@ describe('export', () => {
   })
 })
 
-describe('header', () => {
-  it('goes back to the live view with ‹ Live', async () => {
+describe('control bar', () => {
+  it('is the only bar: the Audit heading at its start, ‹ Live at its end, going back', async () => {
     const onBack = vi.fn()
     await show({ onBack })
+    expect(screen.queryByRole('banner')).toBeNull()
+    const heading = screen.getByRole('heading', { level: 1, name: 'Audit' })
+    const bar = heading.parentElement as HTMLElement
+    expect(bar.firstElementChild).toBe(heading)
+    expect(within(bar).getByRole('radio', { name: '7d' })).toBeInTheDocument()
+    const buttons = within(bar)
+      .getAllByRole('button')
+      .map((b) => b.textContent)
+    expect(buttons.slice(-3)).toEqual(['Refresh GitHub', 'Export CSV', 'Live'])
     fireEvent.click(screen.getByRole('button', { name: 'Live' }))
     expect(onBack).toHaveBeenCalledOnce()
   })
