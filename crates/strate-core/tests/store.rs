@@ -1158,3 +1158,63 @@ fn an_empty_title_or_agent_name_is_no_name() {
         .expect("count");
     assert_eq!(empty, 0, "an empty customTitle is stored as no title");
 }
+
+/// A cold scan of an original transcript and its resume, which replays the
+/// original's records (stamps unchanged) and then adds its own. Returns the
+/// session each uuid is stored under.
+fn replay_owners(name: &str, original: &str, resume: &str) -> Vec<(String, String)> {
+    let tmp = Temp::new(name);
+    let root = tmp.0.join("claude");
+    let dir = root.join("projects/-work-x");
+    fs::create_dir_all(&dir).expect("project dir");
+    let line = |uuid: &str, stamp: &str| {
+        json!({"type": "user", "uuid": uuid, "timestamp": stamp, "cwd": "/work/x"}).to_string()
+    };
+    let replayed = [
+        line("u1", "2026-01-01T00:00:00.000Z"),
+        line("u2", "2026-01-01T00:01:00.000Z"),
+    ];
+    fs::write(
+        dir.join(format!("{original}.jsonl")),
+        format!("{}\n", replayed.join("\n")),
+    )
+    .expect("original");
+    fs::write(
+        dir.join(format!("{resume}.jsonl")),
+        format!(
+            "{}\n{}\n",
+            replayed.join("\n"),
+            line("u3", "2026-01-01T00:09:00.000Z")
+        ),
+    )
+    .expect("resume");
+    let mut store = Store::open(tmp.db()).expect("open");
+    ingest_root(&mut store, &root);
+    let conn = reader(&tmp.db());
+    let mut stmt = conn
+        .prepare("SELECT uuid, session_id FROM events ORDER BY uuid")
+        .expect("prepare");
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("query")
+        .map(|o| o.expect("owner"))
+        .collect()
+}
+
+#[test]
+fn a_replayed_uuid_stays_with_the_original_whatever_the_names_sort_to() {
+    let owners = |pairs: [(&str, &str); 3]| -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(u, s)| (u.to_string(), s.to_string()))
+            .collect()
+    };
+    // The resume's name sorts first, so name order reads it first.
+    assert_eq!(
+        replay_owners("replay-resume-first", "s2", "s1"),
+        owners([("u1", "s2"), ("u2", "s2"), ("u3", "s1")])
+    );
+    assert_eq!(
+        replay_owners("replay-original-first", "s1", "s2"),
+        owners([("u1", "s1"), ("u2", "s1"), ("u3", "s2")])
+    );
+}
