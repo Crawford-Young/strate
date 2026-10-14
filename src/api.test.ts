@@ -92,7 +92,6 @@ describe('commands', () => {
           unpriced: 0,
           tokens: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 },
           agentMs: 180000,
-          approximate: true,
           activeMs: 470000,
           waitMs: 295000,
           sessions: 1,

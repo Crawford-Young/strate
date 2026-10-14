@@ -121,8 +121,6 @@ export interface Metrics {
   tokens: Tokens
   /** Agent-hours: subagent wall time. */
   agentMs: number
-  /** Some of `agentMs` is a background subagent's, timed approximately (#42). */
-  approximate: boolean
   activeMs: number
   /** Waiting on you. */
   waitMs: number

@@ -320,7 +320,6 @@ impl Node {
         m.unpriced += s.unpriced;
         m.tokens.add(&s.tokens);
         m.agent_ms += s.agent_ms;
-        m.approximate |= s.approximate;
         let Time {
             active_ms, wait_ms, ..
         } = if self.step.kind == NodeKind::Agent {

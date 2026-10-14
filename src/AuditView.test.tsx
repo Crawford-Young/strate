@@ -64,21 +64,16 @@ const DAY = 24 * HOUR
 // name), acme/api, then Unlinked, which costs the most so a sort would move it if it could.
 const tree: Audit = audit(
   [
-    node(
-      'repo',
-      'acme/web',
-      { costUsd: 6.5, unpriced: 2, agentMs: 3 * HOUR, approximate: true, activeMs: 2 * HOUR },
-      [
-        node(
-          'epic',
-          '10',
-          { costUsd: 4, progress: { completed: 1, total: 2 }, elapsedMs: 2 * DAY, open: true },
-          [node('issue', '11', { costUsd: 4 }, [], { label: '#11 Fix', github: true })],
-          { label: '#10 Epic', github: true },
-        ),
-        node('issue', '13', { costUsd: 2.5 }, [], { label: '#13 Guess' }),
-      ],
-    ),
+    node('repo', 'acme/web', { costUsd: 6.5, unpriced: 2, agentMs: 3 * HOUR, activeMs: 2 * HOUR }, [
+      node(
+        'epic',
+        '10',
+        { costUsd: 4, progress: { completed: 1, total: 2 }, elapsedMs: 2 * DAY, open: true },
+        [node('issue', '11', { costUsd: 4 }, [], { label: '#11 Fix', github: true })],
+        { label: '#10 Epic', github: true },
+      ),
+      node('issue', '13', { costUsd: 2.5 }, [], { label: '#13 Guess' }),
+    ]),
     node('repo', 'acme/api', {
       costUsd: 1,
       tokens: { input: 1000, output: 200, cacheRead: 3000, cacheWrite: 300 },
@@ -642,7 +637,7 @@ describe('tree table', () => {
     ])
   })
 
-  it('marks issues with no GitHub data, approximate agent-hours, open elapsed and unpriced $', async () => {
+  it('marks issues with no GitHub data, open elapsed and unpriced $, and agent-hours as measured', async () => {
     await show()
     fireEvent.click(screen.getByRole('button', { name: 'Expand repo acme/web' }))
     const guess = within(tableRow(/#13 Guess/))
@@ -651,7 +646,9 @@ describe('tree table', () => {
     const web = within(tableRow(/^acme\/web/))
       .getAllByRole('cell')
       .map((c) => c.textContent)
-    expect(web[3]).toBe('≈3h 0m')
+    // Background agent-hours are measured like foreground ones: no estimate marker (#60).
+    expect(web[3]).toBe('3h 0m')
+    expect(screen.queryByText(/≈/)).toBeNull()
     expect(web[5]).toBe('$6.50 +2 unpriced')
     const epic = within(tableRow(/#10 Epic/))
       .getAllByRole('cell')
