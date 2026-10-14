@@ -256,6 +256,9 @@ areply() { # time uuid requestId model usage content-block
 ameta() { # agentType toolUseId
   echo "{\"agentType\":\"$1\",\"description\":\"Lorem task\",\"toolUseId\":\"$2\",\"spawnDepth\":1,\"requestShape\":\"agent\",\"requestNonInteractive\":true,\"model\":\"claude-sonnet-5-5\"}"
 }
+alaunch() { # time uuid toolUseId agentId: a background dispatch's immediate launch result
+  aenv "$1" "$2"; echo "{$AE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"$3\",\"content\":[{\"type\":\"text\",\"text\":\"Async agent launched successfully.\\nagentId: $4 (lorem ipsum)\"}]}]},\"toolUseResult\":{\"isAsync\":true,\"status\":\"async_launched\",\"agentId\":\"$4\",\"description\":\"Lorem\",\"prompt\":\"Lorem ipsum.\",\"outputFile\":\"/work/tmp/$4.output\",\"canReadOutputFile\":true,\"resolvedModel\":\"$SONNET\"}}"
+}
 OPUS=claude-opus-5-5
 SONNET=claude-sonnet-5-5
 # Every opus request is $0.008 (a1 $0.018 with its cache write), every sonnet one $0.0035.
@@ -277,12 +280,14 @@ aat $A1 /work/demo '"isSidechain":true,"agentId":"a9000000000000001"'
 } > "$AD/$A1/subagents/agent-a9000000000000001.jsonl"
 ameta implementer toolu_a1 > "$AD/$A1/subagents/agent-a9000000000000001.meta.json"
 # A2, window demo-9-s2, 2026-10-05 03:50:00..04:05:10Z (across local midnight):
-# a background subagent, a link to PR #12, then a 12m40s idle gap.
+# a background subagent (run_in_background the string "true", as real records
+# carry it; its tool_result the async launch), a link to PR #12, then a
+# 12m40s idle gap.
 aat $A2 /work/demo '"isSidechain":false'
 { atitle demo-9-s2
   aprompt 2026-10-05T03:50:00 a2-01
-  areply 2026-10-05T03:50:10 a2-02 req_b1 $OPUS "$UO" "$(ktool toolu_b1 Agent '{"subagent_type":"recon","description":"Lorem","prompt":"Lorem ipsum.","run_in_background":true}')"
-  aresult 2026-10-05T03:50:15 a2-03 toolu_b1
+  areply 2026-10-05T03:50:10 a2-02 req_b1 $OPUS "$UO" "$(ktool toolu_b1 Agent '{"subagent_type":"recon","description":"Lorem","prompt":"Lorem ipsum.","run_in_background":"true"}')"
+  alaunch 2026-10-05T03:50:15 a2-03 toolu_b1 a9000000000000002
   areply 2026-10-05T03:50:25 a2-04 req_b2 $OPUS "$UO" "$TEXT"
   echo "{\"type\":\"pr-link\",\"sessionId\":\"$A2\",\"prNumber\":12,\"prUrl\":\"https://github.com/example/demo/pull/12\",\"prRepository\":\"example/demo\",\"timestamp\":\"2026-10-05T03:50:30.000Z\"}"
   aprompt 2026-10-05T04:05:00 a2-05
@@ -310,7 +315,9 @@ aat $A6 /work/demo '"isSidechain":false'
 # Repo nest (owner from github/user.json): epic #1 over the nested epic #2
 # and #4; #2 is over #3. #5 has only a sub-issue in another repo. One
 # window each for #2 (its direct work), #3, #4 and #5, on Oct 4 and Oct 5 in
-# Toronto. Every request is opus, $0.008.
+# Toronto. Every orchestrator request is opus, $0.008. nest-5 also
+# dispatches a background subagent with no run_in_background flag, known
+# only by its async launch result (#55).
 N=fixtures/nest-home
 ND="$N/projects/-work-nest"
 rm -rf "$N"
@@ -322,7 +329,21 @@ nwindow() { # sessionId name prompt-time reply-time requestId
 nwindow 5e55a7a7-0000-4000-8000-0000000000b1 nest-2 2026-10-04T14:00:00 2026-10-04T14:00:20 req_n1
 nwindow 5e55a7a7-0000-4000-8000-0000000000b2 nest-3 2026-10-05T14:00:00 2026-10-05T14:00:30 req_n2
 nwindow 5e55a7a7-0000-4000-8000-0000000000b3 nest-4 2026-10-05T15:00:00 2026-10-05T15:00:40 req_n3
-nwindow 5e55a7a7-0000-4000-8000-0000000000b4 nest-5 2026-10-04T15:00:00 2026-10-04T15:00:10 req_n4
+N4=5e55a7a7-0000-4000-8000-0000000000b4
+NB=a7000000000000001
+aat $N4 /work/nest '"isSidechain":false'
+{ atitle nest-5
+  aprompt 2026-10-04T15:00:00 nest-5-01
+  areply 2026-10-04T15:00:04 nest-5-02 req_n4 $OPUS "$UO" "$(ktool toolu_n4 Agent '{"subagent_type":"recon","description":"Lorem","prompt":"Lorem ipsum."}')"
+  alaunch 2026-10-04T15:00:05 nest-5-03 toolu_n4 $NB
+  areply 2026-10-04T15:00:10 nest-5-04 req_n5 $OPUS "$UO" "$TEXT"
+} > "$ND/$N4.jsonl"
+mkdir -p "$ND/$N4/subagents"
+aat $N4 /work/nest "\"isSidechain\":true,\"agentId\":\"$NB\""
+{ atask 2026-10-04T15:00:06 nest-5s-1
+  areply 2026-10-04T15:00:09 nest-5s-2 req_n6 $SONNET "$US" "$TEXT"
+} > "$ND/$N4/subagents/agent-$NB.jsonl"
+ameta recon toolu_n4 > "$ND/$N4/subagents/agent-$NB.meta.json"
 nissue() { # number title state closedAt parent sub-total sub-completed [separator]
   CLOSED=null; REASON=null; PARENT=null
   if [ "$3" = CLOSED ]; then CLOSED="\"$4\""; REASON='"COMPLETED"'; fi
@@ -374,9 +395,6 @@ gdispatch() { # time uuid requestId toolUseId [name]
   if [ -n "${5:-}" ]; then INPUT="$INPUT,\"name\":\"$5\""; fi
   areply "$1" "$2" "$3" $OPUS "$UO" "$(ktool "$4" Agent "$INPUT}")"
 }
-glaunch() { # time uuid toolUseId agentId: a background dispatch's immediate launch result
-  aenv "$1" "$2"; echo "{$AE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"$3\",\"content\":[{\"type\":\"text\",\"text\":\"Async agent launched successfully.\\nagentId: $4 (lorem ipsum)\"}]}]},\"toolUseResult\":{\"isAsync\":true,\"status\":\"async_launched\",\"agentId\":\"$4\",\"description\":\"Lorem\",\"prompt\":\"Lorem ipsum.\",\"outputFile\":\"/work/tmp/$4.output\",\"canReadOutputFile\":true,\"resolvedModel\":\"$SONNET\"}}"
-}
 gsend() { # to...: SendMessage tool_use blocks
   B=""; i=0
   for to in "$@"; do
@@ -395,12 +413,12 @@ T=2026-10-06T10
 aat $G1 /work/perf '"isSidechain":false'
 { atitle perf-1
   aprompt $T:00:00 g-01
-  gdispatch $T:00:05 g-02 req_p1 toolu_p1; glaunch $T:00:06 g-03 toolu_p1 $B1
-  gdispatch $T:00:10 g-04 req_p2 toolu_p2 perf-helper; glaunch $T:00:11 g-05 toolu_p2 $B2
-  gdispatch $T:00:15 g-06 req_p3 toolu_p3; glaunch $T:00:16 g-07 toolu_p3 $B3
-  gdispatch $T:00:20 g-08 req_p4 toolu_p4; glaunch $T:00:21 g-09 toolu_p4 $B4
-  gdispatch $T:00:25 g-10 req_p5 toolu_p5; glaunch $T:00:26 g-11 toolu_p5 $B5
-  gdispatch $T:00:30 g-12 req_p6 toolu_p6; glaunch $T:00:31 g-13 toolu_p6 $B6
+  gdispatch $T:00:05 g-02 req_p1 toolu_p1; alaunch $T:00:06 g-03 toolu_p1 $B1
+  gdispatch $T:00:10 g-04 req_p2 toolu_p2 perf-helper; alaunch $T:00:11 g-05 toolu_p2 $B2
+  gdispatch $T:00:15 g-06 req_p3 toolu_p3; alaunch $T:00:16 g-07 toolu_p3 $B3
+  gdispatch $T:00:20 g-08 req_p4 toolu_p4; alaunch $T:00:21 g-09 toolu_p4 $B4
+  gdispatch $T:00:25 g-10 req_p5 toolu_p5; alaunch $T:00:26 g-11 toolu_p5 $B5
+  gdispatch $T:00:30 g-12 req_p6 toolu_p6; alaunch $T:00:31 g-13 toolu_p6 $B6
   # quoted, not delivered: b6 stays without a notification
   areply $T:00:40 g-14 req_p7 $OPUS "$UO" "$(ktool toolu_p7 Bash "{\"command\":\"echo '$(note $B6 toolu_p6 failed)'\"}")"
   aenv $T:00:41 g-15; echo "{$AE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_p7\",\"content\":\"$(note $B6 toolu_p6 failed)\"}]}}"
@@ -467,9 +485,9 @@ U=2026-10-13T09
 aat $G3 /work/perf "\"isSidechain\":false,\"session_id\":\"$G3\""
 { atitle perf-3
   aprompt $U:00:00 h-01
-  gdispatch $U:00:05 h-02 req_r1 toolu_r7; glaunch $U:00:06 h-03 toolu_r7 $B7
+  gdispatch $U:00:05 h-02 req_r1 toolu_r7; alaunch $U:00:06 h-03 toolu_r7 $B7
   aenv $U:30:00 h-04; echo "{$AE,\"type\":\"system\",\"subtype\":\"api_error\",\"level\":\"error\",\"error\":{\"status\":529},\"retryInMs\":500,\"retryAttempt\":1,\"maxRetries\":10}"
-  gdispatch $U:59:00 h-05 req_r2 toolu_r8; glaunch $U:59:01 h-06 toolu_r8 $B8
+  gdispatch $U:59:00 h-05 req_r2 toolu_r8; alaunch $U:59:01 h-06 toolu_r8 $B8
   areply 2026-10-13T10:20:00 h-07 req_r3 $OPUS "$UO" "$TEXT"
 } > "$GD/$G3.jsonl"
 aat $G3 /work/perf "\"isSidechain\":true,\"agentId\":\"$B7\""

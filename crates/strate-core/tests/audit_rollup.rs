@@ -548,6 +548,24 @@ fn a_background_dispatch_flags_its_agent_hours_approximate() {
 }
 
 #[test]
+fn a_background_dispatch_with_no_flag_is_known_by_its_launch() {
+    let t = Temp::new("background-no-flag");
+    let db = build_nest(&t);
+    let tree = october(&db, GroupBy::Hierarchy).root;
+    let five = child(child(&tree, NodeKind::Repo, "nest"), NodeKind::Issue, "5");
+    let window = labelled(five, NodeKind::Session, "nest-5");
+    // No run_in_background on its Agent call; its tool_result is the async
+    // launch: [6,9] s.
+    let bg = child(window, NodeKind::Agent, "a7000000000000001");
+    assert!(bg.metrics.approximate);
+    assert_eq!(bg.metrics.agent_ms, 3 * S);
+    assert!(!child(window, NodeKind::Agent, "").metrics.approximate);
+    assert!(window.metrics.approximate && five.metrics.approximate);
+    let nest = child(&tree, NodeKind::Repo, "nest");
+    assert!(!child(nest, NodeKind::Epic, "1").metrics.approximate);
+}
+
+#[test]
 fn the_date_range_keeps_the_cells_of_its_local_days() {
     let t = Temp::new("dates");
     let db = build(&t);
