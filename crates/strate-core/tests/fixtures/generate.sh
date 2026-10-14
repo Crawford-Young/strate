@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ for #26, nest-home/ and github/nest-home.json for #47, perf-home/ for #51, directs-home/ for #53). Field names come from
+# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ for #26, nest-home/ and github/nest-home.json for #47, perf-home/ for #51, directs-home/ for #53, chain-home/ for #63). Field names come from
 # the "~/.claude format, as observed" comment on strate #10; every value is a placeholder.
 set -eu
 cd "$(dirname "$0")/.."
@@ -590,3 +590,67 @@ aat $X2 /work/hub "\"isSidechain\":false,\"session_id\":\"$X2\""
 aat $N4 /work/demo-repo "\"isSidechain\":false,\"session_id\":\"$N4\""
 { dname ticket-demo-repo-4; dpeer 2026-10-07T12:02:02 n4-01 "$(m a)" director-beta
   areply 2026-10-07T12:02:10 n4-02 req_n4-02 $OPUS "$UO" "$TEXT"; } > "$UNITS/$N4.jsonl"
+
+# ---- chain-home: a /clear chain and its unit (#63); hand values in tests/chain.rs ----
+# 2026-10-08Z. director-chain is one process (root L1) across three /clear
+# links, L1 10:00, L2 11:00 and L3 12:00, each dispatching one foreground
+# subagent (J1, J2, J3). L2 messages ticket-chain-repo-7 (U1, a --bg unit),
+# which dispatches J4, then /clears into U2 (same name, J8). A second process
+# (root P1) crosses workstreams: chain-repo-5 (P1, J5), then /clear and
+# /rename chain-repo-6 (P2, J6), then /clear and /rename back to chain-repo-5
+# (P3, J7). Every orchestrator request is opus ($0.008), every subagent's
+# sonnet ($0.0035).
+CH=fixtures/chain-home
+L1=5e55c4c4-0000-4000-8000-0000000000a1
+L2=5e55c4c4-0000-4000-8000-0000000000a2
+L3=5e55c4c4-0000-4000-8000-0000000000a3
+U1=5e55c4c4-0000-4000-8000-0000000000b1
+U2=5e55c4c4-0000-4000-8000-0000000000b2
+P1=5e55c4c4-0000-4000-8000-0000000000c1
+P2=5e55c4c4-0000-4000-8000-0000000000c2
+P3=5e55c4c4-0000-4000-8000-0000000000c3
+CHUB="$CH/projects/-work-hub"
+CREPO="$CH/projects/-work-chain-repo"
+rm -rf "$CH"
+mkdir -p "$CHUB" "$CREPO"
+CT=2026-10-08T
+cm() { echo "5e55ee11-0000-4000-8000-00000000000$1"; }
+cat_() { # sessionId cwd root: an orchestrator envelope on process root `root`
+  aat "$1" "$2" "\"isSidechain\":false,\"session_id\":\"$3\""
+}
+cwork() { # HH:MM uuid-prefix: a prompt, a foreground dispatch answered at :50, a reply
+  aprompt "$CT$1:00" "$2-1"
+  areply "$CT$1:05" "$2-2" "req_$2-2" $OPUS "$UO" "$(ktool "toolu_$2" Agent '{"subagent_type":"implementer","description":"Lorem","prompt":"Lorem ipsum."}')"
+  aresult "$CT$1:50" "$2-3" "toolu_$2"
+  areply "$CT$1:55" "$2-4" "req_$2-4" $OPUS "$UO" "$TEXT"
+}
+csub() { # dir sessionId agentId HH:MM uuid-prefix: the subagent `cwork` dispatched, 10..40 s in
+  mkdir -p "$1/$2/subagents"
+  aat "$2" /work/x "\"isSidechain\":true,\"agentId\":\"$3\""
+  { atask "$CT$4:10" "$5-s1"; areply "$CT$4:40" "$5-s2" "req_$5-s2" $SONNET "$US" "$TEXT"; } > "$1/$2/subagents/agent-$3.jsonl"
+  ameta implementer "toolu_$5" > "$1/$2/subagents/agent-$3.meta.json"
+}
+cat_ $L1 /work/hub $L1
+{ dname director-chain; cwork 10:00 l1; } > "$CHUB/$L1.jsonl"
+csub "$CHUB" $L1 a8000000000000001 10:00 l1
+cat_ $L2 /work/hub $L1
+{ dname director-chain; cwork 11:00 l2; dsend ${CT}11:02 l2-s ticket-chain-repo-7 "$(cm 1)"; } > "$CHUB/$L2.jsonl"
+csub "$CHUB" $L2 a8000000000000002 11:00 l2
+cat_ $L3 /work/hub $L1
+{ dname director-chain; cwork 12:00 l3; } > "$CHUB/$L3.jsonl"
+csub "$CHUB" $L3 a8000000000000003 12:00 l3
+cat_ $U1 /work/chain-repo $U1
+{ dname ticket-chain-repo-7; dpeer ${CT}11:02:02 u1-0 "$(cm 1)" director-chain; cwork 11:03 u1; } > "$CREPO/$U1.jsonl"
+csub "$CREPO" $U1 a8000000000000004 11:03 u1
+cat_ $U2 /work/chain-repo $U1
+{ dname ticket-chain-repo-7; cwork 11:30 u2; } > "$CREPO/$U2.jsonl"
+csub "$CREPO" $U2 a8000000000000008 11:30 u2
+cat_ $P1 /work/chain-repo $P1
+{ dname chain-repo-5; cwork 13:00 p1; } > "$CREPO/$P1.jsonl"
+csub "$CREPO" $P1 a8000000000000005 13:00 p1
+cat_ $P2 /work/chain-repo $P1
+{ dname chain-repo-5; dname chain-repo-6; cwork 14:00 p2; } > "$CREPO/$P2.jsonl"
+csub "$CREPO" $P2 a8000000000000006 14:00 p2
+cat_ $P3 /work/chain-repo $P1
+{ dname chain-repo-6; dname chain-repo-5; cwork 15:00 p3; } > "$CREPO/$P3.jsonl"
+csub "$CREPO" $P3 a8000000000000007 15:00 p3

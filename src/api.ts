@@ -68,6 +68,8 @@ export interface GraphAgent {
   /** The agent's resolved context hard stop, in percent (gear, default 95). */
   hardStopPct: number
   parent: number | null
+  /** Of an earlier `/clear` link of the drawn session's chain (or a unit's); absent when not. */
+  earlier?: boolean
 }
 
 export interface GraphEdge {
@@ -76,7 +78,7 @@ export interface GraphEdge {
   child: number
 }
 
-/** The live session of a workstream only, never earlier sessions. */
+/** The live session of a workstream, with its `/clear` chain's earlier links' agents. */
 export interface LiveGraph {
   sessionId: string
   live: boolean
@@ -145,7 +147,8 @@ export interface Metrics {
 export interface AuditNode {
   /**
    * `group` is a value of the group-by: a day, `<repo>#<pr>` (the PR's own
-   * repo), an agent type or a model. `session` is one `/rename` window.
+   * repo), an agent type or a model. `session` is a `/clear` chain's windows in one
+   * workstream; a director's unit nests under the director's row.
    */
   kind: NodeKind
   /** Unique among its siblings. */

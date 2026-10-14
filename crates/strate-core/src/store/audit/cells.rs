@@ -4,7 +4,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::{Connection, Row};
+use rusqlite::{Connection, OptionalExtension, Row};
 
 use super::gh::{Gh, GhPr};
 use super::{AuditFilter, Tokens};
@@ -179,6 +179,16 @@ impl Cells {
         &self.windows.list[cell.window]
     }
 
+    /// The Session rows `cell` sits under, outermost first, each shown by
+    /// one of its windows: a unit's row nests under its director's, which
+    /// may nest under its own director. The last is `cell`'s own window;
+    /// the first places them all.
+    pub(crate) fn rows(&self, cell: &Cell) -> Vec<&Window> {
+        let mut rows: Vec<&Window> = self.windows.up(cell.window).collect();
+        rows.reverse();
+        rows
+    }
+
     /// The subagent `agent_id` of `cell`'s session. [`Cells::load`] gives
     /// every subagent cell an entry, so the lookup misses only for a cell
     /// that did not come from it.
@@ -210,7 +220,11 @@ pub(crate) enum Place {
 
 /// A `/rename` window (or a session with none).
 pub(crate) struct Window {
-    pub(crate) key: String,
+    /// Its Session row: `<chain>/<workstream>`, the chain its session's
+    /// process root (every `/clear` link of one process shares it) and the
+    /// workstream its merge-resolved name, so a chain's windows in one
+    /// workstream are one row; `session:<id>` for a session with no window.
+    pub(crate) row: String,
     pub(crate) label: String,
     /// The repo its name parses to, linked or not.
     pub(crate) repo: Option<String>,
@@ -222,7 +236,8 @@ pub(crate) struct Window {
     pub(crate) span: Option<(i64, i64)>,
 }
 
-/// Every window the filter's cells touch, resolved once.
+/// Every window the filter's cells touch, and their directors', resolved
+/// once.
 #[derive(Default)]
 struct Windows {
     list: Vec<Window>,
@@ -230,6 +245,9 @@ struct Windows {
     sessions: HashMap<String, Session>,
     /// The filter's segments by id, read in one query.
     named: HashMap<i64, Named>,
+    /// Per Session row, the director's window it nests under (see
+    /// [`launched_from`]); `None` while it resolves.
+    directors: HashMap<String, Option<usize>>,
 }
 
 impl Windows {
@@ -250,24 +268,31 @@ impl Windows {
             Entry::Occupied(found) => found.into_mut(),
             Entry::Vacant(slot) => slot.insert(Session::load(conn, session_id)?),
         };
+        // A director's window may have no cells in the filter.
+        let named = match segment.map(|id| (id, self.named.remove(&id))) {
+            Some((_, Some(named))) => Some(named),
+            Some((id, None)) => Named::load(conn, id)?,
+            None => None,
+        };
         // With no window, the session's id and start.
-        let named = segment
-            .and_then(|id| self.named.remove(&id))
-            .unwrap_or_else(|| Named {
-                name: session_id.to_string(),
-                fallback: true,
-                start: session.start,
-                next: None,
-            });
+        let named = named.unwrap_or_else(|| Named {
+            name: session_id.to_string(),
+            fallback: true,
+            start: session.start,
+            next: None,
+            workstream: None,
+        });
         let parsed = if named.fallback {
             None
         } else {
             parse_name(&named.name)
         };
         let end = named.next.or(session.last);
+        let unit = segment.and(named.workstream);
+        let chain = session.chain.clone();
         self.list.push(Window {
-            key: match segment {
-                Some(id) => id.to_string(),
+            row: match unit {
+                Some(workstream) => format!("{chain}/{workstream}"),
                 None => format!("session:{session_id}"),
             },
             place: place(gh, parsed.as_ref(), &session.links),
@@ -276,13 +301,78 @@ impl Windows {
             label: named.name,
             span: named.start.map(|s| (s, end.unwrap_or(s).max(s))),
         });
-        self.index.insert(key, self.list.len() - 1);
-        Ok(self.list.len() - 1)
+        let at = self.list.len() - 1;
+        self.index.insert(key, at);
+        let row = self.list[at].row.clone();
+        if let Some(workstream) = unit
+            && !self.directors.contains_key(&row)
+        {
+            self.directors.insert(row.clone(), None);
+            let director = match launched_from(conn, &chain, workstream)? {
+                Some((parent, segment)) => Some(self.get(conn, gh, &parent, segment)?),
+                None => None,
+            };
+            // Rows that direct each other: the one resolved first stays on top.
+            let director = director.filter(|&d| self.up(d).all(|w| w.row != row));
+            self.directors.insert(row, director);
+        }
+        Ok(at)
     }
+
+    /// Window `at`, then the director's window its row nests under, and up.
+    /// A row nests only under a director whose walk up never meets it, so
+    /// the walk ends.
+    fn up(&self, at: usize) -> impl Iterator<Item = &Window> {
+        std::iter::successors(Some(&self.list[at]), |w| {
+            self.directors
+                .get(&w.row)
+                .copied()
+                .flatten()
+                .map(|d| &self.list[d])
+        })
+    }
+}
+
+/// Where a unit's Session row (`chain`'s windows in `workstream`) was
+/// launched from: of its sessions with a window there that a director
+/// messaged first (`directs`), the earliest's director session, and the
+/// window of the message it sent (`None`: no window). The director's own
+/// record is in the window live at its offset, a subagent's in that
+/// subagent's window. `None` when no director messaged one.
+fn launched_from(
+    conn: &Connection,
+    chain: &str,
+    workstream: i64,
+) -> Result<Option<(String, Option<i64>)>> {
+    conn.prepare_cached(
+        "SELECT x.parent, CASE WHEN e.agent_id IS NULL THEN (
+                 SELECT g.id FROM segments AS g
+                 WHERE g.session_id = e.session_id AND g.start_offset <= e.byte_offset
+                 ORDER BY g.start_offset DESC LIMIT 1
+             ) ELSE (
+                 SELECT a.segment_id FROM agents AS a
+                 WHERE a.session_id = e.session_id AND a.agent_id = e.agent_id
+             ) END
+         FROM directs AS x
+         JOIN sessions AS c ON c.session_id = x.child
+         JOIN events AS e ON e.sent_msg_id = x.msg_id AND e.session_id = x.parent
+         WHERE ifnull(c.process_root, c.session_id) = ?1
+           AND EXISTS (SELECT 1 FROM segments AS g
+               JOIN workstream_roots AS r ON r.id = g.workstream_id
+               WHERE g.session_id = x.child AND r.root = ?2)
+         ORDER BY c.started_at IS NULL, c.started_at, x.child, e.id
+         LIMIT 1",
+    )?
+    .query_row(rusqlite::params![chain, workstream], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })
+    .optional()
 }
 
 /// What every window of one session shares.
 struct Session {
+    /// Its process root, else its id: what its `/clear` chain shares.
+    chain: String,
     /// Its `github_links`, newest first.
     links: Vec<PrLink>,
     /// Its first record.
@@ -299,9 +389,12 @@ struct PrLink {
     repository: Option<String>,
 }
 
-/// A session's start and its last activity: the latest record its timeline
-/// counts, read from the `events_session_time` index alone (v10, #46).
-const SESSION_SQL: &str = "SELECT (SELECT started_at FROM sessions WHERE session_id = ?1),
+/// A session's chain, its start and its last activity: the latest record
+/// its timeline counts, read from the `events_session_time` index alone
+/// (v10, #46).
+const SESSION_SQL: &str = "SELECT
+         (SELECT ifnull(process_root, session_id) FROM sessions WHERE session_id = ?1),
+         (SELECT started_at FROM sessions WHERE session_id = ?1),
          (SELECT max(timestamp) FROM events
           WHERE session_id = ?1 AND timestamp IS NOT NULL
             AND ifnull(type, '') NOT IN ('custom-title', 'ai-title', 'cost-state'))";
@@ -321,10 +414,11 @@ impl Session {
                 })
             })?
             .collect::<Result<_>>()?;
-        let (start, last): (Option<String>, Option<String>) = conn
+        let (chain, start, last): (Option<String>, Option<String>, Option<String>) = conn
             .prepare_cached(SESSION_SQL)?
-            .query_row([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            .query_row([session_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok(Self {
+            chain: chain.unwrap_or_else(|| session_id.to_string()),
             links,
             start: start.as_deref().and_then(parse_timestamp),
             last: last.as_deref().and_then(parse_timestamp),
@@ -340,39 +434,59 @@ struct Named {
     fallback: bool,
     start: Option<i64>,
     next: Option<i64>,
+    /// Its merge-resolved workstream; `None` for a session with no window.
+    workstream: Option<i64>,
 }
+
+/// Each segment matching `{segments}` with its merge-resolved name and
+/// workstream, and the start of its session's next segment.
+const NAMED_SQL: &str = "SELECT g.id, w.name, w.fallback, g.started_at, g.next, r.root
+     FROM (
+         SELECT id, workstream_id, started_at,
+             lead(started_at) OVER (PARTITION BY session_id ORDER BY start_offset) AS next
+         FROM segments
+         WHERE {segments}
+     ) AS g
+     JOIN workstream_roots AS r ON r.id = g.workstream_id
+     JOIN workstreams AS w ON w.id = r.root";
 
 impl Named {
     /// Every segment of the sessions with cells on days `from..=to`, by id,
     /// in one query (one pass over the recursive `workstream_roots`).
     fn load_all(conn: &Connection, from: &str, to: &str) -> Result<HashMap<i64, Self>> {
+        let sql = NAMED_SQL.replace(
+            "{segments}",
+            "session_id IN (SELECT session_id FROM audit_cells WHERE day BETWEEN ?1 AND ?2)",
+        );
+        conn.prepare_cached(&sql)?
+            .query_map([from, to], Self::read)?
+            .collect()
+    }
+
+    /// Segment `id` alone: a director's window with no cells in the filter.
+    fn load(conn: &Connection, id: i64) -> Result<Option<Self>> {
+        let sql = NAMED_SQL.replace(
+            "{segments}",
+            "session_id = (SELECT session_id FROM segments WHERE id = ?1)",
+        );
+        conn.prepare_cached(&format!("{sql} WHERE g.id = ?1"))?
+            .query_row([id], Self::read)
+            .optional()
+            .map(|found| found.map(|(_, named)| named))
+    }
+
+    fn read(r: &Row) -> Result<(i64, Self)> {
         let at = |s: Option<String>| s.as_deref().and_then(parse_timestamp);
-        conn.prepare_cached(
-            "SELECT g.id, w.name, w.fallback, g.started_at, g.next
-             FROM (
-                 SELECT id, workstream_id, started_at,
-                     lead(started_at) OVER (PARTITION BY session_id ORDER BY start_offset)
-                         AS next
-                 FROM segments
-                 WHERE session_id IN (
-                     SELECT session_id FROM audit_cells WHERE day BETWEEN ?1 AND ?2
-                 )
-             ) AS g
-             JOIN workstream_roots AS r ON r.id = g.workstream_id
-             JOIN workstreams AS w ON w.id = r.root",
-        )?
-        .query_map([from, to], |r| {
-            Ok((
-                r.get(0)?,
-                Self {
-                    name: r.get(1)?,
-                    fallback: r.get(2)?,
-                    start: at(r.get(3)?),
-                    next: at(r.get(4)?),
-                },
-            ))
-        })?
-        .collect()
+        Ok((
+            r.get(0)?,
+            Self {
+                name: r.get(1)?,
+                fallback: r.get(2)?,
+                start: at(r.get(3)?),
+                next: at(r.get(4)?),
+                workstream: r.get(5)?,
+            },
+        ))
     }
 }
 

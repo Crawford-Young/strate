@@ -1,6 +1,7 @@
 // The canvas centre: the selected tab's live session as a tiered graph
 // (orchestrator → subagents, teammates and directed units → their dispatches), laid out by ELK
-// and drawn by React Flow. Selecting a node opens it in the console.
+// and drawn by React Flow, earlier /clear links' agents dimmed. Selecting a node opens it in the
+// console.
 import { AgentNodeCard, BorderTrace, Button, EmptyState, TabsContent } from '@crawfordyoung/ui'
 import {
   Background,
@@ -122,6 +123,7 @@ function AgentNode({
         nudgeAt={a.nudgePct}
         hardStopAt={a.hardStopPct}
         selected={selected}
+        dimmed={a.earlier}
         data-agent={a.id}
         onFocus={(e) => reveal(e.currentTarget)}
       />
