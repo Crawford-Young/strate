@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ for #26, perf-home/ for #51, directs-home/ for #53). Field names come from
+# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ for #26, nest-home/ and github/nest-home.json for #47, perf-home/ for #51, directs-home/ for #53). Field names come from
 # the "~/.claude format, as observed" comment on strate #10; every value is a placeholder.
 set -eu
 cd "$(dirname "$0")/.."
@@ -305,6 +305,39 @@ aat $A5 /work/scratch '"isSidechain":false'
 # A6, window demo-8 (the epic itself), 2026-10-05 10:00:00..10:00:20Z: direct work.
 aat $A6 /work/demo '"isSidechain":false'
 { atitle demo-8; aprompt 2026-10-05T10:00:00 a6-01; areply 2026-10-05T10:00:20 a6-02 req_h1 $OPUS "$UO" "$TEXT"; } > "$AD/$A6.jsonl"
+
+# ---- nest-home: a nested epic (#47); hand values in tests/audit_rollup.rs ----
+# Repo nest (owner from github/user.json): epic #1 over the nested epic #2
+# and #4; #2 is over #3. #5 has only a sub-issue in another repo. One
+# window each for #2 (its direct work), #3, #4 and #5, on Oct 4 and Oct 5 in
+# Toronto. Every request is opus, $0.008.
+N=fixtures/nest-home
+ND="$N/projects/-work-nest"
+rm -rf "$N"
+mkdir -p "$ND"
+nwindow() { # sessionId name prompt-time reply-time requestId
+  aat "$1" /work/nest '"isSidechain":false'
+  { atitle "$2"; aprompt "$3" "$2-01"; areply "$4" "$2-02" "$5" $OPUS "$UO" "$TEXT"; } > "$ND/$1.jsonl"
+}
+nwindow 5e55a7a7-0000-4000-8000-0000000000b1 nest-2 2026-10-04T14:00:00 2026-10-04T14:00:20 req_n1
+nwindow 5e55a7a7-0000-4000-8000-0000000000b2 nest-3 2026-10-05T14:00:00 2026-10-05T14:00:30 req_n2
+nwindow 5e55a7a7-0000-4000-8000-0000000000b3 nest-4 2026-10-05T15:00:00 2026-10-05T15:00:40 req_n3
+nwindow 5e55a7a7-0000-4000-8000-0000000000b4 nest-5 2026-10-04T15:00:00 2026-10-04T15:00:10 req_n4
+nissue() { # number title state closedAt parent sub-total sub-completed [separator]
+  CLOSED=null; REASON=null; PARENT=null
+  if [ "$3" = CLOSED ]; then CLOSED="\"$4\""; REASON='"COMPLETED"'; fi
+  if [ -n "$5" ]; then PARENT="{\"number\":$5,\"repository\":{\"nameWithOwner\":\"acme/nest\"}}"; fi
+  echo "{\"number\":$1,\"title\":\"$2\",\"state\":\"$3\",\"stateReason\":$REASON,\"createdAt\":\"2026-10-01T09:00:00Z\",\"closedAt\":$CLOSED,\"parent\":$PARENT,"
+  echo " \"subIssuesSummary\":{\"total\":$6,\"completed\":$7},\"closedByPullRequestsReferences\":{\"nodes\":[]}}${8:-}"
+}
+{ echo '{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"CURSOR-N"},"nodes":['
+  nissue 1 'Epic: lorem nest' OPEN '' '' 2 0 ,
+  nissue 2 'Nested ipsum' OPEN '' 1 1 1 ,
+  nissue 3 'Dolor leaf' CLOSED 2026-10-05T18:00:00Z 2 0 0 ,
+  nissue 4 'Sit sibling' OPEN '' 1 0 0 ,
+  nissue 5 'Amet abroad' OPEN '' '' 1 0
+  echo ']}}}}'
+} > fixtures/github/nest-home.json
 
 # ---- perf-home: dispatch outcomes, follow-ups, API errors (#51); hand values in tests/performance.rs ----
 # One orchestrator (window perf-1) and six background dispatches, 2026-10-06 10:00..10:15Z.

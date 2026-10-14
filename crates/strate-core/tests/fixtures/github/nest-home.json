@@ -1,0 +1,12 @@
+{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"CURSOR-N"},"nodes":[
+{"number":1,"title":"Epic: lorem nest","state":"OPEN","stateReason":null,"createdAt":"2026-10-01T09:00:00Z","closedAt":null,"parent":null,
+ "subIssuesSummary":{"total":2,"completed":0},"closedByPullRequestsReferences":{"nodes":[]}},
+{"number":2,"title":"Nested ipsum","state":"OPEN","stateReason":null,"createdAt":"2026-10-01T09:00:00Z","closedAt":null,"parent":{"number":1,"repository":{"nameWithOwner":"acme/nest"}},
+ "subIssuesSummary":{"total":1,"completed":1},"closedByPullRequestsReferences":{"nodes":[]}},
+{"number":3,"title":"Dolor leaf","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-10-01T09:00:00Z","closedAt":"2026-10-05T18:00:00Z","parent":{"number":2,"repository":{"nameWithOwner":"acme/nest"}},
+ "subIssuesSummary":{"total":0,"completed":0},"closedByPullRequestsReferences":{"nodes":[]}},
+{"number":4,"title":"Sit sibling","state":"OPEN","stateReason":null,"createdAt":"2026-10-01T09:00:00Z","closedAt":null,"parent":{"number":1,"repository":{"nameWithOwner":"acme/nest"}},
+ "subIssuesSummary":{"total":0,"completed":0},"closedByPullRequestsReferences":{"nodes":[]}},
+{"number":5,"title":"Amet abroad","state":"OPEN","stateReason":null,"createdAt":"2026-10-01T09:00:00Z","closedAt":null,"parent":null,
+ "subIssuesSummary":{"total":1,"completed":0},"closedByPullRequestsReferences":{"nodes":[]}}
+]}}}}
