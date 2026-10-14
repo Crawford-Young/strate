@@ -428,7 +428,7 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version");
-        assert_eq!(version, 9);
+        assert_eq!(version, migrate::MIGRATIONS.len() as i64, "the latest");
         drop(store);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }

@@ -117,8 +117,11 @@ pub struct Metrics {
     pub tokens: Tokens,
     /// Agent-hours: subagent wall time.
     pub agent_ms: i64,
-    /// Some of `agent_ms` is a background subagent's, whose timing is
-    /// approximate until #42.
+    /// Some of `agent_ms` is a background subagent's: its dispatch launched
+    /// async (#55), so it ran beside its orchestrator instead of blocking
+    /// it. Its hours are measured as a foreground one's are, from its own
+    /// transcript's first record to its last (#42 changed only the live
+    /// canvas state, not this).
     pub approximate: bool,
     pub active_ms: i64,
     /// Waiting on you.
