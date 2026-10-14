@@ -7,7 +7,7 @@ use std::sync::{Mutex, PoisonError};
 use tauri::{Emitter, Manager, RunEvent};
 
 use crate::commands::{Reader, STORE_CHANGED};
-use crate::config::Settings;
+use crate::config::{DB_PATH, Settings, resolve_db};
 use crate::engine::Engine;
 
 /// The engine, taken and stopped on exit.
@@ -32,7 +32,7 @@ pub fn run() {
         .setup(|app| {
             let data = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data)?;
-            let db = data.join("strate.db");
+            let db = resolve_db(cfg!(debug_assertions), &data, std::env::var_os(DB_PATH))?;
             let settings =
                 Settings::from_env(|key| std::env::var_os(key), app.path().home_dir().ok())?;
             let handle = app.handle().clone();
