@@ -1118,3 +1118,43 @@ fn hard_stop_must_stay_above_nudge() {
         "gear needs a stored agent"
     );
 }
+
+#[test]
+fn an_empty_title_or_agent_name_is_no_name() {
+    let tmp = Temp::new("empty-name");
+    let path = session_path(&tmp.0, "s1");
+    let mut store = Store::open(tmp.db()).expect("open");
+    store
+        .ingest(&batch(
+            &path,
+            vec![
+                record(
+                    &path,
+                    0,
+                    json!({"type": "custom-title", "customTitle": "demo-1"}),
+                ),
+                record(
+                    &path,
+                    50,
+                    json!({"type": "custom-title", "customTitle": ""}),
+                ),
+                record(&path, 100, json!({"type": "agent-name", "agentName": ""})),
+            ],
+            150,
+        ))
+        .expect("ingest");
+    let conn = reader(&tmp.db());
+    assert_eq!(
+        agent_text(&conn, "s1", None, "name").as_deref(),
+        Some("demo-1"),
+        "an empty name never replaces the agent's name"
+    );
+    let empty: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM events WHERE custom_title = ''",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(empty, 0, "an empty customTitle is stored as no title");
+}
