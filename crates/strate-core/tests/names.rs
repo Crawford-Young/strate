@@ -1,7 +1,7 @@
 //! The session-name parser: `<repo>-<issue>[-sN]` windows and
 //! `<repo>-<issue>-<role>-<task>[-N]` agents. Names are synthetic.
 
-use strate_core::names::{ParsedName, parse_name};
+use strate_core::names::{ParsedName, is_director, parse_name};
 
 fn parsed(name: &str) -> (String, u64, Option<u32>) {
     let p = parse_name(name).unwrap_or_else(|| panic!("{name} should parse"));
@@ -127,4 +127,22 @@ fn a_repo_github_cannot_hold_does_not_parse() {
         assert_eq!(parse_name(name), None, "{name:?}");
     }
     assert_eq!(parsed("Lorem_ip.sum-6"), ("Lorem_ip.sum".into(), 6, None));
+}
+
+#[test]
+fn a_director_name_carries_the_typed_prefix_in_any_case() {
+    for yes in ["director-demo", "Director-Harness", "DIRECTOR-x"] {
+        assert!(is_director(yes), "{yes:?}");
+    }
+    for no in [
+        "director-",
+        "director",
+        "directors-demo",
+        "general-notes",
+        "ticket-demo-repo-1",
+        "claude -n director-demo",
+        "",
+    ] {
+        assert!(!is_director(no), "{no:?}");
+    }
 }

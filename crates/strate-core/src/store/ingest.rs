@@ -7,7 +7,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
-use super::{Result, account, group};
+use super::{Result, account, directs, group};
 use crate::cost::SYNTHETIC;
 use crate::discovery::{AgentRef, Graph, Link, Unresolved, scalar_text};
 use crate::tail::{Batch, TailEvent};
@@ -54,12 +54,14 @@ fn owner_of(path: &Path) -> Owner {
 }
 
 /// Stores a batch's events and its checkpoint, then regroups the batch's
-/// session and recomputes the rollups it touches.
+/// session and recomputes the rollups it touches, and `directs` when it
+/// stored a cross-session message.
 pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
     let owner = owner_of(&batch.path);
     let file = text_of(&batch.path);
     let mut agent = None;
     let mut requests = BTreeSet::new();
+    let mut messaged = false;
     for event in &batch.events {
         match event {
             TailEvent::Record { offset, value, .. } => {
@@ -67,7 +69,9 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
                     Some(id) => id,
                     None => *agent.insert(ensure_owner(conn, &owner, &file)?),
                 };
-                requests.extend(record(conn, &owner, id, &file, *offset, value)?);
+                let stored = record(conn, &owner, id, &file, *offset, value)?;
+                requests.extend(stored.request);
+                messaged |= stored.message;
             }
             // The file was rewritten: its uuid-less events would block the
             // new content at the same offsets. Events with a uuid stay and
@@ -82,6 +86,9 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
     group::sessions(conn, [owner.session_id.as_str()])?;
     let touched = account::touched(conn, &owner.session_id, &requests)?;
     account::rollup(conn, touched.iter().map(String::as_str))?;
+    if messaged {
+        directs::rebuild(conn)?;
+    }
     if let Some(c) = batch.checkpoint {
         conn.prepare_cached(
             "INSERT INTO offsets (path, byte_offset, volume, file_index) VALUES (?1, ?2, ?3, ?4)
@@ -161,9 +168,17 @@ fn agent_row(conn: &Connection, session_id: &str, agent_id: Option<&str>) -> Res
         .optional()
 }
 
+/// What storing one record changed beyond its own row.
+#[derive(Default)]
+struct Stored {
+    /// The request key of a request record.
+    request: Option<String>,
+    /// A cross-session message, sent or received.
+    message: bool,
+}
+
 /// Stores one record; a record not seen before also updates its agent
-/// (latest wins) and any GitHub link it carries. Returns the request key of
-/// a request record it stored.
+/// (latest wins) and any GitHub link it carries.
 fn record(
     conn: &Connection,
     owner: &Owner,
@@ -171,7 +186,7 @@ fn record(
     file: &str,
     offset: u64,
     value: &Value,
-) -> Result<Option<String>> {
+) -> Result<Stored> {
     let text = |key: &str| value.get(key).and_then(Value::as_str);
     let kind = text("type");
     let custom_title = match kind {
@@ -184,9 +199,10 @@ fn record(
             "INSERT OR IGNORE INTO events (session_id, agent_id, type, subtype, uuid, parent_uuid,
                  request_id, timestamp, file, byte_offset, raw, cwd, git_branch, custom_title,
                  request_key, model, usage, output_tokens, cost_usd, tool_uses, tool_results,
-                 prompt, notification_task, notification_status, message_to, api_error)
+                 prompt, notification_task, notification_status, message_to, api_error,
+                 sent_msg_id, peer_msg_id, peer_name)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
         )?
         .execute(params![
             owner.session_id,
@@ -215,9 +231,12 @@ fn record(
             acct.notification_status,
             acct.message_to,
             acct.api_error,
+            acct.sent_msg_id,
+            acct.peer_msg_id,
+            acct.peer_name,
         ])? > 0;
     if !inserted {
-        return Ok(None);
+        return Ok(Stored::default());
     }
     // A record written after a PermissionRequest hook: the agent moved on.
     if let Some(timestamp) = text("timestamp") {
@@ -285,7 +304,10 @@ fn record(
             text("timestamp"),
         ])?;
     }
-    Ok(acct.usage.and(acct.request_key))
+    Ok(Stored {
+        request: acct.usage.and(acct.request_key),
+        message: acct.sent_msg_id.is_some() || acct.peer_msg_id.is_some(),
+    })
 }
 
 /// Stores the sessions, agents and edges of a discovery graph. Only adds
