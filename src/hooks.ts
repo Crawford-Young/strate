@@ -1,8 +1,12 @@
 import { useEffect, useEffectEvent, useRef, useState } from 'react'
 import { onStoreChanged } from './api'
 
-/** Bumps on every `store-changed` event; the shell refetches on it, never on a timer. */
-export function useStoreVersion(): number {
+/**
+ * Bumps on every `store-changed` event; the shell refetches on it, never on a timer.
+ * While `paused` the returned version holds still, so nothing refetches for a hidden
+ * view; the events that arrived meanwhile collapse into one bump when it resumes.
+ */
+export function useStoreVersion(paused = false): number {
   const [version, setVersion] = useState(0)
   useEffect(() => {
     let mounted = true
@@ -16,7 +20,9 @@ export function useStoreVersion(): number {
       unlisten?.()
     }
   }, [])
-  return version
+  const [held, setHeld] = useState(version)
+  if (!paused && held !== version) setHeld(version)
+  return paused ? held : version
 }
 
 type Loaded<T> = { target: string; value: T } | { target: string; error: string }

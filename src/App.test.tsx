@@ -669,6 +669,37 @@ describe('audit view', () => {
     expect(screen.getByRole('button', { name: 'Audit' })).toHaveFocus()
   })
 
+  it('stops reading while hidden, then catches up with one read per source on show', async () => {
+    render(<App />)
+    await screen.findByRole('tab', { name: /strate-17/ })
+    openAudit()
+    workstreamsMock.mockClear()
+    liveGraphMock.mockClear()
+    act(() => {
+      storeChanged()
+      storeChanged()
+      storeChanged()
+    })
+    await act(async () => {})
+    expect(workstreamsMock).not.toHaveBeenCalled()
+    expect(liveGraphMock).not.toHaveBeenCalled()
+    back()
+    await act(async () => {})
+    expect(workstreamsMock).toHaveBeenCalledTimes(1)
+    expect(liveGraphMock).toHaveBeenCalledTimes(1)
+    expect(liveGraphMock).toHaveBeenCalledWith(2)
+  })
+
+  it('does not read on show when nothing changed while hidden', async () => {
+    render(<App />)
+    await screen.findByRole('tab', { name: /strate-17/ })
+    openAudit()
+    workstreamsMock.mockClear()
+    back()
+    await act(async () => {})
+    expect(workstreamsMock).not.toHaveBeenCalled()
+  })
+
   it('keeps the picked tab and panel prefs across a visit', async () => {
     render(<App />)
     await screen.findByRole('tab', { name: /strate-17/ })
