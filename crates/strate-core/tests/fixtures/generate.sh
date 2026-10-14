@@ -313,7 +313,8 @@ aat $A6 /work/demo '"isSidechain":false'
 # wins), b3 killed, b4 blocked (completed, its SubagentHandback report has a
 # NEEDS_CONTEXT: line), b5 completed (NEEDS_CONTEXT only quoted mid-line), b6
 # no notification (only quoted in a Bash command and its output). A
-# background shell's failed notification matches no agent.
+# background shell's failed notification matches no agent. Each dispatch's
+# tool_result is its immediate launch result (#42), not its answer.
 G=fixtures/perf-home
 G1=5e55e1e1-0000-4000-8000-0000000000e1
 GD="$G/projects/-work-perf"
@@ -340,6 +341,9 @@ gdispatch() { # time uuid requestId toolUseId [name]
   if [ -n "${5:-}" ]; then INPUT="$INPUT,\"name\":\"$5\""; fi
   areply "$1" "$2" "$3" $OPUS "$UO" "$(ktool "$4" Agent "$INPUT}")"
 }
+glaunch() { # time uuid toolUseId agentId: a background dispatch's immediate launch result
+  aenv "$1" "$2"; echo "{$AE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"$3\",\"content\":[{\"type\":\"text\",\"text\":\"Async agent launched successfully.\\nagentId: $4 (lorem ipsum)\"}]}]},\"toolUseResult\":{\"isAsync\":true,\"status\":\"async_launched\",\"agentId\":\"$4\",\"description\":\"Lorem\",\"prompt\":\"Lorem ipsum.\",\"outputFile\":\"/work/tmp/$4.output\",\"canReadOutputFile\":true,\"resolvedModel\":\"$SONNET\"}}"
+}
 gsend() { # to...: SendMessage tool_use blocks
   B=""; i=0
   for to in "$@"; do
@@ -358,12 +362,12 @@ T=2026-10-06T10
 aat $G1 /work/perf '"isSidechain":false'
 { atitle perf-1
   aprompt $T:00:00 g-01
-  gdispatch $T:00:05 g-02 req_p1 toolu_p1; aresult $T:00:06 g-03 toolu_p1
-  gdispatch $T:00:10 g-04 req_p2 toolu_p2 perf-helper; aresult $T:00:11 g-05 toolu_p2
-  gdispatch $T:00:15 g-06 req_p3 toolu_p3; aresult $T:00:16 g-07 toolu_p3
-  gdispatch $T:00:20 g-08 req_p4 toolu_p4; aresult $T:00:21 g-09 toolu_p4
-  gdispatch $T:00:25 g-10 req_p5 toolu_p5; aresult $T:00:26 g-11 toolu_p5
-  gdispatch $T:00:30 g-12 req_p6 toolu_p6; aresult $T:00:31 g-13 toolu_p6
+  gdispatch $T:00:05 g-02 req_p1 toolu_p1; glaunch $T:00:06 g-03 toolu_p1 $B1
+  gdispatch $T:00:10 g-04 req_p2 toolu_p2 perf-helper; glaunch $T:00:11 g-05 toolu_p2 $B2
+  gdispatch $T:00:15 g-06 req_p3 toolu_p3; glaunch $T:00:16 g-07 toolu_p3 $B3
+  gdispatch $T:00:20 g-08 req_p4 toolu_p4; glaunch $T:00:21 g-09 toolu_p4 $B4
+  gdispatch $T:00:25 g-10 req_p5 toolu_p5; glaunch $T:00:26 g-11 toolu_p5 $B5
+  gdispatch $T:00:30 g-12 req_p6 toolu_p6; glaunch $T:00:31 g-13 toolu_p6 $B6
   # quoted, not delivered: b6 stays without a notification
   areply $T:00:40 g-14 req_p7 $OPUS "$UO" "$(ktool toolu_p7 Bash "{\"command\":\"echo '$(note $B6 toolu_p6 failed)'\"}")"
   aenv $T:00:41 g-15; echo "{$AE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_p7\",\"content\":\"$(note $B6 toolu_p6 failed)\"}]}}"
@@ -430,9 +434,9 @@ U=2026-10-13T09
 aat $G3 /work/perf "\"isSidechain\":false,\"session_id\":\"$G3\""
 { atitle perf-3
   aprompt $U:00:00 h-01
-  gdispatch $U:00:05 h-02 req_r1 toolu_r7; aresult $U:00:06 h-03 toolu_r7
+  gdispatch $U:00:05 h-02 req_r1 toolu_r7; glaunch $U:00:06 h-03 toolu_r7 $B7
   aenv $U:30:00 h-04; echo "{$AE,\"type\":\"system\",\"subtype\":\"api_error\",\"level\":\"error\",\"error\":{\"status\":529},\"retryInMs\":500,\"retryAttempt\":1,\"maxRetries\":10}"
-  gdispatch $U:59:00 h-05 req_r2 toolu_r8; aresult $U:59:01 h-06 toolu_r8
+  gdispatch $U:59:00 h-05 req_r2 toolu_r8; glaunch $U:59:01 h-06 toolu_r8 $B8
   areply 2026-10-13T10:20:00 h-07 req_r3 $OPUS "$UO" "$TEXT"
 } > "$GD/$G3.jsonl"
 aat $G3 /work/perf "\"isSidechain\":true,\"agentId\":\"$B7\""

@@ -207,13 +207,13 @@ fn orchestrator_state(needs_you: bool, registry_state: Option<&str>) -> AgentSta
     }
 }
 
-/// A subagent's or teammate's state: hooks first, then whether its
-/// dispatch was answered and whether its session is still live.
-fn worker_state(needs_you: bool, hook: Option<&str>, answered: bool, live: bool) -> AgentState {
+/// A subagent's or teammate's state: hooks first, then whether it finished
+/// (see [`session_agents`]) and whether its session is still live.
+fn worker_state(needs_you: bool, hook: Option<&str>, finished: bool, live: bool) -> AgentState {
     match (needs_you, hook) {
         (true, _) => AgentState::NeedsYou,
         (_, Some("done")) => AgentState::Done,
-        _ if answered || !live => AgentState::Done,
+        _ if finished || !live => AgentState::Done,
         (_, Some("idle")) => AgentState::Idle,
         _ => AgentState::Working,
     }
@@ -383,6 +383,11 @@ type Row = (GraphAgent, Option<(i64, String)>);
 /// The agents of `session_id`, orchestrator first: with `root`, only the
 /// subagents and teammates that joined one of that workstream's segments
 /// (or none yet). Workers' states read `live` as their session's liveness.
+///
+/// A worker has finished once its dispatch is answered or its task
+/// notification arrives. A background dispatch's tool_result is the
+/// immediate launch result (`toolUseResult.status` `async_launched`), not
+/// an answer: its end is the notification (#42).
 fn session_agents(
     conn: &Connection,
     session_id: &str,
@@ -397,7 +402,10 @@ fn session_agents(
              EXISTS (SELECT 1 FROM edges AS d
                  JOIN events AS e ON e.session_id = a.session_id AND e.tool_results IS NOT NULL
                  JOIN json_each(e.tool_results) AS j ON j.value = d.tool_use_id
-                 WHERE d.child = a.id AND d.kind = 'dispatch'),
+                 WHERE d.child = a.id AND d.kind = 'dispatch'
+                   AND json_extract(e.raw, '$.toolUseResult.status') IS NOT 'async_launched')
+             OR EXISTS (SELECT 1 FROM events AS n
+                 WHERE n.session_id = a.session_id AND n.notification_task = a.agent_id),
              (SELECT p.parent FROM edges AS p
                  WHERE p.child = a.id AND p.kind IN ('dispatch', 'teammate')),
              (SELECT p.kind FROM edges AS p
