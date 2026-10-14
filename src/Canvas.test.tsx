@@ -36,6 +36,7 @@ const ws = (id: number): Workstream => ({
   sessionId: `s-${id}`,
   live: true,
   startedAt: null,
+  director: null,
 })
 
 function agent(over: Partial<GraphAgent> & Pick<GraphAgent, 'id'>): GraphAgent {
@@ -123,6 +124,27 @@ describe('live graph', () => {
     expect(dashed.dataset.dash).toBeTruthy()
     expect(solid.dataset.stroke).toBe('rgb(var(--muted-foreground) / 0.5)')
     expect(screen.getByTestId('edge-2-4')).toBeInTheDocument()
+  })
+
+  it('draws a directs edge solid and brighter than dispatch, with units under the director', async () => {
+    const directed: LiveGraph = {
+      sessionId: 's-1',
+      live: true,
+      agents: [
+        ...tiered.agents,
+        agent({ id: 5, kind: 'orchestrator', agentId: null, name: 'unit', parent: 1 }),
+        agent({ id: 6, parent: 5, name: 'unit-helper' }),
+      ],
+      edges: [...tiered.edges, { kind: 'directs', parent: 1, child: 5 }, dispatch(5, 6)],
+    }
+    render(view({ graph: directed }))
+    await screen.findByTestId('flow')
+    const directs = screen.getByTestId('edge-1-5')
+    expect(directs.dataset.dash).toBeUndefined()
+    expect(directs.dataset.stroke).toBe('rgb(var(--muted-foreground))')
+    expect(y(1)).toBeLessThan(y(5))
+    expect(y(5)).toBeLessThan(y(6))
+    expect(screen.getByTestId('edge-1-2').dataset.stroke).toBe('rgb(var(--muted-foreground) / 0.5)')
   })
 
   it('pins nodes in place: no dragging, no connecting, handles top and bottom', async () => {

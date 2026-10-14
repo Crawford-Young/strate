@@ -1,5 +1,5 @@
 // The canvas centre: the selected tab's live session as a tiered graph
-// (orchestrator → subagents and teammates → their dispatches), laid out by ELK
+// (orchestrator → subagents, teammates and directed units → their dispatches), laid out by ELK
 // and drawn by React Flow. Selecting a node opens it in the console.
 import { AgentNodeCard, BorderTrace, Button, EmptyState, TabsContent } from '@crawfordyoung/ui'
 import {
@@ -136,6 +136,12 @@ function AgentNode({
 const nodeTypes = { agent: AgentNode }
 
 const EDGE_STYLE = { stroke: 'rgb(var(--muted-foreground) / 0.5)', strokeWidth: 2 }
+const EDGE_STYLES = {
+  dispatch: EDGE_STYLE,
+  teammate: { ...EDGE_STYLE, strokeDasharray: '6 4' },
+  // A director's unit: solid like dispatch, at the full muted colour so it reads as the stronger link.
+  directs: { ...EDGE_STYLE, stroke: 'rgb(var(--muted-foreground))' },
+}
 const FIT_VIEW_OPTIONS = { maxZoom: 1 }
 
 interface GraphViewProps {
@@ -197,7 +203,7 @@ function GraphView({ graph, selected, onSelect }: GraphViewProps) {
       source: String(e.parent),
       target: String(e.child),
       type: 'step',
-      style: e.kind === 'teammate' ? { ...EDGE_STYLE, strokeDasharray: '6 4' } : EDGE_STYLE,
+      style: EDGE_STYLES[e.kind],
     }))
   return (
     <>

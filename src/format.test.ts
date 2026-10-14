@@ -38,6 +38,7 @@ const ws: Workstream = {
   sessionId: 's',
   live: true,
   startedAt: '2026-10-12T10:00:00Z',
+  director: null,
 }
 const at = (iso: string) => Date.parse(iso)
 
@@ -86,6 +87,22 @@ describe('nodeState', () => {
 describe('sessionCost', () => {
   it('sums the drawn agents, skipping unpriced ones', () => {
     expect(sessionCost(graph(0.25, null, 0.5))).toBe(0.75)
+  })
+
+  it('leaves out directed units and everything beneath them', () => {
+    const at = (id: number, costUsd: number): GraphAgent => ({ ...agent(costUsd), id })
+    const director: LiveGraph = {
+      sessionId: 's',
+      live: true,
+      agents: [at(1, 1), at(2, 10), at(3, 100), at(4, 1000)],
+      edges: [
+        { kind: 'dispatch', parent: 1, child: 2 },
+        { kind: 'directs', parent: 1, child: 3 },
+        { kind: 'dispatch', parent: 3, child: 4 },
+        { kind: 'directs', parent: 1, child: 4 },
+      ],
+    }
+    expect(sessionCost(director)).toBe(11)
   })
 
   it('is null with no graph or nothing priced', () => {

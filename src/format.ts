@@ -22,12 +22,28 @@ export function nodeState(state: AgentState): AgentNodeState {
   return state === 'needs_you' ? 'needs-you' : state
 }
 
+/** Every directed unit's root and the agents beneath it: other sessions, drawn here. */
+function directedAgents(graph: LiveGraph): Set<number> {
+  const out = new Set<number>()
+  const queue = graph.edges.filter((e) => e.kind === 'directs').map((e) => e.child)
+  for (let id = queue.pop(); id !== undefined; id = queue.pop()) {
+    if (out.has(id)) continue
+    out.add(id)
+    for (const e of graph.edges) if (e.parent === id) queue.push(e.child)
+  }
+  return out
+}
+
 /**
  * $ of the drawn session: each agent's `costUsd` sums its own requests only,
- * so the agents add up to the session without double counting.
+ * so the agents add up to the session without double counting. Directed units
+ * and their agents are drawn on a director's canvas but are their own sessions.
  */
 export function sessionCost(graph: LiveGraph | null): number | null {
-  const priced = (graph?.agents ?? []).flatMap((a) => (a.costUsd === null ? [] : [a.costUsd]))
+  const units = graph ? directedAgents(graph) : new Set<number>()
+  const priced = (graph?.agents ?? []).flatMap((a) =>
+    a.costUsd === null || units.has(a.id) ? [] : [a.costUsd],
+  )
   return priced.length ? priced.reduce((sum, usd) => sum + usd, 0) : null
 }
 
