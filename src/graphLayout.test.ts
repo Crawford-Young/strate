@@ -59,6 +59,18 @@ const overlaps = (a: { x: number; y: number }, b: { x: number; y: number }) =>
   Math.abs(a.x - b.x) < NODE_WIDTH && Math.abs(a.y - b.y) < NODE_HEIGHT
 
 describe('layoutGraph', () => {
+  it('lays a directed unit under its director with its own agents beneath', async () => {
+    const directed = graph(
+      [agent(1), agent(2, 1), agent(3, 1), agent(4, 3)],
+      [dispatch(1, 2), { kind: 'directs', parent: 1, child: 3 }, dispatch(3, 4)],
+    )
+    const { positions } = await layoutGraph(elk, directed)
+    expect(at(positions, 1).y).toBeLessThan(at(positions, 3).y)
+    expect(at(positions, 3).y).toBe(at(positions, 2).y)
+    expect(at(positions, 3).y).toBeLessThan(at(positions, 4).y)
+    expect(structureKey(directed)).toContain('directs:1>3')
+  })
+
   it('lays the graph out top-down in tiers', async () => {
     const { positions } = await layoutGraph(elk, tiered)
     expect([...positions.keys()].sort()).toEqual([1, 2, 3, 4, 5])

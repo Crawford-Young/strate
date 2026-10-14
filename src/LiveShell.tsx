@@ -25,8 +25,11 @@ interface Selection {
 }
 const NONE: Selection = { tab: null, agent: null }
 
+/** A tab of its own: live and not nested under a director's tab. */
+const hasTab = (w: Workstream) => w.live && w.director === null
+
 const isLive = (sessions: Workstream[], id: number | null) =>
-  sessions.some((w) => w.live && w.id === id)
+  sessions.some((w) => hasTab(w) && w.id === id)
 
 interface LiveShellProps {
   hidden: boolean
@@ -51,8 +54,9 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
   const canvasRef = useRef<HTMLElement>(null)
 
   const [storeStatus, sessions] = overview && 'value' in overview ? overview.value : [null, []]
-  // Only live sessions get a tab; past ones belong to the audit view.
-  const liveSessions = sessions.filter((w) => w.live)
+  // Only live, top-level sessions get a tab: past ones belong to the audit view, and units
+  // show on their director's canvas.
+  const liveSessions = sessions.filter(hasTab)
   const active = liveSessions.find((w) => w.id === selection.tab) ?? liveSessions[0] ?? null
   const activeKey = active && String(active.id)
   const agentId = selection.agent

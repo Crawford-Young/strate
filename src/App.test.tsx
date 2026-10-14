@@ -56,6 +56,7 @@ function ws(over: Partial<Workstream> & Pick<Workstream, 'id' | 'name'>): Workst
     sessionId: `s-${over.id}`,
     live: false,
     startedAt: null,
+    director: null,
     ...over,
   }
 }
@@ -208,6 +209,17 @@ describe('orchestrator tabs', () => {
     expect(within(tab(/strate-17/)).getByText('$3.10')).toBeInTheDocument()
     expect(within(tab(/strate-17/)).getByText('needs you')).toBeInTheDocument()
     expect(within(tab(/app@main/)).queryByText('needs you')).not.toBeInTheDocument()
+  })
+
+  it('keeps units nested under a live director off the strip', async () => {
+    workstreamsMock.mockResolvedValue([
+      shell,
+      ws({ id: 4, name: 'unit-a', live: true, director: 2 }),
+    ])
+    render(<App />)
+    await screen.findByRole('tab', { name: /strate-17/ })
+    expect(screen.getAllByRole('tab')).toHaveLength(1)
+    expect(screen.queryByRole('tab', { name: /unit-a/ })).not.toBeInTheDocument()
   })
 
   it('leaves sessions that are no longer live out of the strip', async () => {
@@ -375,6 +387,21 @@ describe('refetching', () => {
     await screen.findByRole('button', { name: /app-main/ })
     const console = screen.getByRole('complementary', { name: 'Console' })
     expect(within(console).getByRole('heading', { name: 'Console' })).toBeInTheDocument()
+  })
+
+  it('forgets a picked tab that becomes nested, like a gone one', async () => {
+    render(<App />)
+    await screen.findByRole('tab', { name: /strate-17/ })
+    selectTab(/app@main/)
+    await screen.findByRole('button', { name: /app-main/ })
+    workstreamsMock.mockResolvedValue([shell, { ...unnamed, director: 2 }])
+    act(() => storeChanged())
+    await screen.findByRole('button', { name: /implementer/ })
+    expect(screen.getByRole('tab', { selected: true })).toHaveAccessibleName(/strate-17/)
+    workstreamsMock.mockResolvedValue([shell, unnamed])
+    act(() => storeChanged())
+    await screen.findByRole('tab', { name: /app@main/ })
+    expect(screen.getByRole('tab', { selected: true })).toHaveAccessibleName(/strate-17/)
   })
 
   it('stops listening on unmount', async () => {

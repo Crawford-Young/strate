@@ -29,6 +29,8 @@ export interface Workstream {
   live: boolean
   /** The latest segment start (ISO). */
   startedAt: string | null
+  /** The live workstream whose tab this one nests under; null for a top-level tab. */
+  director: number | null
 }
 
 export interface WorkstreamCost {
@@ -69,7 +71,7 @@ export interface GraphAgent {
 }
 
 export interface GraphEdge {
-  kind: 'dispatch' | 'teammate'
+  kind: 'dispatch' | 'teammate' | 'directs'
   parent: number
   child: number
 }
