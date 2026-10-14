@@ -22,37 +22,17 @@ export function nodeState(state: AgentState): AgentNodeState {
   return state === 'needs_you' ? 'needs-you' : state
 }
 
-/** Every directed unit's root and the agents beneath it: other sessions, drawn here. */
-function directedAgents(graph: LiveGraph): Set<number> {
-  const out = new Set<number>()
-  const queue = graph.edges.filter((e) => e.kind === 'directs').map((e) => e.child)
-  for (let id = queue.pop(); id !== undefined; id = queue.pop()) {
-    if (out.has(id)) continue
-    out.add(id)
-    for (const e of graph.edges) if (e.parent === id) queue.push(e.child)
-  }
-  return out
-}
-
 /**
- * $ of the drawn session: each agent's `costUsd` sums its own requests only,
- * so the agents add up to the session without double counting. Directed units
- * and their agents are drawn on a director's canvas but are their own sessions.
+ * The line over the canvas: running time, session $, total $, needs-you. The session $ is only the
+ * part of the drawn session in this workstream, so it never exceeds the total. The running time is
+ * the session's run time as read, plus `sinceReadMs` of local time since.
  */
-export function sessionCost(graph: LiveGraph | null): number | null {
-  const units = graph ? directedAgents(graph) : new Set<number>()
-  const priced = (graph?.agents ?? []).flatMap((a) =>
-    a.costUsd === null || units.has(a.id) ? [] : [a.costUsd],
-  )
-  return priced.length ? priced.reduce((sum, usd) => sum + usd, 0) : null
-}
-
-/** The line over the canvas: running time, session $, total $, needs-you. */
-export function sessionLine(ws: Workstream, graph: LiveGraph | null, now: number): string {
-  const running = ws.startedAt ? `running ${duration(now - Date.parse(ws.startedAt))}` : 'running'
+export function sessionLine(ws: Workstream, graph: LiveGraph | null, sinceReadMs: number): string {
+  const runMs = graph?.runMs ?? null
+  const running = runMs === null ? 'running' : `running ${duration(runMs + sinceReadMs)}`
   const parts = [
     ws.live ? running : 'finished',
-    `${money(sessionCost(graph))} this session`,
+    `${money(graph?.sessionCostUsd ?? null)} this session`,
     `${money(ws.costUsd)} total`,
   ]
   if (ws.needsYou > 0) parts.push(`${ws.needsYou} needs you`)

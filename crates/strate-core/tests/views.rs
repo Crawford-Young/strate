@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
-use strate_core::discovery::{AgentRef, Graph, Link, SubagentMeta, SubagentNode};
+use strate_core::discovery::{AgentRef, Graph, Link, SubagentMeta, SubagentNode, discover};
 use strate_core::hooks::{Hook, HookEvent};
 use strate_core::registry::{RegistryEvent, parse_snapshot};
 use strate_core::store::views::{self, AgentState, GraphAgent, GraphEdge, Workstream};
@@ -344,6 +344,15 @@ fn the_live_graph_is_the_live_session_only_with_states_and_context() {
     assert!(close(orchestrator.context_pct, 25.0));
     assert!(close(orchestrator.cost_usd, cost(1000, 49_000)));
     assert_eq!(orchestrator.parent, None);
+    // The session's $ in this workstream sums its subagents too, never
+    // s-old's; its run time spans its first record to its last.
+    let alpha_session_usd = cost(1000, 49_000) + 2.0 * cost(2000, 0);
+    assert!(
+        close(graph.session_cost_usd, alpha_session_usd),
+        "{:?}",
+        graph.session_cost_usd
+    );
+    assert_eq!(graph.run_ms, Some(40_000));
 
     // a1's dispatch has its tool_result; a2 asked for permission.
     assert_eq!(a1.state, AgentState::Done);
@@ -553,4 +562,86 @@ fn a_merged_workstream_reads_as_its_target_and_unknown_ids_have_no_graph() {
     assert_eq!(graph.session_id, "s-beta");
 
     assert_eq!(views::live_graph(&reader, 9999).expect("query"), None);
+}
+
+/// Every transcript under `dir`, sorted.
+fn transcripts(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).expect("readable dir") {
+        let path = entry.expect("entry").path();
+        if path.is_dir() {
+            out.extend(transcripts(&path));
+        } else if path.extension().is_some_and(|e| e == "jsonl") {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The `workstreams-home` fixture, cold: its discovery graph, then each
+/// transcript as one batch.
+fn load_workstreams_home(store: &mut Store) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workstreams-home");
+    store
+        .ingest_graph(&discover(&root).expect("discover"))
+        .expect("graph");
+    for file in transcripts(&root.join("projects")) {
+        let text = fs::read_to_string(&file).expect("read");
+        let path: Arc<Path> = file.into();
+        let mut offset = 0u64;
+        let mut events = Vec::new();
+        for line in text.split_inclusive('\n') {
+            events.push(TailEvent::Record {
+                path: path.clone(),
+                offset,
+                value: serde_json::from_str(line).expect("fixture line is json"),
+            });
+            offset += line.len() as u64;
+        }
+        store
+            .ingest(&Batch {
+                path,
+                events,
+                checkpoint: None,
+            })
+            .expect("ingest");
+    }
+}
+
+#[test]
+fn a_sessions_dollars_count_only_the_workstreams_part_of_it() {
+    let temp = Temp::new("renamed");
+    let (mut store, reader) = temp.open();
+    load_workstreams_home(&mut store);
+    let rows = views::workstreams(&reader).expect("workstreams");
+    for ws in &rows {
+        let graph = views::live_graph(&reader, ws.id)
+            .expect("query")
+            .expect("every fixture workstream has a session");
+        let session = graph.session_cost_usd.unwrap_or(0.0);
+        assert!(
+            session <= ws.cost_usd.unwrap_or(0.0) + 1e-12,
+            "{}: {session} this session over {:?} total",
+            ws.name,
+            ws.cost_usd
+        );
+    }
+
+    // C9 was renamed demo-repo-81 -> demo-repo-82 mid-session, and
+    // demo-repo-82 holds only the part after the rename.
+    let renamed = by_name(&rows, "demo-repo-82");
+    let graph = views::live_graph(&reader, renamed.id)
+        .expect("query")
+        .expect("a graph");
+    assert_eq!(graph.session_id, "5e55c0c0-0000-4000-8000-0000000000c9");
+    assert!(
+        close(graph.session_cost_usd, renamed.cost_usd.expect("priced")),
+        "{:?} vs {:?}",
+        graph.session_cost_usd,
+        renamed.cost_usd
+    );
+    // Summed per agent, the whole session runs over the workstream's total.
+    let whole: f64 = graph.agents.iter().filter_map(|a| a.cost_usd).sum();
+    assert!(whole > renamed.cost_usd.expect("priced"), "{whole}");
 }

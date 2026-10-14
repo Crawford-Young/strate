@@ -95,6 +95,9 @@ function agent(over: Partial<GraphAgent> & Pick<GraphAgent, 'id'>): GraphAgent {
 const shellGraph: LiveGraph = {
   sessionId: 's-2',
   live: true,
+  sessionCostUsd: 0.42,
+  // As read at 11:02:30, the clock the session line test starts on.
+  runMs: 62 * 60_000 + 30_000,
   agents: [
     agent({
       id: 10,
@@ -121,6 +124,8 @@ const shellGraph: LiveGraph = {
 const unnamedGraph: LiveGraph = {
   sessionId: 's-3',
   live: true,
+  sessionCostUsd: null,
+  runMs: null,
   agents: [agent({ id: 20, agentId: null, kind: 'orchestrator', name: 'app-main' })],
   edges: [],
 }

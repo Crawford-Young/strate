@@ -102,6 +102,11 @@ pub struct NeedsYou {
 pub struct LiveGraph {
     pub session_id: String,
     pub live: bool,
+    /// The drawn session's priced requests that count toward this
+    /// workstream (`event_workstreams`); `None` with none.
+    pub session_cost_usd: Option<f64>,
+    /// The drawn session's wall time, first record to last (`sessions.run_ms`).
+    pub run_ms: Option<i64>,
     pub agents: Vec<GraphAgent>,
     pub edges: Vec<GraphEdge>,
 }
@@ -478,6 +483,24 @@ fn units(conn: &Connection, root: i64, drawn: &str) -> Result<Vec<(String, bool)
     .collect()
 }
 
+/// The $ of `session_id` that counts toward workstream `root`, never more
+/// than the workstream's total, and the session's run time.
+fn session_totals(
+    conn: &Connection,
+    session_id: &str,
+    root: i64,
+) -> Result<(Option<f64>, Option<i64>)> {
+    conn.prepare_cached(
+        "SELECT (SELECT sum(r.cost_usd) FROM requests AS r
+                 JOIN event_workstreams AS w ON w.event = r.id
+                 WHERE r.session_id = ?1 AND w.workstream = ?2),
+             (SELECT run_ms FROM sessions WHERE session_id = ?1)",
+    )?
+    .query_row(rusqlite::params![session_id, root], |r| {
+        Ok((r.get(0)?, r.get(1)?))
+    })
+}
+
 /// The graph of the session `workstream` draws (any id of a merge chain
 /// resolves to its root), plus every unit any of the workstream's sessions
 /// directed: its orchestrator under the drawn one by a `directs` edge, and
@@ -495,6 +518,7 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
         return Ok(None);
     };
     let live = shown.live;
+    let (session_cost_usd, run_ms) = session_totals(conn, &shown.session_id, root)?;
     let mut rows = session_agents(conn, &shown.session_id, Some(root), live)?;
     let director = rows
         .iter()
@@ -526,6 +550,8 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
     Ok(Some(LiveGraph {
         session_id: shown.session_id,
         live,
+        session_cost_usd,
+        run_ms,
         agents,
         edges,
     }))
@@ -702,12 +728,24 @@ mod tests {
         let graph = LiveGraph {
             session_id: "s".into(),
             live: true,
+            session_cost_usd: None,
+            run_ms: None,
             agents: vec![],
             edges: vec![],
         };
         let mut got = keys(&graph);
         got.sort();
-        assert_eq!(got, ["agents", "edges", "live", "sessionId"]);
+        assert_eq!(
+            got,
+            [
+                "agents",
+                "edges",
+                "live",
+                "runMs",
+                "sessionCostUsd",
+                "sessionId"
+            ]
+        );
         let mut got = keys(Workstream {
             id: 1,
             name: "n".into(),
