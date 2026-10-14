@@ -87,10 +87,12 @@ fn reply(uuid: &str, at: &str, input: u64, cached: u64, dispatches: &[&str]) -> 
                                  "output_tokens": 100}}})
 }
 
+/// A foreground dispatch's answer: its subagent's report.
 fn result(uuid: &str, at: &str, tool_use_id: &str) -> Value {
     json!({"type": "user", "uuid": uuid, "timestamp": at,
            "message": {"role": "user", "content": [
-               {"type": "tool_result", "tool_use_id": tool_use_id, "content": "Lorem."}]}})
+               {"type": "tool_result", "tool_use_id": tool_use_id, "content": "Lorem."}]},
+           "toolUseResult": {"status": "completed", "content": [{"type": "text", "text": "Lorem."}]}})
 }
 
 fn dispatched(session: &str, agent: &str, tool_use_id: &str) -> SubagentNode {

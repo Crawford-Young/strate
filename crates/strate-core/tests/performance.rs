@@ -2,11 +2,13 @@
 //! each dispatch's outcome from its task notifications and final report,
 //! follow-ups by SendMessage, context peaks, and the API-error and
 //! SendMessage columns of `events`, and the performance read over them
-//! with the GitHub cache from `tests/fixtures/github/perf-home.json`. Every
-//! db lives in a temp dir.
+//! with the GitHub cache from `tests/fixtures/github/perf-home.json`; and a
+//! background dispatch's state on the canvas from its launch to its
+//! notification (#42). Every db lives in a temp dir.
 
 use std::fs;
 use std::io;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,9 +16,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 use strate_core::cost::context_pct;
 use strate_core::discovery::discover;
 use strate_core::github::{Runner, refresh};
+use strate_core::hooks::{Hook, HookEvent};
+use strate_core::registry::{RegistryEvent, parse_snapshot};
 use strate_core::store::Store;
 use strate_core::store::views::{
-    AuditFilter, GroupBy, Performance, PermissionWaits, Tokens, performance,
+    self, AgentState, AuditFilter, GroupBy, Performance, PermissionWaits, Tokens, performance,
 };
 use strate_core::tail::{Batch, Checkpoint, FileIdentity, TailEvent};
 
@@ -82,23 +86,32 @@ fn transcripts() -> Vec<PathBuf> {
 
 /// The whole of `path` as one batch, each line a record at its byte offset.
 fn batch(path: &Path) -> Batch {
+    lines(path, 0..usize::MAX)
+}
+
+/// Lines `range` of `path` as one batch, each a record at its byte offset,
+/// checkpointed at the end of the last: a transcript as it grows.
+fn lines(path: &Path, range: Range<usize>) -> Batch {
     let text = fs::read_to_string(path).expect("read");
     let path: Arc<Path> = path.into();
-    let mut offset = 0u64;
+    let (mut offset, mut end) = (0u64, 0u64);
     let mut events = Vec::new();
-    for line in text.split_inclusive('\n') {
-        events.push(TailEvent::Record {
-            path: path.clone(),
-            offset,
-            value: serde_json::from_str(line).expect("fixture line is json"),
-        });
+    for (n, line) in text.split_inclusive('\n').enumerate() {
+        if range.contains(&n) {
+            events.push(TailEvent::Record {
+                path: path.clone(),
+                offset,
+                value: serde_json::from_str(line).expect("fixture line is json"),
+            });
+            end = offset + line.len() as u64;
+        }
         offset += line.len() as u64;
     }
     Batch {
         path,
         events,
         checkpoint: Some(Checkpoint {
-            offset,
+            offset: end,
             identity: FileIdentity {
                 volume: 0,
                 index: 0,
@@ -313,6 +326,81 @@ fn opening_a_store_from_an_older_rollup_version_backfills_every_column() {
         event_column(&db, "api_error", "g-24").as_deref(),
         Some("prompt_too_long")
     );
+}
+
+/// Each dispatch's state on perf-1's canvas, in `B` order.
+fn states(reader: &Connection) -> Vec<AgentState> {
+    let rows = views::workstreams(reader).expect("workstreams");
+    let perf1 = rows.iter().find(|w| w.name == "perf-1").expect("perf-1");
+    let graph = views::live_graph(reader, perf1.id)
+        .expect("query")
+        .expect("a graph");
+    assert_eq!(graph.session_id, SID);
+    B.iter()
+        .map(|b| {
+            let agent = graph
+                .agents
+                .iter()
+                .find(|a| a.agent_id.as_deref() == Some(b));
+            agent.unwrap_or_else(|| panic!("{b} not drawn")).state
+        })
+        .collect()
+}
+
+#[test]
+fn a_background_dispatch_works_from_its_launch_until_its_notification() {
+    use AgentState::{Done, Working};
+    let t = Temp::new("background");
+    let mut store = Store::open_in(t.db(), "UTC").expect("open");
+    store
+        .ingest_graph(&discover(&root()).expect("discover"))
+        .expect("graph");
+    let entry = format!(
+        r#"[{{"pid":4101,"cwd":"/work/perf","kind":"interactive","startedAt":1791000000000,
+             "sessionId":"{SID}","name":"perf-1","status":"busy"}}]"#
+    );
+    store
+        .apply_registry(&[RegistryEvent::Appeared {
+            entry: parse_snapshot(entry.as_bytes()).expect("entry").remove(0),
+            at_ms: 1000,
+        }])
+        .expect("live");
+    let reader = Store::open_reader(t.db()).expect("reader");
+    let main = root().join(format!("projects/-work-perf/{SID}.jsonl"));
+    let b1 = root().join(format!(
+        "projects/-work-perf/{SID}/subagents/agent-{}.jsonl",
+        B[0]
+    ));
+
+    // The title, the prompt, b1's dispatch and its immediate launch result.
+    store.ingest(&lines(&main, 0..4)).expect("launch");
+    assert_eq!(states(&reader)[0], Working, "a launch result is no answer");
+    // b1's transcript grows: its task, then two requests.
+    for n in 0..3 {
+        store.ingest(&lines(&b1, n..n + 1)).expect("b1 grows");
+        assert_eq!(states(&reader)[0], Working, "b1 record {n}");
+    }
+    // The other launches, then every notification: b6 is never notified.
+    store
+        .ingest(&lines(&main, 4..usize::MAX))
+        .expect("notifications");
+    assert_eq!(
+        states(&reader),
+        [Done, Done, Done, Done, Done, Working],
+        "a notification of any status ends a dispatch"
+    );
+    // b6's SubagentStop hook ends it too.
+    store
+        .apply_hook(&Hook {
+            received_ms: 2000,
+            event: HookEvent::SubagentStop {
+                session_id: SID.into(),
+                agent_id: B[5].into(),
+                agent_type: Some("implementer".into()),
+            },
+        })
+        .expect("stop");
+    assert_eq!(states(&reader), [Done; 6]);
 }
 
 /// The store built from every transcript, with `perf`'s GitHub cache
