@@ -302,6 +302,13 @@ struct PrLink {
     repository: Option<String>,
 }
 
+/// A session's start and its last activity: the latest record its timeline
+/// counts, read from the `events_session_time` index alone (v10, #46).
+const SESSION_SQL: &str = "SELECT (SELECT started_at FROM sessions WHERE session_id = ?1),
+         (SELECT max(timestamp) FROM events
+          WHERE session_id = ?1 AND timestamp IS NOT NULL
+            AND ifnull(type, '') NOT IN ('custom-title', 'ai-title', 'cost-state'))";
+
 impl Session {
     fn load(conn: &Connection, session_id: &str) -> Result<Self> {
         let links = conn
@@ -318,12 +325,7 @@ impl Session {
             })?
             .collect::<Result<_>>()?;
         let (start, last): (Option<String>, Option<String>) = conn
-            .prepare_cached(
-                "SELECT (SELECT started_at FROM sessions WHERE session_id = ?1),
-                     (SELECT max(timestamp) FROM events
-                      WHERE session_id = ?1 AND timestamp IS NOT NULL
-                        AND ifnull(type, '') NOT IN ('custom-title', 'ai-title', 'cost-state'))",
-            )?
+            .prepare_cached(SESSION_SQL)?
             .query_row([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
         Ok(Self {
             links,
@@ -412,6 +414,35 @@ fn linked_pr(prs: &[GhPr], links: &[PrLink], repo: &str) -> Option<i64> {
     })
 }
 
+/// Every subagent of the sessions with subagent cells on days `?1..=?2`
+/// (see [`Agent::load_all`]). The background flag reads only the events the
+/// `events_async_launch` index holds (v10, #46), so its predicate must stay
+/// `json_extract(e.raw, '$.toolUseResult.status') = 'async_launched'`.
+const AGENTS_SQL: &str = "WITH wanted (session_id) AS (
+         SELECT DISTINCT session_id FROM audit_cells
+         WHERE day BETWEEN ?1 AND ?2 AND agent_id IS NOT NULL
+     ),
+     dispatch (child, tool_use_id, parent_session) AS (
+         SELECT d.child, d.tool_use_id, p.session_id FROM edges AS d
+         JOIN agents AS c ON c.id = d.child
+         JOIN agents AS p ON p.id = d.parent
+         WHERE d.kind = 'dispatch' AND c.session_id IN (SELECT session_id FROM wanted)
+     ),
+     background (id) AS (
+         SELECT j.value
+         FROM events AS e, json_each(e.tool_results) AS j
+         WHERE e.session_id IN (SELECT parent_session FROM dispatch)
+           AND e.tool_results IS NOT NULL
+           AND json_extract(e.raw, '$.toolUseResult.status') = 'async_launched'
+     )
+     SELECT a.session_id, a.agent_id,
+         coalesce(a.registry_name, a.name, a.description, a.agent_type), a.agent_type,
+         a.run_ms,
+         EXISTS (SELECT 1 FROM dispatch AS d
+             WHERE d.child = a.id AND d.tool_use_id IN (SELECT id FROM background))
+     FROM agents AS a
+     WHERE a.session_id IN (SELECT session_id FROM wanted) AND a.agent_id IS NOT NULL";
+
 /// A subagent as its node shows it.
 pub(crate) struct Agent {
     pub(crate) label: String,
@@ -434,45 +465,20 @@ impl Agent {
         from: &str,
         to: &str,
     ) -> Result<HashMap<(String, String), Self>> {
-        conn.prepare_cached(
-            "WITH wanted (session_id) AS (
-                 SELECT DISTINCT session_id FROM audit_cells
-                 WHERE day BETWEEN ?1 AND ?2 AND agent_id IS NOT NULL
-             ),
-             dispatch (child, tool_use_id, parent_session) AS (
-                 SELECT d.child, d.tool_use_id, p.session_id FROM edges AS d
-                 JOIN agents AS c ON c.id = d.child
-                 JOIN agents AS p ON p.id = d.parent
-                 WHERE d.kind = 'dispatch' AND c.session_id IN (SELECT session_id FROM wanted)
-             ),
-             background (id) AS (
-                 SELECT j.value
-                 FROM events AS e, json_each(e.tool_results) AS j
-                 WHERE e.session_id IN (SELECT parent_session FROM dispatch)
-                   AND e.tool_results IS NOT NULL
-                   AND json_extract(e.raw, '$.toolUseResult.status') = 'async_launched'
-             )
-             SELECT a.session_id, a.agent_id,
-                 coalesce(a.registry_name, a.name, a.description, a.agent_type), a.agent_type,
-                 a.run_ms,
-                 EXISTS (SELECT 1 FROM dispatch AS d
-                     WHERE d.child = a.id AND d.tool_use_id IN (SELECT id FROM background))
-             FROM agents AS a
-             WHERE a.session_id IN (SELECT session_id FROM wanted) AND a.agent_id IS NOT NULL",
-        )?
-        .query_map([from, to], |r| {
-            let agent_id: String = r.get(1)?;
-            Ok((
-                (r.get(0)?, agent_id.clone()),
-                Self {
-                    label: r.get::<_, Option<String>>(2)?.unwrap_or(agent_id),
-                    agent_type: r.get(3)?,
-                    run_ms: r.get(4)?,
-                    background: r.get(5)?,
-                },
-            ))
-        })?
-        .collect()
+        conn.prepare_cached(AGENTS_SQL)?
+            .query_map([from, to], |r| {
+                let agent_id: String = r.get(1)?;
+                Ok((
+                    (r.get(0)?, agent_id.clone()),
+                    Self {
+                        label: r.get::<_, Option<String>>(2)?.unwrap_or(agent_id),
+                        agent_type: r.get(3)?,
+                        run_ms: r.get(4)?,
+                        background: r.get(5)?,
+                    },
+                ))
+            })?
+            .collect()
     }
 
     /// A subagent with cells but no `agents` row.
@@ -483,5 +489,47 @@ impl Agent {
             run_ms: None,
             background: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+    use crate::tail::test_dir;
+
+    /// Each step of `sql`'s query plan, one per line, every parameter "".
+    fn plan(conn: &Connection, sql: &str) -> String {
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("plan");
+        let params = vec![""; stmt.parameter_count()];
+        stmt.query_map(rusqlite::params_from_iter(params), |r| {
+            r.get::<_, String>(3)
+        })
+        .expect("steps")
+        .collect::<Result<Vec<_>>>()
+        .expect("detail")
+        .join("\n")
+    }
+
+    /// `events` rows carry their whole record, so a scan of a session's
+    /// rows costs ~1 ms each: the Audit's two reads of them go through
+    /// their v10 indexes instead (#46).
+    #[test]
+    fn the_audits_reads_of_events_use_their_indexes() {
+        let dir = test_dir("audit-plans");
+        let db = dir.join("strate.db");
+        drop(Store::open(&db).expect("open"));
+        let conn = Store::open_reader(&db).expect("reader");
+        let session = plan(&conn, SESSION_SQL);
+        assert!(
+            session.contains("COVERING INDEX events_session_time"),
+            "{session}"
+        );
+        let agents = plan(&conn, AGENTS_SQL);
+        assert!(agents.contains("INDEX events_async_launch"), "{agents}");
+        drop(conn);
+        std::fs::remove_dir_all(dir).expect("cleanup");
     }
 }
