@@ -49,6 +49,8 @@ describe('commands', () => {
     const graph: LiveGraph = {
       sessionId: 's-alpha',
       live: true,
+      sessionCostUsd: 0.01,
+      runMs: 40_000,
       agents: [
         {
           id: 1,

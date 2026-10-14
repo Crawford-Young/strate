@@ -38,6 +38,8 @@ interface CanvasProps {
 }
 
 export function Canvas({ error, status, active, graph, selected, onSelect }: CanvasProps) {
+  // Outlives tab switches, so a session's count goes on while another tab shows.
+  const [firstSeen] = useState(() => new Map<string, FirstSeen>())
   if (error !== null) return <EmptyState message={`Couldn't read the store: ${error}`} />
   if (status !== 'live') {
     return (
@@ -52,7 +54,7 @@ export function Canvas({ error, status, active, graph, selected, onSelect }: Can
   if (active === null) return <EmptyState message="No live sessions." />
   return (
     <TabsContent value={String(active.id)} className="mt-0 h-full">
-      <SessionHeader ws={active} graph={graph ?? null} />
+      <SessionHeader ws={active} graph={graph ?? null} firstSeen={firstSeen} />
       {graph === null && (
         <div className="p-4 pt-16">
           <EmptyState message="No session to draw yet." />
@@ -267,13 +269,53 @@ function GraphView({ graph, selected, onSelect }: GraphViewProps) {
   )
 }
 
-/** The tab's name and the one line over the canvas, ticking as its minutes change. */
-function SessionHeader({ ws, graph }: { ws: Workstream; graph: LiveGraph | null }) {
-  const now = useClock(ws.startedAt ? Date.parse(ws.startedAt) : 0)
+/** A session's latest run time and when this canvas first saw it. */
+interface FirstSeen {
+  runMs: number | null
+  at: number
+}
+
+interface SessionHeaderProps {
+  ws: Workstream
+  graph: LiveGraph | null
+  /** Per session id; one entry each, replaced when its run time moves. */
+  firstSeen: Map<string, FirstSeen>
+}
+
+/** When `graph`'s session was first seen at its current run time; now for one not seen yet. */
+function seenAt(firstSeen: Map<string, FirstSeen>, graph: LiveGraph | null): number {
+  if (graph === null) return Date.now()
+  const seen = firstSeen.get(graph.sessionId)
+  if (seen?.runMs === graph.runMs) return seen.at
+  const at = Date.now()
+  firstSeen.set(graph.sessionId, { runMs: graph.runMs, at })
+  return at
+}
+
+/** The tab's name and the one line over the canvas. */
+function SessionHeader({ ws, graph, firstSeen }: SessionHeaderProps) {
   return (
     <div className="pointer-events-none absolute left-4 top-3.5 z-10 flex flex-col gap-0.5">
       <h2 className="font-mono text-sm font-semibold">{ws.name}</h2>
-      <p className="text-xs tabular-nums text-muted-foreground">{sessionLine(ws, graph, now)}</p>
+      {/* A reread with no new run time (a store change elsewhere) or a return from another tab
+          keeps the count going; a new run time starts it again. */}
+      <SessionText
+        key={`${graph?.sessionId}:${graph?.runMs}`}
+        ws={ws}
+        graph={graph}
+        firstSeen={firstSeen}
+      />
     </div>
+  )
+}
+
+/** The session line, its run time ticking on from when it was first seen, as its minutes change. */
+function SessionText({ ws, graph, firstSeen }: SessionHeaderProps) {
+  const [readAt] = useState(() => seenAt(firstSeen, graph))
+  const now = useClock(readAt - (graph?.runMs ?? 0))
+  return (
+    <p className="text-xs tabular-nums text-muted-foreground">
+      {sessionLine(ws, graph, now - readAt)}
+    </p>
   )
 }

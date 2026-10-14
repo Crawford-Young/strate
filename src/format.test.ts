@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { GraphAgent, LiveGraph, Workstream } from './api'
-import { duration, money, nodeState, sessionCost, sessionLine } from './format'
+import { duration, money, nodeState, sessionLine } from './format'
 
 const MIN = 60_000
 
@@ -23,8 +23,17 @@ function agent(costUsd: number | null): GraphAgent {
   }
 }
 
-function graph(...costs: (number | null)[]): LiveGraph {
-  return { sessionId: 's', live: true, agents: costs.map(agent), edges: [] }
+/** A session that has run 1h 2m and spent $0.42 in this workstream. */
+function graph(over: Partial<LiveGraph> = {}): LiveGraph {
+  return {
+    sessionId: 's',
+    live: true,
+    sessionCostUsd: 0.42,
+    runMs: 62 * MIN,
+    agents: [agent(0.3)],
+    edges: [],
+    ...over,
+  }
 }
 
 const ws: Workstream = {
@@ -40,7 +49,6 @@ const ws: Workstream = {
   startedAt: '2026-10-12T10:00:00Z',
   director: null,
 }
-const at = (iso: string) => Date.parse(iso)
 
 describe('money', () => {
   it('shows dollars to the cent', () => {
@@ -84,54 +92,36 @@ describe('nodeState', () => {
   })
 })
 
-describe('sessionCost', () => {
-  it('sums the drawn agents, skipping unpriced ones', () => {
-    expect(sessionCost(graph(0.25, null, 0.5))).toBe(0.75)
-  })
-
-  it('leaves out directed units and everything beneath them', () => {
-    const at = (id: number, costUsd: number): GraphAgent => ({ ...agent(costUsd), id })
-    const director: LiveGraph = {
-      sessionId: 's',
-      live: true,
-      agents: [at(1, 1), at(2, 10), at(3, 100), at(4, 1000)],
-      edges: [
-        { kind: 'dispatch', parent: 1, child: 2 },
-        { kind: 'directs', parent: 1, child: 3 },
-        { kind: 'dispatch', parent: 3, child: 4 },
-        { kind: 'directs', parent: 1, child: 4 },
-      ],
-    }
-    expect(sessionCost(director)).toBe(11)
-  })
-
-  it('is null with no graph or nothing priced', () => {
-    expect(sessionCost(null)).toBeNull()
-    expect(sessionCost(graph(null, null))).toBeNull()
-  })
-})
-
 describe('sessionLine', () => {
-  it('shows running time, session $, total $ and needs-you for a live tab', () => {
-    const line = sessionLine({ ...ws, needsYou: 2 }, graph(0.42), at('2026-10-12T11:02:00Z'))
-    expect(line).toBe('running 1h 2m · $0.42 this session · $3.10 total · 2 needs you')
+  it('shows run time, session $, total $ and needs-you for a live tab', () => {
+    expect(sessionLine({ ...ws, needsYou: 2 }, graph(), 0)).toBe(
+      'running 1h 2m · $0.42 this session · $3.10 total · 2 needs you',
+    )
   })
 
-  it('leaves needs-you out at zero', () => {
-    expect(sessionLine(ws, graph(0.42), at('2026-10-12T10:05:00Z'))).toBe(
-      'running 5m · $0.42 this session · $3.10 total',
+  it('adds the time since the graph was read to the session run time', () => {
+    expect(sessionLine(ws, graph(), 3 * MIN)).toBe(
+      'running 1h 5m · $0.42 this session · $3.10 total',
+    )
+  })
+
+  it("takes the session $ and run time from the graph, never its agents or the tab's start", () => {
+    const early = { ...ws, startedAt: '2026-10-01T00:00:00Z' }
+    expect(sessionLine(early, graph({ agents: [agent(9), agent(4)] }), 0)).toBe(
+      'running 1h 2m · $0.42 this session · $3.10 total',
     )
   })
 
   it('says finished once the session is not live', () => {
-    expect(sessionLine({ ...ws, live: false }, null, at('2026-10-12T11:00:00Z'))).toBe(
+    expect(sessionLine({ ...ws, live: false }, graph({ sessionCostUsd: null }), 0)).toBe(
       'finished · $— this session · $3.10 total',
     )
   })
 
-  it('says running without a time when the start is unknown', () => {
-    expect(sessionLine({ ...ws, startedAt: null }, null, 0)).toBe(
-      'running · $— this session · $3.10 total',
+  it('says running without a time until the graph has a run time', () => {
+    expect(sessionLine(ws, null, 0)).toBe('running · $— this session · $3.10 total')
+    expect(sessionLine(ws, graph({ runMs: null }), 5 * MIN)).toBe(
+      'running · $0.42 this session · $3.10 total',
     )
   })
 })

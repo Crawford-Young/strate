@@ -2,7 +2,7 @@ import { Tabs } from '@crawfordyoung/ui'
 import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import type { ElkNode } from 'elkjs/lib/elk-api'
 import ELK from 'elkjs/lib/elk.bundled.js'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { centerCalls, flowProps, resetFlow, zoomCalls } from '../tests/xyflow-mock'
 import type { GraphAgent, GraphEdge, LiveGraph, Workstream } from './api'
 import { Canvas } from './Canvas'
@@ -64,6 +64,8 @@ const dispatch = (parent: number, child: number): GraphEdge => ({ kind: 'dispatc
 const tiered: LiveGraph = {
   sessionId: 's-1',
   live: true,
+  sessionCostUsd: null,
+  runMs: null,
   agents: [
     agent({ id: 1, kind: 'orchestrator', agentId: null, name: 'lead' }),
     agent({ id: 2, parent: 1, name: 'builder' }),
@@ -128,8 +130,7 @@ describe('live graph', () => {
 
   it('draws a directs edge solid and brighter than dispatch, with units under the director', async () => {
     const directed: LiveGraph = {
-      sessionId: 's-1',
-      live: true,
+      ...tiered,
       agents: [
         ...tiered.agents,
         agent({ id: 5, kind: 'orchestrator', agentId: null, name: 'unit', parent: 1 }),
@@ -467,5 +468,58 @@ describe('layout', () => {
     render(view({ graph: null }))
     expect(screen.getByText('No session to draw yet.')).toBeInTheDocument()
     expect(layout).not.toHaveBeenCalled()
+  })
+})
+
+describe('session line', () => {
+  const MIN = 60_000
+  const ran = (runMs: number): LiveGraph => ({ ...tiered, runMs })
+  const running = (time: string) => screen.queryByText(new RegExp(`^running ${time} · `))
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    vi.setSystemTime(new Date('2026-10-12T11:00:00Z'))
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it("ticks the session's run time on from when it was read, each minute it crosses", async () => {
+    render(view({ graph: ran(5 * MIN + 30_000) }))
+    expect(running('5m')).toBeInTheDocument()
+    await act(() => vi.advanceTimersByTimeAsync(29_999))
+    expect(running('5m')).toBeInTheDocument()
+    await act(() => vi.advanceTimersByTimeAsync(1))
+    expect(running('6m')).toBeInTheDocument()
+  })
+
+  it('keeps ticking through a reread with the same run time, and restarts from a new one', async () => {
+    const { rerender } = render(view({ graph: ran(5 * MIN) }))
+    await act(() => vi.advanceTimersByTimeAsync(3 * MIN))
+    expect(running('8m')).toBeInTheDocument()
+    // A store change elsewhere rereads the graph; this session has no new record.
+    rerender(view({ graph: ran(5 * MIN) }))
+    expect(running('8m')).toBeInTheDocument()
+    rerender(view({ graph: ran(9 * MIN) }))
+    expect(running('9m')).toBeInTheDocument()
+    await act(() => vi.advanceTimersByTimeAsync(MIN))
+    expect(running('10m')).toBeInTheDocument()
+  })
+
+  it('keeps counting a session through a visit to another tab', async () => {
+    const { rerender } = render(view({ graph: ran(5 * MIN) }))
+    await act(() => vi.advanceTimersByTimeAsync(2 * MIN))
+    rerender(view({ graph: { ...ran(5 * MIN), sessionId: 's-2' }, active: ws(2) }))
+    await act(() => vi.advanceTimersByTimeAsync(MIN))
+    rerender(view({ graph: ran(5 * MIN) }))
+    expect(running('8m')).toBeInTheDocument()
+  })
+
+  it("restarts the count on another tab's session", async () => {
+    const { rerender } = render(view({ graph: ran(5 * MIN) }))
+    await act(() => vi.advanceTimersByTimeAsync(2 * MIN))
+    rerender(view({ graph: { ...ran(5 * MIN), sessionId: 's-2' }, active: ws(2) }))
+    expect(running('5m')).toBeInTheDocument()
   })
 })
