@@ -38,7 +38,7 @@ interface LiveShellProps {
 }
 
 export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProps) {
-  const version = useStoreVersion()
+  const version = useStoreVersion(hidden)
   const [selection, setSelection] = useState<Selection>(NONE)
   const overview = useLoad('overview', version, async () => {
     const loaded = await Promise.all([status(), workstreams()])
