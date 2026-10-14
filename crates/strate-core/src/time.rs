@@ -10,7 +10,11 @@
 
 use std::collections::HashMap;
 
-use jiff::{Timestamp, Zoned, tz::TimeZone};
+use jiff::{
+    Timestamp, Zoned,
+    civil::{Date, Time},
+    tz::TimeZone,
+};
 
 /// Silence longer than this between two records is idle, not active.
 pub const IDLE_GAP_MS: i64 = 10 * 60 * 1000;
@@ -262,10 +266,42 @@ pub fn local_day(tz: &TimeZone, ms: i64) -> Option<String> {
     instant(tz, ms).map(|z| z.date().to_string())
 }
 
-/// The local midnight starting the day of `ms`, as epoch ms.
-pub fn day_start(tz: &TimeZone, ms: i64) -> Option<i64> {
-    let start = instant(tz, ms)?.start_of_day().ok()?;
-    Some(start.timestamp().as_millisecond())
+/// `ms` on its local day's wall clock: ms from that day's 00:00 to its
+/// clock time, so 10:00 is 10 h even on a 23 h or 25 h day. `None` outside
+/// jiff's range.
+pub fn wall_ms(tz: &TimeZone, ms: i64) -> Option<i64> {
+    let at = instant(tz, ms)?;
+    Some(since_midnight(&at, at.date()))
+}
+
+/// `[start, end)` on the wall clock of `start`'s local day (an end past
+/// that day runs past 24:00), as one piece per UTC offset in force across
+/// it: a 23 h day's skipped hour holds nothing, and a 25 h day's repeated
+/// hour holds both passes. `None` outside jiff's range.
+pub fn wall_clock(tz: &TimeZone, start: i64, end: i64) -> Option<Vec<(i64, i64)>> {
+    let day = instant(tz, start)?.date();
+    let changes = tz
+        .following(Timestamp::from_millisecond(start).ok()?)
+        .map(|t| t.timestamp().as_millisecond())
+        .take_while(|&t| t < end)
+        .filter(|&t| t > start);
+    let mut cuts: Vec<i64> = std::iter::once(start).chain(changes).collect();
+    cuts.push(end);
+    cuts.windows(2)
+        .map(|w| {
+            let from = since_midnight(&instant(tz, w[0])?, day);
+            Some((from, from + w[1] - w[0]))
+        })
+        .collect()
+}
+
+/// `at`'s clock time as ms from 00:00 on `day`.
+fn since_midnight(at: &Zoned, day: Date) -> i64 {
+    let ms = at
+        .datetime()
+        .duration_since(day.to_datetime(Time::midnight()))
+        .as_millis();
+    i64::try_from(ms).expect("jiff's range fits in i64 ms")
 }
 
 fn instant(tz: &TimeZone, ms: i64) -> Option<Zoned> {
@@ -850,24 +886,110 @@ mod tests {
         assert_eq!(local_day(&toronto, mar9).as_deref(), Some("2026-03-09"));
     }
 
+    const H: i64 = 3_600_000;
+    const M: i64 = 60_000;
+
+    fn ts(s: &str) -> i64 {
+        parse_timestamp(s).expect("ts")
+    }
+
     #[test]
-    fn a_local_day_starts_at_its_own_midnight() {
+    fn a_moment_reads_its_own_days_wall_clock() {
         let toronto = jiff::tz::TimeZone::get("America/Toronto").expect("tz");
-        // 06:00 EDT on Oct 3 -> 04:00Z; in UTC, 10:00 -> 00:00Z.
-        assert_eq!(day_start(&toronto, T0), Some(T0 - 6 * 3_600_000));
+        // 06:00 EDT on Oct 3; in UTC, 10:00.
+        assert_eq!(wall_ms(&toronto, T0), Some(6 * H));
+        assert_eq!(wall_ms(&jiff::tz::TimeZone::UTC, T0), Some(10 * H));
+        // Mar 8 (23 h, midnight 05:00Z): 14:00Z is 10:00 EDT, 9 h in.
         assert_eq!(
-            day_start(&jiff::tz::TimeZone::UTC, T0),
-            Some(T0 - 10 * 3_600_000)
+            wall_ms(&toronto, ts("2026-03-08T06:59:59Z")),
+            Some(2 * H - 1000)
         );
-        // Around the 25 h Nov 1 and the 23 h Mar 8.
-        let nov1 = parse_timestamp("2026-11-01T04:00:00Z").expect("ts");
-        let nov2 = parse_timestamp("2026-11-02T05:00:00Z").expect("ts");
-        assert_eq!(day_start(&toronto, nov2), Some(nov2));
-        assert_eq!(day_start(&toronto, nov2 - 1), Some(nov1));
-        let mar8 = parse_timestamp("2026-03-08T05:00:00Z").expect("ts");
-        let mar9 = parse_timestamp("2026-03-09T04:00:00Z").expect("ts");
-        assert_eq!(day_start(&toronto, mar9 - 1), Some(mar8));
-        assert_eq!(day_start(&toronto, i64::MAX), None);
+        assert_eq!(wall_ms(&toronto, ts("2026-03-08T07:00:00Z")), Some(3 * H));
+        assert_eq!(wall_ms(&toronto, ts("2026-03-08T14:00:00Z")), Some(10 * H));
+        // Nov 1 (25 h, midnight 04:00Z): 01:30 comes twice, and 04:30Z on
+        // Nov 2 is 23:30 EST, 24.5 h in.
+        assert_eq!(
+            wall_ms(&toronto, ts("2026-11-01T05:30:00Z")),
+            Some(H + 30 * M)
+        );
+        assert_eq!(
+            wall_ms(&toronto, ts("2026-11-01T06:30:00Z")),
+            Some(H + 30 * M)
+        );
+        assert_eq!(
+            wall_ms(&toronto, ts("2026-11-02T04:30:00Z")),
+            Some(23 * H + 30 * M)
+        );
+        assert_eq!(wall_ms(&toronto, ts("2026-11-02T05:00:00Z")), Some(0));
+        assert_eq!(wall_ms(&toronto, i64::MAX), None);
+    }
+
+    #[test]
+    fn a_span_on_the_wall_clock_is_cut_at_each_offset_change() {
+        let toronto = jiff::tz::TimeZone::get("America/Toronto").expect("tz");
+        let utc = jiff::tz::TimeZone::UTC;
+        // No change: one piece, and a day's end is 24:00, not 00:00.
+        assert_eq!(wall_clock(&toronto, T0, T0 + H), Some(vec![(6 * H, 7 * H)]));
+        let (oct3, oct4) = (T0 - 6 * H, T0 + 18 * H);
+        assert_eq!(wall_clock(&toronto, oct3, oct4), Some(vec![(0, 24 * H)]));
+        assert_eq!(
+            wall_clock(&utc, T0, T0 + 20 * H),
+            Some(vec![(10 * H, 30 * H)])
+        );
+        // Spring forward at 07:00Z: 01:55 EST to 03:05 EDT skips 02:00-03:00.
+        assert_eq!(
+            wall_clock(
+                &toronto,
+                ts("2026-03-08T06:55:00Z"),
+                ts("2026-03-08T07:05:00Z")
+            ),
+            Some(vec![(H + 55 * M, 2 * H), (3 * H, 3 * H + 5 * M)])
+        );
+        // The whole 23 h day.
+        assert_eq!(
+            wall_clock(
+                &toronto,
+                ts("2026-03-08T05:00:00Z"),
+                ts("2026-03-09T04:00:00Z")
+            ),
+            Some(vec![(0, 2 * H), (3 * H, 24 * H)])
+        );
+        // Fall back at 06:00Z: 01:55 EDT to 01:05 EST passes 01:00-02:00
+        // twice, and so does the whole 25 h day.
+        assert_eq!(
+            wall_clock(
+                &toronto,
+                ts("2026-11-01T05:55:00Z"),
+                ts("2026-11-01T06:05:00Z")
+            ),
+            Some(vec![(H + 55 * M, 2 * H), (H, H + 5 * M)])
+        );
+        assert_eq!(
+            wall_clock(
+                &toronto,
+                ts("2026-11-01T04:00:00Z"),
+                ts("2026-11-02T05:00:00Z")
+            ),
+            Some(vec![(0, 2 * H), (H, 24 * H)])
+        );
+        // A change on the span's edge cuts nothing.
+        assert_eq!(
+            wall_clock(
+                &toronto,
+                ts("2026-11-01T06:00:00Z"),
+                ts("2026-11-01T06:05:00Z")
+            ),
+            Some(vec![(H, H + 5 * M)])
+        );
+        assert_eq!(
+            wall_clock(
+                &toronto,
+                ts("2026-11-01T05:55:00Z"),
+                ts("2026-11-01T06:00:00Z")
+            ),
+            Some(vec![(H + 55 * M, 2 * H)])
+        );
+        assert_eq!(wall_clock(&toronto, i64::MAX - 1, i64::MAX), None);
     }
 
     #[test]

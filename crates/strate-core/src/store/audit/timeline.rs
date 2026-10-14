@@ -32,7 +32,10 @@ pub enum SpanKind {
     Agent,
 }
 
-/// `[start_ms, end_ms)` in ms since its day's local midnight.
+/// `[start_ms, end_ms)` on its day's wall clock (ms from 00:00 to the clock
+/// time), the 24 h axis DayTimeline draws even on a 23 h or 25 h day. A run
+/// across a UTC offset change is one span per side: the skipped hour holds
+/// nothing, and the repeated hour holds both passes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimelineSpan {
@@ -41,8 +44,8 @@ pub struct TimelineSpan {
     pub kind: SpanKind,
 }
 
-/// An issue's close (`#N closed`) or a PR's merge (`PR #N merged`), in ms
-/// since its day's local midnight.
+/// An issue's close (`#N closed`) or a PR's merge (`PR #N merged`), on its
+/// day's wall clock.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimelineMark {
@@ -105,16 +108,18 @@ pub fn audit_timeline(
     for session in sessions {
         for run in account::session_runs(conn, session, &tz)? {
             let Some(kind) = kind(&run) else { continue };
-            let (Some(day), Some(midnight)) = (&run.day, time::day_start(&tz, run.start)) else {
+            let (Some(day), Some(pieces)) = (&run.day, time::wall_clock(&tz, run.start, run.end))
+            else {
                 continue;
             };
             let key = (session, run.agent.as_deref(), run.segment, day.as_str());
             if timed.contains(&key) {
-                entry(&mut days, day).spans.push(TimelineSpan {
-                    start_ms: run.start - midnight,
-                    end_ms: run.end - midnight,
+                let spans = pieces.into_iter().map(|(start_ms, end_ms)| TimelineSpan {
+                    start_ms,
+                    end_ms,
                     kind,
                 });
+                entry(&mut days, day).spans.extend(spans);
             }
         }
     }
@@ -125,8 +130,7 @@ pub fn audit_timeline(
         _ => None,
     };
     for (at, label) in marks {
-        let (Some(day), Some(midnight)) = (time::local_day(&tz, at), time::day_start(&tz, at))
-        else {
+        let (Some(day), Some(at_ms)) = (time::local_day(&tz, at), time::wall_ms(&tz, at)) else {
             continue;
         };
         let shown = match own_day {
@@ -134,10 +138,9 @@ pub fn audit_timeline(
             None => (filter.from.as_str()..=filter.to.as_str()).contains(&day.as_str()),
         };
         if shown {
-            entry(&mut days, &day).marks.push(TimelineMark {
-                at_ms: at - midnight,
-                label,
-            });
+            entry(&mut days, &day)
+                .marks
+                .push(TimelineMark { at_ms, label });
         }
     }
     Ok(days
