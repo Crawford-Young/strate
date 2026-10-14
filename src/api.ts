@@ -285,13 +285,24 @@ export interface BottleneckDay {
   /** The orchestrator's active time. */
   activeMs: number
   blockedReports: number
+  /** Permission prompts that started this day: the answered ones' waits. */
+  permissionMs: number
+  /** Those prompts, open ones included. */
+  permissionPrompts: number
+}
+
+/** What the PermissionRequest hook has recorded (#52). */
+export interface PermissionWaits {
+  /** The local day of the store's first recorded prompt, whatever the filter; null: none ever. */
+  recordedSince: string | null
+  /** Prompts in the range still unanswered: counted in `permissionPrompts`, not `permissionMs`. */
+  open: number
 }
 
 export interface Bottleneck {
   /** By day, then repo; Unlinked last. */
   days: BottleneckDay[]
-  /** No source until hooks record permission prompts (#52). */
-  permissionWaits: 'not_recorded'
+  permissionWaits: PermissionWaits
 }
 
 export interface LaneCount {

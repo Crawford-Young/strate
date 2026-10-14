@@ -431,6 +431,47 @@ fn hook(at_ms: i64, event: HookEvent) -> Hook {
 
 type AgentRow = (String, Option<String>, Option<String>, Option<String>);
 
+/// (session, agent id, tool, start ms, end ms) of a stored permission wait.
+type Wait = (String, Option<String>, Option<String>, i64, Option<i64>);
+
+/// Every stored permission wait, oldest first.
+fn waits(reader: &Connection) -> Vec<Wait> {
+    let mut stmt = reader
+        .prepare(
+            "SELECT a.session_id, a.agent_id, w.tool_name, w.start_ms, w.end_ms
+             FROM permission_waits AS w JOIN agents AS a ON a.id = w.agent
+             ORDER BY w.start_ms, w.id",
+        )
+        .expect("query");
+    stmt.query_map([], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    })
+    .expect("rows")
+    .collect::<rusqlite::Result<_>>()
+    .expect("waits")
+}
+
+fn wait(agent_id: Option<&str>, tool: &str, start: i64, end: Option<i64>) -> Wait {
+    (
+        "s-alpha".into(),
+        agent_id.map(Into::into),
+        Some(tool.into()),
+        start,
+        end,
+    )
+}
+
+fn permission(at_ms: i64, agent_id: Option<&str>, tool: &str) -> Hook {
+    hook(
+        at_ms,
+        HookEvent::PermissionRequest {
+            session_id: "s-alpha".into(),
+            agent_id: agent_id.map(Into::into),
+            tool_name: Some(tool.into()),
+        },
+    )
+}
+
 /// kind, agent_type, path, hook_state of one agent.
 fn agent(reader: &Connection, session: &str, agent_id: Option<&str>) -> Vec<AgentRow> {
     let mut stmt = reader
@@ -495,7 +536,7 @@ fn subagent_start_shows_the_agent_before_its_transcript_and_ingest_merges_into_i
 }
 
 #[test]
-fn a_subagent_permission_request_is_needs_you_until_it_moves_on_or_stops() {
+fn a_subagent_permission_request_is_needs_you_and_a_stored_wait_until_it_moves_on_or_stops() {
     let temp = Temp::new("hook-permission");
     let (mut store, reader) = temp.open();
     let asked = ms("2026-10-08T10:00:05.000Z");
@@ -517,6 +558,7 @@ fn a_subagent_permission_request_is_needs_you_until_it_moves_on_or_stops() {
         asked,
     )];
     assert_eq!(needs_you(&reader), expected);
+    assert_eq!(waits(&reader), [wait(Some("a1"), "Bash", asked, None)]);
 
     // A record written before the request (the tool_use itself) changes nothing.
     let file = "s-alpha/subagents/agent-a1.jsonl";
@@ -527,6 +569,7 @@ fn a_subagent_permission_request_is_needs_you_until_it_moves_on_or_stops() {
         ))
         .expect("earlier record");
     assert_eq!(needs_you(&reader), expected);
+    assert_eq!(waits(&reader), [wait(Some("a1"), "Bash", asked, None)]);
 
     // A later record (the tool result): the agent moved on.
     store
@@ -539,6 +582,11 @@ fn a_subagent_permission_request_is_needs_you_until_it_moves_on_or_stops() {
     assert_eq!(
         agent(&reader, "s-alpha", Some("a1"))[0].3.as_deref(),
         Some("running")
+    );
+    let answered = ms("2026-10-08T10:00:09.000Z");
+    assert_eq!(
+        waits(&reader),
+        [wait(Some("a1"), "Bash", asked, Some(answered))]
     );
 
     store
@@ -565,6 +613,81 @@ fn a_subagent_permission_request_is_needs_you_until_it_moves_on_or_stops() {
     let stopped = agent(&reader, "s-alpha", Some("a1"));
     assert_eq!(stopped[0].1.as_deref(), Some("implementer"));
     assert_eq!(stopped[0].3.as_deref(), Some("done"));
+    assert_eq!(
+        waits(&reader),
+        [
+            wait(Some("a1"), "Bash", asked, Some(answered)),
+            wait(Some("a1"), "Write", asked + 10_000, Some(asked + 20_000)),
+        ]
+    );
+}
+
+#[test]
+fn a_repeated_request_with_no_record_between_is_one_wait_from_the_first() {
+    let temp = Temp::new("hook-repeat");
+    let (mut store, reader) = temp.open();
+    let asked = ms("2026-10-08T10:00:05.000Z");
+    store
+        .apply_hook(&permission(asked, Some("a1"), "Bash"))
+        .expect("first");
+    store
+        .apply_hook(&permission(asked + 3_000, Some("a1"), "Write"))
+        .expect("second");
+    assert_eq!(waits(&reader), [wait(Some("a1"), "Bash", asked, None)]);
+    store
+        .ingest(&batch(
+            "s-alpha/subagents/agent-a1.jsonl",
+            &[json!({"type":"user","uuid":"a1-u1","timestamp":"2026-10-08T10:00:20.000Z"})],
+        ))
+        .expect("answered");
+    assert_eq!(
+        waits(&reader),
+        [wait(
+            Some("a1"),
+            "Bash",
+            asked,
+            Some(ms("2026-10-08T10:00:20.000Z"))
+        )]
+    );
+}
+
+#[test]
+fn any_later_hook_on_the_agent_ends_its_wait_and_other_agents_keep_theirs() {
+    let temp = Temp::new("hook-later");
+    let (mut store, reader) = temp.open();
+    store
+        .apply_hook(&permission(100, Some("a1"), "Bash"))
+        .expect("a1");
+    store
+        .apply_hook(&permission(150, Some("a2"), "Edit"))
+        .expect("a2");
+    store
+        .apply_hook(&hook(
+            200,
+            HookEvent::SubagentStart {
+                session_id: "s-alpha".into(),
+                agent_id: "a1".into(),
+                agent_type: None,
+            },
+        ))
+        .expect("a1 start");
+    store
+        .apply_hook(&hook(
+            300,
+            HookEvent::TeammateIdle {
+                session_id: "s-alpha".into(),
+                agent_id: Some("a2".into()),
+                teammate_name: None,
+            },
+        ))
+        .expect("a2 idle");
+    assert_eq!(
+        waits(&reader),
+        [
+            wait(Some("a1"), "Bash", 100, Some(200)),
+            wait(Some("a2"), "Edit", 150, Some(300)),
+        ]
+    );
 }
 
 #[test]
@@ -591,13 +714,224 @@ fn an_orchestrator_permission_request_clears_when_the_registry_says_busy() {
             50
         )]
     );
+    assert_eq!(waits(&reader), [wait(None, "Bash", 50, None)]);
+    // The registry still says waiting: the wait goes on.
     store
         .apply_registry(&[RegistryEvent::Appeared {
+            entry: waiting_alpha(),
+            at_ms: 55,
+        }])
+        .expect("waiting");
+    assert_eq!(waits(&reader), [wait(None, "Bash", 50, None)]);
+    store
+        .apply_registry(&[RegistryEvent::Changed {
             entry: with_status(&waiting_alpha(), "busy"),
             at_ms: 60,
         }])
         .expect("busy");
     assert!(needs_you(&reader).is_empty());
+    assert_eq!(waits(&reader), [wait(None, "Bash", 50, Some(60))]);
+
+    // A poll stamped before the request arrived (the poller stamps its
+    // time before it runs `claude agents`) saw the session before it asked:
+    // it answers nothing.
+    store
+        .apply_hook(&permission(100, None, "Write"))
+        .expect("again");
+    store
+        .apply_registry(&[RegistryEvent::Changed {
+            entry: with_status(&waiting_alpha(), "idle"),
+            at_ms: 90,
+        }])
+        .expect("stale idle");
+    assert_eq!(needs_you(&reader).len(), 1);
+    assert_eq!(
+        waits(&reader),
+        [
+            wait(None, "Bash", 50, Some(60)),
+            wait(None, "Write", 100, None),
+        ]
+    );
+    store
+        .apply_registry(&[RegistryEvent::Changed {
+            entry: with_status(&waiting_alpha(), "busy"),
+            at_ms: 110,
+        }])
+        .expect("busy again");
+    assert!(needs_you(&reader).is_empty());
+    assert_eq!(
+        waits(&reader),
+        [
+            wait(None, "Bash", 50, Some(60)),
+            wait(None, "Write", 100, Some(110)),
+        ]
+    );
+}
+
+#[test]
+fn only_a_message_record_ends_a_wait_not_bookkeeping() {
+    let temp = Temp::new("hook-bookkeeping");
+    let (mut store, reader) = temp.open();
+    let asked = ms("2026-10-08T10:00:05.000Z");
+    store
+        .apply_hook(&permission(asked, None, "Bash"))
+        .expect("permission");
+    // Written while the prompt shows: none of them is the session acting.
+    let later = "2026-10-08T10:00:06.000Z";
+    store
+        .ingest(&batch(
+            "s-alpha.jsonl",
+            &[
+                json!({"type":"attachment","uuid":"o1","timestamp":later}),
+                json!({"type":"queue-operation","operation":"enqueue","timestamp":later}),
+                json!({"type":"system","subtype":"informational","uuid":"o2","timestamp":later}),
+                json!({"type":"file-history-delta","timestamp":later}),
+            ],
+        ))
+        .expect("bookkeeping");
+    assert_eq!(needs_you(&reader).len(), 1);
+    assert_eq!(waits(&reader), [wait(None, "Bash", asked, None)]);
+    store
+        .ingest(&batch(
+            "s-alpha.jsonl",
+            &[json!({"type":"assistant","uuid":"o3","timestamp":"2026-10-08T10:00:30.000Z"})],
+        ))
+        .expect("acting");
+    assert!(needs_you(&reader).is_empty());
+    assert_eq!(
+        waits(&reader),
+        [wait(
+            None,
+            "Bash",
+            asked,
+            Some(ms("2026-10-08T10:00:30.000Z"))
+        )]
+    );
+}
+
+#[test]
+fn a_session_gone_mid_prompt_stops_needing_you_and_its_wait_ends_when_last_seen() {
+    let temp = Temp::new("hook-gone");
+    let (mut store, reader) = temp.open();
+    let entry = waiting_alpha();
+    store
+        .apply_registry(&[RegistryEvent::Appeared {
+            entry: entry.clone(),
+            at_ms: 40,
+        }])
+        .expect("listed");
+    store
+        .apply_hook(&permission(50, None, "Bash"))
+        .expect("orchestrator asks");
+    store
+        .apply_hook(&permission(52, Some("a1"), "Edit"))
+        .expect("subagent asks");
+    assert_eq!(needs_you(&reader).len(), 3, "registry, orchestrator, a1");
+    store
+        .apply_registry(&[RegistryEvent::Gone {
+            entry,
+            last_seen_ms: 70,
+        }])
+        .expect("gone");
+    assert!(
+        needs_you(&reader).is_empty(),
+        "a gone session needs nothing"
+    );
+    assert_eq!(agent(&reader, "s-alpha", None)[0].3, None);
+    assert_eq!(
+        waits(&reader),
+        [
+            wait(None, "Bash", 50, Some(70)),
+            // A subagent's wait ends on its own record or SubagentStop.
+            wait(Some("a1"), "Edit", 52, None),
+        ]
+    );
+}
+
+#[test]
+fn a_session_last_seen_before_its_request_ends_the_wait_at_the_request() {
+    let temp = Temp::new("hook-gone-early");
+    let (mut store, reader) = temp.open();
+    let entry = waiting_alpha();
+    store
+        .apply_registry(&[RegistryEvent::Appeared {
+            entry: entry.clone(),
+            at_ms: 40,
+        }])
+        .expect("listed");
+    // Asked between the last poll that listed it and the one that did not.
+    store
+        .apply_hook(&permission(50, None, "Bash"))
+        .expect("asks");
+    store
+        .apply_registry(&[RegistryEvent::Gone {
+            entry,
+            last_seen_ms: 40,
+        }])
+        .expect("gone");
+    assert!(needs_you(&reader).is_empty());
+    assert_eq!(waits(&reader), [wait(None, "Bash", 50, Some(50))]);
+}
+
+#[test]
+fn a_baseline_that_drops_a_waiting_session_ends_its_wait_when_last_seen() {
+    let temp = Temp::new("hook-baseline");
+    let (mut store, reader) = temp.open();
+    store
+        .apply_registry(&[RegistryEvent::Appeared {
+            entry: waiting_alpha(),
+            at_ms: 40,
+        }])
+        .expect("listed");
+    store
+        .apply_hook(&permission(50, None, "Bash"))
+        .expect("asks");
+    store
+        .apply_registry(&[RegistryEvent::Changed {
+            entry: waiting_alpha(),
+            at_ms: 60,
+        }])
+        .expect("still waiting");
+    // strate restarts; its first poll no longer lists the session.
+    store
+        .apply_registry(&[RegistryEvent::Baseline { keys: vec![] }])
+        .expect("baseline");
+    assert!(needs_you(&reader).is_empty());
+    assert_eq!(waits(&reader), [wait(None, "Bash", 50, Some(60))]);
+}
+
+#[test]
+fn a_gone_row_leaves_a_session_another_live_row_lists_waiting() {
+    let temp = Temp::new("hook-gone-other");
+    let (mut store, reader) = temp.open();
+    let first = waiting_alpha();
+    let second = entry(
+        r#"{"pid":4102,"cwd":"/work/alpha","kind":"interactive","startedAt":1791000000000,
+            "sessionId":"s-alpha","name":"alpha-1","status":"waiting","waitingFor":"permission"}"#,
+    );
+    store
+        .apply_registry(&[
+            RegistryEvent::Appeared {
+                entry: first.clone(),
+                at_ms: 40,
+            },
+            RegistryEvent::Appeared {
+                entry: second,
+                at_ms: 40,
+            },
+        ])
+        .expect("listed twice");
+    store
+        .apply_hook(&permission(50, None, "Bash"))
+        .expect("asks");
+    store
+        .apply_registry(&[RegistryEvent::Gone {
+            entry: first,
+            last_seen_ms: 70,
+        }])
+        .expect("one gone");
+    assert_eq!(waits(&reader), [wait(None, "Bash", 50, None)]);
+    assert!(needs_you(&reader).iter().any(|n| n.2 == "hook"));
 }
 
 #[test]

@@ -334,7 +334,14 @@ describe('agents & models', () => {
 
 describe('bottleneck', () => {
   const days = [
-    bottleneckDay({ day: '2026-10-12', repo: 'acme/web', askMs: 2 * HOUR, activeMs: 6 * HOUR }),
+    bottleneckDay({
+      day: '2026-10-12',
+      repo: 'acme/web',
+      askMs: 2 * HOUR,
+      activeMs: 6 * HOUR,
+      permissionMs: HOUR / 2,
+      permissionPrompts: 2,
+    }),
     bottleneckDay({
       day: '2026-10-12',
       repo: null,
@@ -348,8 +355,10 @@ describe('bottleneck', () => {
       blockedMs: HOUR / 2,
       activeMs: 2 * HOUR,
       blockedReports: 2,
+      permissionPrompts: 1,
     }),
   ]
+  const recorded = { recordedSince: '2026-10-05', open: 1 }
 
   it('totals your time in the loop as a share of active time', () => {
     show({ days })
@@ -371,11 +380,32 @@ describe('bottleneck', () => {
     ])
   })
 
-  it('says permission prompts are not recorded', () => {
+  it('says permission prompts are not recorded until a hook has recorded one', () => {
     show({ days })
     expect(tile('Permission prompts', region('Bottleneck'))).toEqual([
       'Not recorded',
-      'hooks are off. strate#52 wires them.',
+      'no PermissionRequest hook received yet',
+    ])
+  })
+
+  it('totals the permission waits, counting the open prompts apart, since the first recorded', () => {
+    show({ days, permissionWaits: recorded })
+    expect(tile('Permission prompts', region('Bottleneck'))).toEqual([
+      '0.5 h',
+      '3 prompts, 1 still open',
+      'recorded since Oct 5',
+    ])
+  })
+
+  it('names a single prompt and leaves out the open count when none is open', () => {
+    show({
+      days: [bottleneckDay({ permissionMs: HOUR, permissionPrompts: 1 })],
+      permissionWaits: { recordedSince: '2026-10-12', open: 0 },
+    })
+    expect(tile('Permission prompts', region('Bottleneck'))).toEqual([
+      '1.0 h',
+      '1 prompt',
+      'recorded since Oct 12',
     ])
   })
 
@@ -384,39 +414,56 @@ describe('bottleneck', () => {
     expect(tile('Answering questions', region('Bottleneck'))[1]).toBe('— of 0.0 h active')
   })
 
-  it('stacks questions, prompt wait and blocked per day, in hours', () => {
-    show({ days })
+  it('stacks questions, prompt wait, blocked and permission prompts per day, in hours', () => {
+    show({ days, permissionWaits: recorded })
     expect(headers('Per day, hours')).toEqual([
       'Day',
       'Answering questions',
       'Waiting for prompt',
       'Blocked (proxy)',
+      'Permission prompts',
     ])
     expect(rows('Per day, hours')).toEqual([
-      ['Oct 12', '2h', '1h', '0h'],
-      ['Oct 13', '0h', '0h', '0.5h'],
+      ['Oct 12', '2h', '1h', '0h', '0.5h'],
+      ['Oct 13', '0h', '0h', '0.5h', '0h'],
     ])
   })
 
   it('splits it per repo, Unlinked last, with the wait share of active time', () => {
-    show({ days })
+    show({ days, permissionWaits: recorded })
     expect(headers('Per repo')).toEqual([
       'Repo',
       'Questions',
       'Prompt wait',
       'Blocked',
+      'Permission',
       'Active',
       'Wait share',
     ])
     expect(rows('Per repo')).toEqual([
-      ['acme/web', '2.0 h', '0.0 h', '0.5 h', '8.0 h', '31%'],
-      ['Unlinked', '0.0 h', '1.0 h', '0.0 h', '2.0 h', '50%'],
+      ['acme/web', '2.0 h', '0.0 h', '0.5 h', '0.5 h', '8.0 h', '38%'],
+      ['Unlinked', '0.0 h', '1.0 h', '0.0 h', '0.0 h', '2.0 h', '50%'],
     ])
   })
 
   it('dashes the wait share of a repo with no active time', () => {
-    show({ days: [bottleneckDay({ repo: 'acme/api', askMs: HOUR })] })
-    expect(rows('Per repo')).toEqual([['acme/api', '1.0 h', '0.0 h', '0.0 h', '0.0 h', '—']])
+    show({ days: [bottleneckDay({ repo: 'acme/api', askMs: HOUR })], permissionWaits: recorded })
+    expect(rows('Per repo')).toEqual([
+      ['acme/api', '1.0 h', '0.0 h', '0.0 h', '0.0 h', '0.0 h', '—'],
+    ])
+  })
+
+  it('dashes permission per repo and charts no permission series until a prompt is recorded', () => {
+    show({ days })
+    expect(rows('Per repo').map((r) => r[4])).toEqual(['—', '—'])
+    expect(headers('Per day, hours')).not.toContain('Permission prompts')
+  })
+
+  it('notes that the wait share can pass 100%', () => {
+    show({ days })
+    expect(region('Per repo')).toHaveTextContent(
+      "Wait share can pass 100%: blocked and subagent permission time fall outside the orchestrator's active time.",
+    )
   })
 
   it('keeps Unlinked last under any sort', () => {

@@ -8,9 +8,11 @@
 //!   or not), plus the range's spend with no outcome yet.
 //! - Agents: per agent type and model, each dispatch with a cell in the
 //!   range once, by outcome; orchestrator rows per model, flagged.
-//! - Bottleneck: per local day and repo, your own time in the loop, and a
-//!   blocked proxy: a blocked dispatch's last record to its parent's next
-//!   typed prompt or Agent/SendMessage dispatch, on the day it went quiet.
+//! - Bottleneck: per local day and repo, your own time in the loop, a
+//!   blocked proxy (a blocked dispatch's last record to its parent's next
+//!   typed prompt or Agent/SendMessage dispatch, on the day it went quiet),
+//!   and the permission waits the hooks recorded (#52), on the day each
+//!   started, in the window its agent was in.
 //! - Waste: rework and errors in the range.
 //!
 //! A dispatch with no notification is running while its last record is
@@ -31,7 +33,7 @@ use super::gh::Gh;
 use super::{AuditFilter, Tokens};
 use crate::names::parse_name;
 use crate::store::{Result, account};
-use crate::time::{local_day, parse_timestamp};
+use crate::time::{USER_TOOLS, local_day, parse_timestamp};
 
 /// A dispatch never notified is running while its last record is this
 /// close to the store's newest.
@@ -141,13 +143,22 @@ pub struct BottleneckDay {
     /// The orchestrator's active time.
     pub active_ms: i64,
     pub blocked_reports: i64,
+    /// Permission prompts that started this day: answered ones' waits.
+    pub permission_ms: i64,
+    /// Those prompts, open ones included.
+    pub permission_prompts: i64,
 }
 
-/// Permission-prompt waits have no source until hooks record them (#52).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionWaits {
-    NotRecorded,
+/// What the hooks have recorded of permission prompts (#52).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionWaits {
+    /// The local day of the first recorded prompt in the store, whatever
+    /// the filter; `None`: none recorded, so the hooks have never run.
+    pub recorded_since: Option<String>,
+    /// Prompts in the range and filter still unanswered: counted in
+    /// `permission_prompts`, not in `permission_ms`.
+    pub open: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -220,12 +231,13 @@ pub fn performance(conn: &Connection, filter: &AuditFilter) -> Result<Performanc
         agents: AgentInfo::load_all(conn)?,
         newest: newest_record(conn)?,
     };
+    let places = Places::load(conn)?;
     let dispatches = read.dispatches(&cells, &in_range);
     let agents = read.agent_rows(&in_range, &dispatches);
     Ok(Performance {
         outcome: read.outcome(&cells, &in_range),
-        bottleneck: read.bottleneck(&cells, &in_range, &dispatches)?,
-        waste: read.waste(&cells, &in_range, &dispatches, &agents)?,
+        bottleneck: read.bottleneck(&cells, &in_range, &dispatches, &places)?,
+        waste: read.waste(&cells, &in_range, &dispatches, &agents, &places)?,
         agents,
     })
 }
@@ -365,8 +377,8 @@ struct Dispatch<'a> {
 /// where a stored event counts, as `account` places requests.
 struct Places {
     repos: HashMap<i64, Option<String>>,
-    /// (start offset, segment id), by offset.
-    sessions: HashMap<String, Vec<(i64, i64)>>,
+    /// (start offset, segment id, earliest record ms), by offset.
+    sessions: HashMap<String, Vec<(i64, i64, Option<i64>)>>,
 }
 
 impl Places {
@@ -376,7 +388,8 @@ impl Places {
             sessions: HashMap::new(),
         };
         let mut stmt = conn.prepare_cached(
-            "SELECT g.id, g.session_id, g.start_offset, w.name, w.fallback FROM segments AS g
+            "SELECT g.id, g.session_id, g.start_offset, w.name, w.fallback, g.started_at
+             FROM segments AS g
              JOIN workstream_roots AS r ON r.id = g.workstream_id
              JOIN workstreams AS w ON w.id = r.root
              ORDER BY g.session_id, g.start_offset",
@@ -391,10 +404,12 @@ impl Places {
                 .flatten()
                 .map(|p| p.repo);
             out.repos.insert(id, repo);
-            out.sessions
-                .entry(r.get(1)?)
-                .or_default()
-                .push((r.get(2)?, id));
+            let started: Option<String> = r.get(5)?;
+            out.sessions.entry(r.get(1)?).or_default().push((
+                r.get(2)?,
+                id,
+                started.as_deref().and_then(parse_timestamp),
+            ));
         }
         Ok(out)
     }
@@ -412,13 +427,25 @@ impl Places {
         segments
             .iter()
             .rev()
-            .find(|(start, _)| *start <= offset)
-            .map(|(_, id)| *id)
+            .find(|(start, _, _)| *start <= offset)
+            .map(|(_, id, _)| *id)
+    }
+
+    /// The window of `session`'s orchestrator at `ms`: the last one whose
+    /// earliest record is no later, else its first.
+    fn segment_at_time(&self, session: &str, ms: i64) -> Option<i64> {
+        let segments = self.sessions.get(session)?;
+        segments
+            .iter()
+            .rev()
+            .find(|(_, _, started)| started.is_some_and(|s| s <= ms))
+            .or(segments.first())
+            .map(|(_, id, _)| *id)
     }
 
     /// `session`'s first window.
     fn first_segment(&self, session: &str) -> Option<i64> {
-        self.sessions.get(session)?.first().map(|(_, id)| *id)
+        self.sessions.get(session)?.first().map(|(_, id, _)| *id)
     }
 }
 
@@ -610,6 +637,7 @@ impl Read<'_> {
         cells: &Cells,
         in_range: &[&Cell],
         dispatches: &[Dispatch],
+        places: &Places,
     ) -> Result<Bottleneck> {
         let mut days: BTreeMap<DayKey, BottleneckDay> = BTreeMap::new();
         for cell in in_range.iter().filter(|c| c.agent_id.is_none()) {
@@ -638,9 +666,64 @@ impl Read<'_> {
             row.blocked_reports += 1;
             row.blocked_ms += answered.map_or(0, |at| (at - last).max(0));
         }
+        let permission_waits = self.permission_waits(&mut days, places)?;
         Ok(Bottleneck {
             days: days.into_values().collect(),
-            permission_waits: PermissionWaits::NotRecorded,
+            permission_waits,
+        })
+    }
+
+    /// Adds each recorded permission wait in the range and filter to its
+    /// start day's row, in the window its agent was in: an orchestrator's
+    /// by time, a subagent's where it started. An open wait (no answer
+    /// stored yet) counts as a prompt with no time: its end is unknown, and
+    /// the live needs-you view already shows a current one. A question or
+    /// plan approval is left out: the time model counts it as ask time.
+    fn permission_waits(
+        &self,
+        days: &mut BTreeMap<DayKey, BottleneckDay>,
+        places: &Places,
+    ) -> Result<PermissionWaits> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT a.session_id, a.agent_id, w.start_ms, w.end_ms, w.tool_name
+             FROM permission_waits AS w JOIN agents AS a ON a.id = w.agent",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut open = 0;
+        while let Some(r) = rows.next()? {
+            let session: String = r.get(0)?;
+            let agent_id: Option<String> = r.get(1)?;
+            let start: i64 = r.get(2)?;
+            let tool: Option<String> = r.get(4)?;
+            if tool.is_some_and(|t| USER_TOOLS.contains(&t.as_str())) {
+                continue;
+            }
+            let Some(day) = self.day_in_range(start) else {
+                continue;
+            };
+            let segment = match agent_id {
+                None => places.segment_at_time(&session, start),
+                agent => self.agents.get(&(session, agent)).and_then(|i| i.segment),
+            };
+            let repo = places.repo(segment);
+            if !self.wanted(repo) {
+                continue;
+            }
+            let row = day_row(days, &day, repo.map(str::to_string));
+            row.permission_prompts += 1;
+            match r.get::<_, Option<i64>>(3)? {
+                Some(end) => row.permission_ms += end - start,
+                None => open += 1,
+            }
+        }
+        let first: Option<i64> =
+            self.conn
+                .query_row("SELECT min(start_ms) FROM permission_waits", [], |r| {
+                    r.get(0)
+                })?;
+        Ok(PermissionWaits {
+            recorded_since: first.and_then(|ms| local_day(&self.tz, ms)),
+            open,
         })
     }
 
@@ -666,9 +749,9 @@ impl Read<'_> {
         in_range: &[&Cell],
         dispatches: &[Dispatch],
         rows: &[AgentRow],
+        places: &Places,
     ) -> Result<Waste> {
-        let places = Places::load(self.conn)?;
-        let counts = self.event_counts(&places)?;
+        let counts = self.event_counts(places)?;
         let count = |status: Status| dispatches.iter().filter(|d| d.status == status).count();
         let no_report_top = rows
             .iter()
@@ -714,7 +797,7 @@ impl Read<'_> {
             no_report: count(Status::NoReport) as i64,
             no_report_top,
             compactions: counts.compactions,
-            clears: self.clears(&places)?,
+            clears: self.clears(places)?,
             context_peaks_over_80: peaks.iter().filter(|(p, _)| *p >= PEAK_PCT).count() as i64,
             deepest_peak: peaks
                 .iter()
@@ -860,6 +943,8 @@ fn day_row<'a>(
             blocked_ms: 0,
             active_ms: 0,
             blocked_reports: 0,
+            permission_ms: 0,
+            permission_prompts: 0,
         })
 }
 

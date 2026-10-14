@@ -227,6 +227,8 @@ describe('commands', () => {
             blockedMs: 535000,
             activeMs: 120000,
             blockedReports: 1,
+            permissionMs: 15000,
+            permissionPrompts: 2,
           },
           {
             day: '2026-10-13',
@@ -236,9 +238,11 @@ describe('commands', () => {
             blockedMs: 0,
             activeMs: 60000,
             blockedReports: 0,
+            permissionMs: 0,
+            permissionPrompts: 1,
           },
         ],
-        permissionWaits: 'not_recorded',
+        permissionWaits: { recordedSince: '2026-10-05', open: 1 },
       },
       waste: {
         followups: 3,

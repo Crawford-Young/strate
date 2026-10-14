@@ -20,7 +20,7 @@ use jiff::{
 pub const IDLE_GAP_MS: i64 = 10 * 60 * 1000;
 
 /// Tools that wait on a person: their time is user time.
-const USER_TOOLS: [&str; 2] = ["AskUserQuestion", "ExitPlanMode"];
+pub const USER_TOOLS: [&str; 2] = ["AskUserQuestion", "ExitPlanMode"];
 
 /// What the time model reads from one record.
 #[derive(Debug, Clone, PartialEq)]
