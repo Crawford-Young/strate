@@ -417,15 +417,18 @@ pub(crate) struct Agent {
     pub(crate) label: String,
     pub(crate) agent_type: Option<String>,
     pub(crate) run_ms: Option<i64>,
-    /// Dispatched with `run_in_background: true` on its Agent tool_use, read
-    /// at query time from the parent's stored record (no column of its own).
+    /// Launched in the background: its dispatch's tool_result is the async
+    /// launch (`toolUseResult.status` `async_launched`), as #42 reads it.
+    /// Read at query time from the parent's stored record (no column of its
+    /// own). Not `run_in_background`: real Agent calls carry it as the
+    /// string "true", or not at all while still launching async (#55).
     background: bool,
 }
 
 impl Agent {
     /// Every subagent of the sessions with subagent cells on days
     /// `from..=to`, by (session, agent id), in one query: each parent
-    /// session's tool_use blocks are read once for the background flags.
+    /// session's tool_results are read once for the background flags.
     fn load_all(
         conn: &Connection,
         from: &str,
@@ -443,11 +446,11 @@ impl Agent {
                  WHERE d.kind = 'dispatch' AND c.session_id IN (SELECT session_id FROM wanted)
              ),
              background (id) AS (
-                 SELECT json_extract(b.value, '$.id')
-                 FROM events AS e, json_each(e.raw, '$.message.content') AS b
+                 SELECT j.value
+                 FROM events AS e, json_each(e.tool_results) AS j
                  WHERE e.session_id IN (SELECT parent_session FROM dispatch)
-                   AND e.tool_uses IS NOT NULL AND b.type = 'object'
-                   AND json_extract(b.value, '$.input.run_in_background') IS 1
+                   AND e.tool_results IS NOT NULL
+                   AND json_extract(e.raw, '$.toolUseResult.status') = 'async_launched'
              )
              SELECT a.session_id, a.agent_id,
                  coalesce(a.registry_name, a.name, a.description, a.agent_type), a.agent_type,
