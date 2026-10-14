@@ -19,6 +19,7 @@ import type {
   Outcome,
   OutcomeWeek,
   Performance,
+  PermissionWaits,
   Waste,
 } from './api'
 import { hoursLabel, shortDay } from './audit'
@@ -33,7 +34,9 @@ import {
   successPct,
   totals,
   trendRows,
+  waited,
   weekLabel,
+  type BottleneckSums,
   type RepoSums,
 } from './performance'
 
@@ -317,8 +320,6 @@ function AgentsSection({ agents }: { agents: AgentRow[] }) {
   )
 }
 
-const waitedMs = (r: RepoSums) => r.askMs + r.promptWaitMs + r.blockedMs
-
 /** A per-repo column; Unlinked sorts last either way, as in the tree table. */
 function repoColumn(
   header: string,
@@ -337,9 +338,10 @@ function repoColumn(
 const hoursColumn = (header: string, ms: (r: RepoSums) => number) =>
   repoColumn(header, ms, (r) => hours(ms(r)))
 
-const waitShare = (r: RepoSums) => share(waitedMs(r), r.activeMs)
+const waitShare = (r: RepoSums) => share(waited(r), r.activeMs)
 
-const REPO_COLUMNS: ColumnDef<RepoSums>[] = [
+/** The per-repo columns; until a permission prompt is recorded its column is a dash, not 0. */
+const repoColumns = (recorded: boolean): ColumnDef<RepoSums>[] => [
   repoColumn(
     'Repo',
     (r) => r.repo as string,
@@ -348,6 +350,13 @@ const REPO_COLUMNS: ColumnDef<RepoSums>[] = [
   hoursColumn('Questions', (r) => r.askMs),
   hoursColumn('Prompt wait', (r) => r.promptWaitMs),
   hoursColumn('Blocked', (r) => r.blockedMs),
+  recorded
+    ? hoursColumn('Permission', (r) => r.permissionMs)
+    : repoColumn(
+        'Permission',
+        () => 0,
+        () => '—',
+      ),
   hoursColumn('Active', (r) => r.activeMs),
   repoColumn(
     'Wait share',
@@ -359,15 +368,19 @@ const REPO_COLUMNS: ColumnDef<RepoSums>[] = [
   ),
 ]
 
+const REPO_COLUMNS = repoColumns(true)
+const REPO_COLUMNS_UNRECORDED = repoColumns(false)
+
 const repoRowId = (r: RepoSums) => JSON.stringify(r.repo)
 
 function BottleneckSection({ bottleneck }: { bottleneck: Bottleneck }) {
   const t = totals(bottleneck.days)
-  const chart = bottleneckChart(bottleneck.days)
+  const recordedSince = bottleneck.permissionWaits.recordedSince
+  const chart = bottleneckChart(bottleneck.days, recordedSince)
   return (
     <Section
       title="Bottleneck"
-      sub="Your own time in the loop: answering questions and plan approvals, idle until your next prompt, and agents blocked on you."
+      sub="Your own time in the loop: answering questions and plan approvals, idle until your next prompt, agents blocked on you, and permission prompts."
     >
       <Tiles>
         <StatTile
@@ -388,12 +401,7 @@ function BottleneckSection({ bottleneck }: { bottleneck: Bottleneck }) {
           delta={{ label: `${t.blockedReports} blocked reports` }}
           hint="NEEDS_CONTEXT → next prompt or dispatch"
         />
-        {/* `permissionWaits` has one value until hooks record the prompts (#52). */}
-        <StatTile
-          label="Permission prompts"
-          unavailable="Not recorded"
-          hint="hooks are off. strate#52 wires them."
-        />
+        <PermissionTile sums={t} waits={bottleneck.permissionWaits} />
       </Tiles>
       <div className="grid gap-3 lg:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
         <Panel title="Per day, hours">
@@ -408,10 +416,40 @@ function BottleneckSection({ bottleneck }: { bottleneck: Bottleneck }) {
           />
         </Panel>
         <Panel title="Per repo">
-          <DataTable columns={REPO_COLUMNS} data={byRepo(bottleneck.days)} getRowId={repoRowId} />
+          <DataTable
+            columns={recordedSince === null ? REPO_COLUMNS_UNRECORDED : REPO_COLUMNS}
+            data={byRepo(bottleneck.days)}
+            getRowId={repoRowId}
+          />
+          <p className="mt-2 text-xs text-muted-foreground">
+            Wait share can pass 100%: blocked and subagent permission time fall outside the
+            orchestrator&apos;s active time.
+          </p>
         </Panel>
       </div>
     </Section>
+  )
+}
+
+/** Permission waits, once the PermissionRequest hook has recorded any: open prompts count, with no time. */
+function PermissionTile({ sums, waits }: { sums: BottleneckSums; waits: PermissionWaits }) {
+  if (waits.recordedSince === null)
+    return (
+      <StatTile
+        label="Permission prompts"
+        unavailable="Not recorded"
+        hint="no PermissionRequest hook received yet"
+      />
+    )
+  const n = sums.permissionPrompts
+  const prompts = `${n} ${n === 1 ? 'prompt' : 'prompts'}`
+  return (
+    <StatTile
+      label="Permission prompts"
+      value={hours(sums.permissionMs)}
+      delta={{ label: waits.open > 0 ? `${prompts}, ${waits.open} still open` : prompts }}
+      hint={`recorded since ${shortDay(waits.recordedSince)}`}
+    />
   )
 }
 

@@ -7,7 +7,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
-use super::{Result, account, directs, group};
+use super::{Result, account, directs, group, live};
 use crate::cost::SYNTHETIC;
 use crate::discovery::{AgentRef, Graph, Link, Unresolved, scalar_text};
 use crate::tail::{Batch, TailEvent};
@@ -240,15 +240,24 @@ fn record(
     if !inserted {
         return Ok(Stored::default());
     }
-    // A record written after a PermissionRequest hook: the agent moved on.
-    if let Some(timestamp) = text("timestamp") {
-        conn.prepare_cached(
-            "UPDATE agents SET hook_waiting_for = NULL,
-                 hook_state = CASE WHEN agent_id IS NULL THEN NULL ELSE 'running' END
-             WHERE id = ?1 AND hook_state = 'needs_you'
-               AND unixepoch(?2, 'subsec') * 1000 > hook_at_ms",
-        )?
-        .execute(params![agent, timestamp])?;
+    // A message written after a PermissionRequest hook: the agent moved on,
+    // and its wait ends at the record. Bookkeeping (attachments, queue
+    // operations, system and file-history records) can be written while
+    // the prompt still shows.
+    if let (Some("user" | "assistant"), Some(timestamp)) = (kind, text("timestamp")) {
+        let answered: Option<i64> = conn
+            .prepare_cached(
+                "UPDATE agents SET hook_waiting_for = NULL,
+                     hook_state = CASE WHEN agent_id IS NULL THEN NULL ELSE 'running' END
+                 WHERE id = ?1 AND hook_state = 'needs_you'
+                   AND unixepoch(?2, 'subsec') * 1000 > hook_at_ms
+                 RETURNING CAST(round(unixepoch(?2, 'subsec') * 1000) AS INTEGER)",
+            )?
+            .query_row(params![agent, timestamp], |r| r.get(0))
+            .optional()?;
+        if let Some(end_ms) = answered {
+            live::end_wait(conn, agent, end_ms)?;
+        }
     }
     if owner.agent_id.is_none()
         && let Some(root) = text("session_id")

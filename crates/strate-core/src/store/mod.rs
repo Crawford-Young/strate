@@ -199,7 +199,11 @@ impl Store {
     /// Applies registry poll events in one transaction: each entry's row in
     /// `registry` (a session it names gets a stub session and orchestrator
     /// until its transcript arrives), and the orchestrator's
-    /// `registry_name` and `registry_state`. Error events change nothing.
+    /// `registry_name` and `registry_state`. An entry no longer waiting, in
+    /// a poll stamped at or after the request, answers its orchestrator's
+    /// permission prompt, ending the wait at the poll; a session no live
+    /// row lists any more exited, so its prompt ends when it was last seen.
+    /// Error events change nothing.
     pub fn apply_registry(&mut self, events: &[RegistryEvent]) -> Result<()> {
         let tx = self.transaction()?;
         for event in events {
@@ -210,7 +214,10 @@ impl Store {
 
     /// Applies one hook event: creates the session, orchestrator and agent
     /// rows it names when missing (merging with later discovery and tail
-    /// ingest), and sets the agent's `hook_state`.
+    /// ingest), and sets the agent's `hook_state`. A PermissionRequest opens
+    /// a permission wait (a repeat while one is open is the same wait), and
+    /// any other hook on the agent ends it, as its next user or assistant
+    /// record does at that record's time.
     pub fn apply_hook(&mut self, hook: &Hook) -> Result<()> {
         let tx = self.transaction()?;
         live::hook(&tx.tx, hook)?;
@@ -429,6 +436,65 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version");
         assert_eq!(version, migrate::MIGRATIONS.len() as i64, "the latest");
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_v10_store_keeps_an_unanswered_permission_request_of_a_live_session_as_an_open_wait() {
+        let dir = test_dir("store-v10-upgrade");
+        let db = dir.join("strate.db");
+        let mut v10 = Connection::open(&db).expect("v10 db");
+        migrate::migrate(&mut v10, &migrate::MIGRATIONS[..10]).expect("v10");
+        v10.execute_batch(
+            "INSERT INTO sessions (session_id, path) VALUES ('s1', '/p/s1.jsonl');
+             INSERT INTO agents (session_id, agent_id, kind, hook_state, hook_waiting_for,
+                     hook_at_ms)
+             VALUES ('s1', NULL, 'orchestrator', 'needs_you', 'Bash', 1000),
+                    ('s1', 'a1', 'subagent', 'running', NULL, 900),
+                    ('s1', 'a2', 'subagent', 'needs_you', NULL, 1200);
+             -- s2 exited mid-prompt: its registry row is gone.
+             INSERT INTO sessions (session_id, path) VALUES ('s2', '/p/s2.jsonl');
+             INSERT INTO registry (key, kind, session_id, cwd, started_at_ms, status,
+                     first_seen_ms, last_seen_ms, gone)
+             VALUES ('pid:1:1', 'interactive', 's2', '/work/x', 1, 'waiting', 500, 1500, 1);
+             INSERT INTO agents (session_id, agent_id, kind, hook_state, hook_waiting_for,
+                     hook_at_ms)
+             VALUES ('s2', NULL, 'orchestrator', 'needs_you', 'Bash', 1100);",
+        )
+        .expect("v10 rows");
+        drop(v10);
+
+        let store = Store::open_in(&db, "UTC").expect("upgrade");
+        type Wait = (Option<String>, Option<String>, i64, Option<i64>);
+        let waits: Vec<Wait> = store
+            .conn
+            .prepare(
+                "SELECT a.agent_id, w.tool_name, w.start_ms, w.end_ms
+                 FROM permission_waits AS w JOIN agents AS a ON a.id = w.agent
+                 ORDER BY w.start_ms",
+            )
+            .expect("waits")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .expect("rows")
+            .collect::<Result<_>>()
+            .expect("waits");
+        assert_eq!(
+            waits,
+            [
+                (None, Some("Bash".into()), 1000, None),
+                (Some("a2".into()), None, 1200, None),
+            ]
+        );
+        let gone: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT hook_state FROM agents WHERE session_id = 's2' AND agent_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .expect("s2");
+        assert_eq!(gone, None, "a gone session needs nothing");
         drop(store);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }

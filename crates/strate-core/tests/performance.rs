@@ -23,6 +23,7 @@ use strate_core::store::views::{
     self, AgentState, AuditFilter, GroupBy, Performance, PermissionWaits, Tokens, performance,
 };
 use strate_core::tail::{Batch, Checkpoint, FileIdentity, TailEvent};
+use strate_core::time::parse_timestamp;
 
 const SID: &str = "5e55e1e1-0000-4000-8000-0000000000e1";
 /// Window perf-1 on 2026-10-05: issue #1's earlier work.
@@ -576,7 +577,19 @@ fn the_bottleneck_splits_your_time_per_day_and_repo_with_a_blocked_proxy() {
     let t = Temp::new("bottleneck");
     let db = built(&t);
     let b = read(&db, &[]).bottleneck;
-    assert_eq!(b.permission_waits, PermissionWaits::NotRecorded);
+    // No hook ever recorded a permission prompt.
+    assert_eq!(
+        b.permission_waits,
+        PermissionWaits {
+            recorded_since: None,
+            open: 0
+        }
+    );
+    assert!(
+        b.days
+            .iter()
+            .all(|d| d.permission_ms == 0 && d.permission_prompts == 0)
+    );
     let keys: Vec<(&str, Option<&str>)> = b
         .days
         .iter()
@@ -696,10 +709,232 @@ fn performance_serializes_in_camel_case_and_a_bad_day_is_an_error() {
     let t = Temp::new("json");
     let db = built(&t);
     let json = serde_json::to_value(read(&db, &[])).expect("json");
-    assert_eq!(json["bottleneck"]["permissionWaits"], "not_recorded");
+    assert_eq!(
+        json["bottleneck"]["permissionWaits"],
+        serde_json::json!({ "recordedSince": null, "open": 0 })
+    );
+    assert_eq!(json["bottleneck"]["days"][0]["permissionMs"], 0);
+    assert_eq!(json["bottleneck"]["days"][0]["permissionPrompts"], 0);
     assert!(json["outcome"]["weeks"][0]["usdPerClosedIssue"].is_number());
     assert_eq!(json["waste"]["noReportTop"]["agentType"], "implementer");
     assert!(json["agents"][1]["cacheHitPct"].is_number());
     assert_eq!(json["waste"]["contextPeaksOver80"], 1);
     assert!(performance(&db, &filter("October", "2026-10-13", &[])).is_err());
+}
+
+fn at(iso: &str) -> i64 {
+    parse_timestamp(iso).expect("timestamp")
+}
+
+fn permission(iso: &str, session: &str, agent_id: Option<&str>) -> Hook {
+    asking(iso, session, agent_id, "Bash")
+}
+
+fn asking(iso: &str, session: &str, agent_id: Option<&str>, tool: &str) -> Hook {
+    Hook {
+        received_ms: at(iso),
+        event: HookEvent::PermissionRequest {
+            session_id: session.into(),
+            agent_id: agent_id.map(Into::into),
+            tool_name: Some(tool.into()),
+        },
+    }
+}
+
+/// The registry listing `session` busy at `iso`: its orchestrator's
+/// permission prompt is answered.
+fn busy(iso: &str, session: &str, pid: u32) -> RegistryEvent {
+    let entry = parse_snapshot(
+        format!(
+            r#"[{{"pid":{pid},"cwd":"/work/perf","kind":"interactive","startedAt":1791000000000,
+                "sessionId":"{session}","status":"busy"}}]"#
+        )
+        .as_bytes(),
+    )
+    .expect("entry")
+    .remove(0);
+    RegistryEvent::Appeared {
+        entry,
+        at_ms: at(iso),
+    }
+}
+
+/// (day, repo, permission ms, permission prompts) of each bottleneck row.
+fn permission_rows(p: &Performance) -> Vec<(String, Option<String>, i64, i64)> {
+    p.bottleneck
+        .days
+        .iter()
+        .map(|d| {
+            (
+                d.day.clone(),
+                d.repo.clone(),
+                d.permission_ms,
+                d.permission_prompts,
+            )
+        })
+        .collect()
+}
+
+fn row(day: &str, repo: Option<&str>, ms: i64, prompts: i64) -> (String, Option<String>, i64, i64) {
+    (day.into(), repo.map(Into::into), ms, prompts)
+}
+
+#[test]
+fn permission_waits_count_on_the_day_they_started_in_their_window_repo() {
+    let t = Temp::new("permission");
+    drop(built(&t));
+    let mut store = Store::open_in(t.db(), "UTC").expect("open");
+    // G2 (10-05, before the range): 10 s.
+    store
+        .apply_hook(&permission("2026-10-05T09:00:10.000Z", G2, None))
+        .expect("g2");
+    store
+        .apply_registry(&[busy("2026-10-05T09:00:20.000Z", G2, 4102)])
+        .expect("g2 busy");
+    // The orchestrator: 2 min; its dispatch b1: 15 s, until it stopped.
+    store
+        .apply_hook(&permission("2026-10-06T10:05:00.000Z", SID, None))
+        .expect("sid");
+    store
+        .apply_registry(&[busy("2026-10-06T10:07:00.000Z", SID, 4101)])
+        .expect("sid busy");
+    store
+        .apply_hook(&permission("2026-10-06T10:00:30.000Z", SID, Some(B[0])))
+        .expect("b1");
+    store
+        .apply_hook(&Hook {
+            received_ms: at("2026-10-06T10:00:45.000Z"),
+            event: HookEvent::SubagentStop {
+                session_id: SID.into(),
+                agent_id: B[0].into(),
+                agent_type: None,
+            },
+        })
+        .expect("b1 stop");
+    // Questions and plan approvals are ask time already: b2's answered
+    // AskUserQuestion and b3's open ExitPlanMode count nowhere here.
+    store
+        .apply_hook(&asking(
+            "2026-10-06T10:02:00.000Z",
+            SID,
+            Some(B[1]),
+            "AskUserQuestion",
+        ))
+        .expect("b2 asks");
+    store
+        .apply_hook(&Hook {
+            received_ms: at("2026-10-06T10:09:00.000Z"),
+            event: HookEvent::SubagentStop {
+                session_id: SID.into(),
+                agent_id: B[1].into(),
+                agent_type: None,
+            },
+        })
+        .expect("b2 stop");
+    store
+        .apply_hook(&asking(
+            "2026-10-06T10:03:00.000Z",
+            SID,
+            Some(B[2]),
+            "ExitPlanMode",
+        ))
+        .expect("b3 plans");
+    // G3 (perf-3) still waiting; G4 (Unlinked) 30 s.
+    store
+        .apply_hook(&permission("2026-10-13T10:00:00.000Z", G3, None))
+        .expect("g3");
+    store
+        .apply_hook(&permission("2026-10-13T10:30:10.000Z", G4, None))
+        .expect("g4");
+    store
+        .apply_registry(&[busy("2026-10-13T10:30:40.000Z", G4, 4104)])
+        .expect("g4 busy");
+    drop(store);
+    let db = Connection::open(t.db()).expect("db");
+
+    let all = read(&db, &[]);
+    assert_eq!(
+        permission_rows(&all),
+        [
+            row("2026-10-06", Some("perf"), 135_000, 2),
+            row("2026-10-13", Some("perf"), 0, 1),
+            row("2026-10-13", None, 30_000, 1),
+        ]
+    );
+    let since = Some("2026-10-05".to_string());
+    assert_eq!(
+        all.bottleneck.permission_waits,
+        PermissionWaits {
+            recorded_since: since.clone(),
+            open: 1
+        }
+    );
+
+    let perf = read(&db, &["perf"]);
+    assert_eq!(
+        permission_rows(&perf),
+        [
+            row("2026-10-06", Some("perf"), 135_000, 2),
+            row("2026-10-13", Some("perf"), 0, 1),
+        ]
+    );
+    assert_eq!(perf.bottleneck.permission_waits.open, 1);
+
+    let other = read(&db, &["other"]);
+    assert!(other.bottleneck.days.is_empty());
+    assert_eq!(
+        other.bottleneck.permission_waits,
+        PermissionWaits {
+            recorded_since: since,
+            open: 0
+        }
+    );
+
+    let later = performance(&db, &filter("2026-10-07", "2026-10-13", &[])).expect("read");
+    assert!(later.bottleneck.days.iter().all(|d| d.day == "2026-10-13"));
+}
+
+#[test]
+fn an_orchestrator_wait_counts_in_the_window_it_started_in() {
+    let t = Temp::new("permission-windows");
+    let mut store = Store::open_in(t.db(), "UTC").expect("open");
+    let path: Arc<Path> = Path::new("/cfg/projects/-work-x/s-rename.jsonl").into();
+    let records = [
+        r#"{"type":"custom-title","customTitle":"alpha-1"}"#,
+        r#"{"type":"user","uuid":"u1","timestamp":"2026-10-07T10:00:00.000Z","message":{"content":"Lorem."}}"#,
+        r#"{"type":"assistant","uuid":"u2","timestamp":"2026-10-07T10:00:05.000Z","message":{"content":[]}}"#,
+        r#"{"type":"custom-title","customTitle":"beta-2"}"#,
+        r#"{"type":"user","uuid":"u3","timestamp":"2026-10-07T11:00:00.000Z","message":{"content":"Ipsum."}}"#,
+        r#"{"type":"assistant","uuid":"u4","timestamp":"2026-10-07T11:00:05.000Z","message":{"content":[]}}"#,
+    ];
+    let part = |range: Range<usize>| Batch {
+        path: path.clone(),
+        events: range
+            .map(|i| TailEvent::Record {
+                path: path.clone(),
+                offset: i as u64 * 200,
+                value: serde_json::from_str(records[i]).expect("json"),
+            })
+            .collect(),
+        checkpoint: None,
+    };
+    // Each prompt is answered by the window's next record.
+    store
+        .apply_hook(&permission("2026-10-07T10:00:02.000Z", "s-rename", None))
+        .expect("alpha");
+    store.ingest(&part(0..3)).expect("alpha window");
+    store
+        .apply_hook(&permission("2026-10-07T11:00:01.000Z", "s-rename", None))
+        .expect("beta");
+    store.ingest(&part(3..6)).expect("beta window");
+    drop(store);
+    let db = Connection::open(t.db()).expect("db");
+    let p = performance(&db, &filter("2026-10-07", "2026-10-07", &[])).expect("read");
+    assert_eq!(
+        permission_rows(&p),
+        [
+            row("2026-10-07", Some("alpha"), 3_000, 1),
+            row("2026-10-07", Some("beta"), 4_000, 1),
+        ]
+    );
 }

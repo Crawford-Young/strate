@@ -141,8 +141,17 @@ const days = [
     blockedMs: HOUR / 2,
     activeMs: 2 * HOUR,
     blockedReports: 2,
+    permissionMs: HOUR / 2,
+    permissionPrompts: 3,
   }),
-  bottleneckDay({ day: '2026-10-13', repo: 'acme/api', promptWaitMs: HOUR / 4, activeMs: HOUR }),
+  bottleneckDay({
+    day: '2026-10-13',
+    repo: 'acme/api',
+    promptWaitMs: HOUR / 4,
+    activeMs: HOUR,
+    permissionMs: 3 * HOUR,
+    permissionPrompts: 1,
+  }),
 ]
 
 describe('totals', () => {
@@ -153,36 +162,43 @@ describe('totals', () => {
       blockedMs: HOUR / 2,
       activeMs: 8 * HOUR,
       blockedReports: 3,
+      permissionMs: 3.5 * HOUR,
+      permissionPrompts: 4,
     })
   })
 })
 
 describe('bottleneckChart', () => {
-  it('stacks questions, prompt wait and blocked in hours, a row per day with time', () => {
-    const { data, series } = bottleneckChart(days)
+  it('stacks questions, prompt wait, blocked and permission prompts in hours, a row per day with time', () => {
+    const { data, series } = bottleneckChart(days, '2026-10-01')
     expect(series.map((s) => s.label)).toEqual([
       'Answering questions',
       'Waiting for prompt',
       'Blocked (proxy)',
+      'Permission prompts',
     ])
     expect(data).toEqual([
-      { day: '2026-10-12', ask: 1, promptWait: 3, blocked: 0 },
-      { day: '2026-10-13', ask: 1, promptWait: 0.25, blocked: 0.5 },
+      { day: '2026-10-12', ask: 1, promptWait: 3, blocked: 0, permission: 0 },
+      { day: '2026-10-13', ask: 1, promptWait: 0.25, blocked: 0.5, permission: 3.5 },
     ])
+  })
+
+  it('leaves permission prompts out until a prompt is recorded', () => {
+    const { data, series } = bottleneckChart(days, null)
+    expect(series.map((s) => s.key)).not.toContain('permission')
+    expect(data.every((d) => !('permission' in d))).toBe(true)
+  })
+
+  it('has no permission value on days before the first recorded prompt, and says since when', () => {
+    const { data, series } = bottleneckChart(days, '2026-10-13')
+    expect(series.at(-1)).toEqual({ key: 'permission', label: 'Permission prompts (since Oct 13)' })
+    expect(data.map((d) => d.permission)).toEqual([null, 3.5])
   })
 })
 
 describe('byRepo', () => {
-  it('sums each repo over the days, most waiting first and Unlinked last', () => {
+  it('sums each repo over the days, most waiting (permission prompts too) first and Unlinked last', () => {
     expect(byRepo(days)).toEqual([
-      {
-        repo: 'acme/web',
-        askMs: 2 * HOUR,
-        promptWaitMs: 0,
-        blockedMs: HOUR / 2,
-        activeMs: 6 * HOUR,
-        blockedReports: 2,
-      },
       {
         repo: 'acme/api',
         askMs: 0,
@@ -190,6 +206,18 @@ describe('byRepo', () => {
         blockedMs: 0,
         activeMs: HOUR,
         blockedReports: 0,
+        permissionMs: 3 * HOUR,
+        permissionPrompts: 1,
+      },
+      {
+        repo: 'acme/web',
+        askMs: 2 * HOUR,
+        promptWaitMs: 0,
+        blockedMs: HOUR / 2,
+        activeMs: 6 * HOUR,
+        blockedReports: 2,
+        permissionMs: HOUR / 2,
+        permissionPrompts: 3,
       },
       {
         repo: null,
@@ -198,6 +226,8 @@ describe('byRepo', () => {
         blockedMs: 0,
         activeMs: HOUR,
         blockedReports: 1,
+        permissionMs: 0,
+        permissionPrompts: 0,
       },
     ])
   })

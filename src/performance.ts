@@ -65,6 +65,8 @@ const ZERO: BottleneckSums = {
   blockedMs: 0,
   activeMs: 0,
   blockedReports: 0,
+  permissionMs: 0,
+  permissionPrompts: 0,
 }
 
 const add = (a: BottleneckSums, b: BottleneckSums): BottleneckSums => ({
@@ -73,6 +75,8 @@ const add = (a: BottleneckSums, b: BottleneckSums): BottleneckSums => ({
   blockedMs: a.blockedMs + b.blockedMs,
   activeMs: a.activeMs + b.activeMs,
   blockedReports: a.blockedReports + b.blockedReports,
+  permissionMs: a.permissionMs + b.permissionMs,
+  permissionPrompts: a.permissionPrompts + b.permissionPrompts,
 })
 
 /** Every day and repo summed. */
@@ -91,24 +95,37 @@ const SERIES: StackedBarSeries[] = [
   { key: 'blocked', label: 'Blocked (proxy)' },
 ]
 
-/** Your time per day over every repo, in hours, stacked; only the days with a row. */
-export function bottleneckChart(days: BottleneckDay[]): {
-  data: StackedBarDatum[]
-  series: StackedBarSeries[]
-} {
-  const data = [...sumBy(days, (d) => d.day)].map(([day, s]) => ({
+/**
+ * Your time per day over every repo, in hours, stacked; only the days with a row. Permission
+ * prompts join once `recordedSince` (the first recorded prompt's day) is set, with no value on
+ * the days before it, and the label names that day when the chart has such days.
+ */
+export function bottleneckChart(
+  days: BottleneckDay[],
+  recordedSince: string | null,
+): { data: StackedBarDatum[]; series: StackedBarSeries[] } {
+  const sums = [...sumBy(days, (d) => d.day)]
+  const data = sums.map(([day, s]) => ({
     day,
     ask: s.askMs / HOUR,
     promptWait: s.promptWaitMs / HOUR,
     blocked: s.blockedMs / HOUR,
+    ...(recordedSince !== null && {
+      permission: day < recordedSince ? null : s.permissionMs / HOUR,
+    }),
   }))
-  return { data, series: SERIES }
+  if (recordedSince === null) return { data, series: SERIES }
+  const label = sums.some(([day]) => day < recordedSince)
+    ? `Permission prompts (since ${shortDay(recordedSince)})`
+    : 'Permission prompts'
+  return { data, series: [...SERIES, { key: 'permission', label }] }
 }
 
 /** One repo's time over the range; `repo` null is Unlinked. */
 export type RepoSums = BottleneckSums & { repo: string | null }
 
-const waited = (s: BottleneckSums) => s.askMs + s.promptWaitMs + s.blockedMs
+/** Your time in the loop: questions, prompt wait, blocked and permission prompts. */
+export const waited = (s: BottleneckSums) => s.askMs + s.promptWaitMs + s.blockedMs + s.permissionMs
 
 /** Each repo summed over the days, the most time waiting first, Unlinked last. */
 export function byRepo(days: BottleneckDay[]): RepoSums[] {

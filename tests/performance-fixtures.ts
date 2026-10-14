@@ -1,5 +1,13 @@
 // Builders for Audit performance reads in tests: every count zero unless a test sets it.
-import type { AgentRow, BottleneckDay, Outcome, OutcomeWeek, Performance, Waste } from '../src/api'
+import type {
+  AgentRow,
+  BottleneckDay,
+  Outcome,
+  OutcomeWeek,
+  Performance,
+  PermissionWaits,
+  Waste,
+} from '../src/api'
 
 export const week = (over: Partial<OutcomeWeek> = {}): OutcomeWeek => ({
   week: '2026-10-12',
@@ -48,6 +56,8 @@ export const bottleneckDay = (over: Partial<BottleneckDay> = {}): BottleneckDay 
   blockedMs: 0,
   activeMs: 0,
   blockedReports: 0,
+  permissionMs: 0,
+  permissionPrompts: 0,
   ...over,
 })
 
@@ -72,10 +82,16 @@ export const waste = (over: Partial<Waste> = {}): Waste => ({
 })
 
 export const performance = (
-  over: Partial<Omit<Performance, 'bottleneck'>> & { days?: BottleneckDay[] } = {},
+  over: Partial<Omit<Performance, 'bottleneck'>> & {
+    days?: BottleneckDay[]
+    permissionWaits?: PermissionWaits
+  } = {},
 ): Performance => ({
   outcome: over.outcome ?? outcome(),
   agents: over.agents ?? [],
-  bottleneck: { days: over.days ?? [], permissionWaits: 'not_recorded' },
+  bottleneck: {
+    days: over.days ?? [],
+    permissionWaits: over.permissionWaits ?? { recordedSince: null, open: 0 },
+  },
   waste: over.waste ?? waste(),
 })
