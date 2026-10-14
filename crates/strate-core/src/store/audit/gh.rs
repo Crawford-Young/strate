@@ -13,7 +13,9 @@ use crate::time::parse_timestamp;
 pub(crate) struct Gh {
     issues: HashMap<(String, i64), GhIssue>,
     prs: HashMap<(String, i64), Vec<GhPr>>,
-    /// The issues that are epics: with sub-issues, or named as a parent.
+    /// The issues that are epics: named as parent by a cached issue of
+    /// their repo. A parent in another repo is dropped at fetch, so these
+    /// are the epics with a sub-issue in the same repo.
     epics: HashSet<(String, i64)>,
 }
 
@@ -58,9 +60,9 @@ impl Gh {
             let completed: i64 = r.get("sub_completed")?;
             let parent: Option<i64> = r.get("parent")?;
             let closed_at: Option<String> = r.get("closed_at")?;
-            if total > 0 {
-                epics.insert((repo.clone(), number));
-            }
+            // Not `total > 0`: that counts sub-issues in other repos, which
+            // never sit under it, so it would be an epic over only its
+            // direct work.
             if let Some(p) = parent {
                 epics.insert((repo.clone(), p));
             }
@@ -107,8 +109,8 @@ impl Gh {
         self.issues.get(&(repo.to_string(), number))
     }
 
-    /// Whether `repo`#`number` is an epic: it has sub-issues, or a cached
-    /// issue of the repo names it as parent.
+    /// Whether `repo`#`number` is an epic: a cached issue of the repo names
+    /// it as parent.
     pub(crate) fn is_epic(&self, repo: &str, number: i64) -> bool {
         self.epics.contains(&(repo.to_string(), number))
     }

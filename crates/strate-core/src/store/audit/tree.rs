@@ -147,6 +147,8 @@ fn group_step(group_by: GroupBy, cell: &Cell, cells: &Cells, gh: &Gh) -> Option<
 }
 
 /// The steps a window's place makes: Repo > Epic > Issue > PR, or Unlinked.
+/// An issue sits under each of its epics, outermost first; an epic's own
+/// window goes under its "Direct work" Issue node, beside its sub-issues.
 fn place_steps(place: &Place, gh: &Gh) -> Vec<Step> {
     let (repo, issue, pr) = match place {
         Place::Unlinked => {
@@ -166,12 +168,10 @@ fn place_steps(place: &Place, gh: &Gh) -> Vec<Step> {
         repo.clone(),
         repo.clone(),
     ));
-    if let Some(epic) = gh.issue(repo, issue).and_then(|i| i.parent) {
+    for epic in epics_over(gh, repo, issue) {
         steps.push(Step::issue(NodeKind::Epic, gh, repo, epic));
-        steps.push(Step::issue(NodeKind::Issue, gh, repo, issue));
-    } else if gh.is_epic(repo, issue) {
-        // An epic with a window of its own: one Epic node, the window under
-        // its "Direct work" Issue node beside the sub-issues.
+    }
+    if gh.is_epic(repo, issue) {
         steps.push(Step::issue(NodeKind::Epic, gh, repo, issue));
         let mut direct = Step::issue(NodeKind::Issue, gh, repo, issue);
         direct.label = "Direct work".into();
@@ -184,6 +184,24 @@ fn place_steps(place: &Place, gh: &Gh) -> Vec<Step> {
         steps.push(pr_step(gh, repo, issue, number));
     }
     steps
+}
+
+/// The epics `repo`#`issue` is under, outermost first: its parent, the
+/// parent's parent, and on while the cache holds the next. GitHub allows no
+/// cycle, but the cache could hold one (an issue moved during a paged
+/// refresh), so the walk stops at the first repeat.
+fn epics_over(gh: &Gh, repo: &str, issue: i64) -> Vec<i64> {
+    let mut epics = Vec::new();
+    let mut at = issue;
+    while let Some(parent) = gh.issue(repo, at).and_then(|i| i.parent) {
+        if parent == issue || epics.contains(&parent) {
+            break;
+        }
+        epics.push(parent);
+        at = parent;
+    }
+    epics.reverse();
+    epics
 }
 
 /// PR `number` closing `repo`#`issue`: closed at its merge, open while

@@ -6,7 +6,9 @@
 //! the date-range and repo filters, Unlinked, the background-dispatch flag
 //! and the headline. The row timeline (`audit_timeline`): hand values for
 //! demo-9 across a local midnight, and a property test (each day's spans
-//! sum to every node's cells that day). Every db lives in a temp dir.
+//! sum to every node's cells that day). A nested epic (#47) over
+//! `tests/fixtures/nest-home` and `github/nest-home.json`. Every db lives in
+//! a temp dir.
 
 use std::collections::VecDeque;
 use std::fs;
@@ -55,12 +57,13 @@ fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-fn root() -> PathBuf {
-    fixtures().join("audit-home")
+/// The synthetic `~/.claude` at `tests/fixtures/<name>`.
+fn home(name: &str) -> PathBuf {
+    fixtures().join(name)
 }
 
-/// Every transcript under `root/projects`, sorted.
-fn transcripts() -> Vec<PathBuf> {
+/// Every transcript under `home/projects`, sorted.
+fn transcripts(home: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in fs::read_dir(dir).expect("readable dir") {
             let path = entry.expect("entry").path();
@@ -72,7 +75,7 @@ fn transcripts() -> Vec<PathBuf> {
         }
     }
     let mut out = Vec::new();
-    walk(&root().join("projects"), &mut out);
+    walk(&home.join("projects"), &mut out);
     out.sort();
     out
 }
@@ -120,19 +123,30 @@ fn scripted(files: &[&str]) -> Runner {
 /// then the GitHub cache. `demo` resolves its owner from the pr-link and
 /// fetches the fixture; `other` asks for the login, then is not found.
 fn build(t: &Temp) -> Connection {
-    let mut store = build_without_gh(t);
+    let mut store = build_without_gh(t, "audit-home");
     let mut runner = scripted(&["audit-home.json", "user.json", "not-found.json"]);
     refresh(&mut store, &mut runner, &["demo", "other"], 1).expect("gh refresh");
     Store::open_reader(t.db()).expect("reader")
 }
 
-/// The same build with no GitHub refresh: an empty cache, as with no `gh`.
-fn build_without_gh(t: &Temp) -> Store {
+/// Cold build of `tests/fixtures/nest-home` in Toronto: `nest` asks for the
+/// login, then fetches the fixture.
+fn build_nest(t: &Temp) -> Connection {
+    let mut store = build_without_gh(t, "nest-home");
+    let mut runner = scripted(&["user.json", "nest-home.json"]);
+    refresh(&mut store, &mut runner, &["nest"], 1).expect("gh refresh");
+    Store::open_reader(t.db()).expect("reader")
+}
+
+/// The build of fixture home `name` with no GitHub refresh: an empty cache,
+/// as with no `gh`.
+fn build_without_gh(t: &Temp, name: &str) -> Store {
+    let home = home(name);
     let mut store = Store::open_in(t.db(), TORONTO).expect("open");
     store
-        .ingest_graph(&discover(&root()).expect("discover"))
+        .ingest_graph(&discover(&home).expect("discover"))
         .expect("graph");
-    for path in transcripts() {
+    for path in transcripts(&home) {
         store.ingest(&batch(&path)).expect("ingest");
     }
     store
@@ -316,6 +330,113 @@ fn an_epic_with_its_own_window_is_one_node_with_direct_work() {
     check_all_sums(&db);
 }
 
+/// How many nodes under `node`, itself included, are `kind` keyed `key`.
+fn count(node: &AuditNode, kind: NodeKind, key: &str) -> usize {
+    let own = usize::from(node.kind == kind && node.key == key);
+    own + node
+        .children
+        .iter()
+        .map(|c| count(c, kind, key))
+        .sum::<usize>()
+}
+
+/// The `(kind, key)` of each child of `node`, in order.
+fn kinds(node: &AuditNode) -> Vec<(NodeKind, &str)> {
+    node.children
+        .iter()
+        .map(|c| (c.kind, c.key.as_str()))
+        .collect()
+}
+
+#[test]
+fn a_nested_epic_is_one_node_under_its_parent() {
+    let t = Temp::new("nested-epic");
+    let db = build_nest(&t);
+    let tree = october(&db, GroupBy::Hierarchy).root;
+    let nest = child(&tree, NodeKind::Repo, "nest");
+    // #5's only sub-issue is in another repo: an issue, not an epic whose
+    // only child is its direct work.
+    assert_eq!(kinds(nest), [(NodeKind::Epic, "1"), (NodeKind::Issue, "5")]);
+    let five = child(nest, NodeKind::Issue, "5");
+    assert_eq!(five.label, "#5 Amet abroad");
+    labelled(five, NodeKind::Session, "nest-5");
+
+    // #2 is a sub-issue of #1 and the epic over #3: one Epic node under #1.
+    let one = child(nest, NodeKind::Epic, "1");
+    assert_eq!(kinds(one), [(NodeKind::Epic, "2"), (NodeKind::Issue, "4")]);
+    assert_eq!(count(&tree, NodeKind::Epic, "2"), 1);
+    assert_eq!(
+        count(&tree, NodeKind::Issue, "2"),
+        1,
+        "its direct work only"
+    );
+    let two = child(one, NodeKind::Epic, "2");
+    assert_eq!(two.label, "#2 Nested ipsum");
+    let p = two.metrics.progress.as_ref().expect("nested epic progress");
+    assert_eq!((p.completed, p.total), (1, 1));
+    assert_eq!(kinds(two), [(NodeKind::Issue, "2"), (NodeKind::Issue, "3")]);
+    let direct = child(two, NodeKind::Issue, "2");
+    assert_eq!(direct.label, "Direct work");
+    assert!(direct.metrics.progress.is_none());
+    labelled(direct, NodeKind::Session, "nest-2");
+    labelled(
+        child(two, NodeKind::Issue, "3"),
+        NodeKind::Session,
+        "nest-3",
+    );
+
+    // One opus request per window: #2 holds its own and #3's, #1 also #4's.
+    assert!(close(2.0 * OPUS, two.metrics.cost_usd));
+    assert!(close(3.0 * OPUS, one.metrics.cost_usd));
+    assert_eq!((two.metrics.sessions, one.metrics.sessions), (2, 3));
+    // Open: nest-2's start (Oct 4 14:00:00Z) to #3's close (Oct 5
+    // 18:00:00Z), its latest child end.
+    assert!(two.metrics.open);
+    assert_eq!(two.metrics.elapsed_ms, Some(28 * 3600 * S));
+
+    // The timeline finds the nested epic by the same path.
+    let oct = filter("2026-10-01", "2026-10-31", &[], GroupBy::Hierarchy);
+    let to_two = [
+        (NodeKind::Repo, "nest"),
+        (NodeKind::Epic, "1"),
+        (NodeKind::Epic, "2"),
+    ];
+    let days = audit_timeline(&db, &oct, &steps(&to_two)).expect("timeline");
+    let on: Vec<_> = days.iter().map(|d| d.day.as_str()).collect();
+    assert_eq!(on, ["2026-10-04", "2026-10-05"]);
+    check_all_sums(&db);
+}
+
+#[test]
+fn a_parent_cycle_in_the_cache_stops_at_the_first_repeat() {
+    let t = Temp::new("parent-cycle");
+    // GitHub allows no cycle, but a refresh paging while an issue moves
+    // could cache one: #1 under #2 under #1.
+    let db = synthetic(
+        &t,
+        "INSERT INTO sessions (session_id, path, started_at) VALUES
+             ('s1', '/p/s1.jsonl', '2026-10-02T10:00:00.000Z');
+         INSERT INTO workstreams (id, name, fallback) VALUES (1, 'ring-1', 0);
+         INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id)
+             VALUES (1, 's1', 0, '2026-10-02T10:00:00.000Z', 1);
+         INSERT INTO audit_cells (session_id, agent_id, segment_id, day, model, wall_ms,
+             active_ms, wait_ms, cost_usd, unpriced, input_tokens, output_tokens,
+             cache_read_tokens, cache_write_tokens) VALUES
+             ('s1', NULL, 1, '2026-10-02', 'm', 1000, 1000, 0, 1.0, 0, 10, 1, 0, 0);
+         INSERT INTO gh_repos (slug, owner, name, fetched_at) VALUES ('ring', 'example', 'ring', 1);
+         INSERT INTO gh_issues (repo, number, title, state, created_at, parent, sub_total,
+             sub_completed) VALUES
+             ('ring', 1, 'Lorem', 'OPEN', '2026-10-01T00:00:00Z', 2, 1, 0),
+             ('ring', 2, 'Ipsum', 'OPEN', '2026-10-01T00:00:00Z', 1, 1, 0);",
+    );
+    let tree = lab(&db, "2026-10-01", "2026-10-31", GroupBy::Hierarchy).root;
+    let two = child(child(&tree, NodeKind::Repo, "ring"), NodeKind::Epic, "2");
+    let one = child(two, NodeKind::Epic, "1");
+    assert_eq!(kinds(one), [(NodeKind::Issue, "1")]);
+    assert_eq!(count(&tree, NodeKind::Epic, "1"), 1);
+    assert!(close(1.0, one.metrics.cost_usd));
+}
+
 #[test]
 fn only_unparsed_windows_are_unlinked() {
     let t = Temp::new("unlinked");
@@ -362,7 +483,7 @@ fn only_unparsed_windows_are_unlinked() {
 #[test]
 fn with_no_github_cache_issues_sit_under_their_repo() {
     let t = Temp::new("no-gh");
-    drop(build_without_gh(&t));
+    drop(build_without_gh(&t, "audit-home"));
     let db = Store::open_reader(t.db()).expect("reader");
     let a = october(&db, GroupBy::Hierarchy);
     let demo = child(&a.root, NodeKind::Repo, "demo");
@@ -794,7 +915,7 @@ fn the_audit_lists_the_repos_github_could_not_fetch() {
     assert_eq!(errors[0].repo, "other");
     assert!(errors[0].error.contains("Could not resolve"), "{errors:?}");
     let t = Temp::new("gh-errors-none");
-    drop(build_without_gh(&t));
+    drop(build_without_gh(&t, "audit-home"));
     let db = Store::open_reader(t.db()).expect("reader");
     assert!(october(&db, GroupBy::Hierarchy).github_errors.is_empty());
 }

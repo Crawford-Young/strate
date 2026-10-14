@@ -4,8 +4,9 @@
 //! Levels: Repo > Epic > Issue > PR > Session > Agent. A Session node is one
 //! `/rename` window. Its name (`<repo>-<issue>[-sN]`, bare or behind
 //! `ticket-` or `epic-`; see [`crate::names`]) places it under its repo and
-//! issue. When the GitHub cache holds that issue, it also goes
-//! under the epic the issue is a sub-issue of, and under a PR: the issue's
+//! issue. When the GitHub cache holds that issue, it also goes under each
+//! epic above the issue, outermost first (an epic is one node, its own
+//! windows under its "Direct work"), and under a PR: the issue's
 //! PR that the session's `github_links` names, else the issue's only PR,
 //! else none. An issue the cache doesn't hold (no `gh`, a failed fetch) has
 //! `github: false`, no epic, PR or progress, and is open. Only a window that
