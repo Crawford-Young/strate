@@ -45,7 +45,6 @@ const METRICS: [header: string, value: (n: AuditNode) => Cell][] = [
   ['Open', (n) => n.metrics.open],
   ['Active (ms)', (n) => n.metrics.activeMs],
   ['Agent-hours wall (ms)', (n) => n.metrics.agentMs],
-  ['Approximate agent-hours', (n) => n.metrics.approximate],
   ['Waiting on you (ms)', (n) => n.metrics.waitMs],
   ['Cost (USD)', (n) => usd(n.metrics.costUsd)],
   ['Unpriced requests', (n) => n.metrics.unpriced],

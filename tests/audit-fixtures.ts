@@ -7,7 +7,6 @@ export function metrics(over: Partial<Metrics> = {}): Metrics {
     unpriced: 0,
     tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     agentMs: 0,
-    approximate: false,
     activeMs: 0,
     waitMs: 0,
     sessions: 0,

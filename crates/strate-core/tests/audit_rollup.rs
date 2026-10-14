@@ -3,10 +3,10 @@
 //! America/Toronto. Hand values for the closed issue `demo-9`, a property
 //! test (every additive metric of every node is the sum of its children,
 //! under every group-by, and the root is the sum of the cells in the filter),
-//! the date-range and repo filters, Unlinked, the background-dispatch flag
-//! and the headline. The row timeline (`audit_timeline`): hand values for
-//! demo-9 across a local midnight, and a property test (each day's spans
-//! sum to every node's cells that day). A nested epic (#47) over
+//! the date-range and repo filters, Unlinked and the headline. The row
+//! timeline (`audit_timeline`): hand values for demo-9 across a local
+//! midnight, and a property test (each day's spans sum to every node's
+//! cells that day). A nested epic (#47) over
 //! `tests/fixtures/nest-home` and `github/nest-home.json`. Every db lives in
 //! a temp dir.
 
@@ -224,7 +224,6 @@ fn the_closed_issue_matches_its_hand_values() {
     assert_eq!(m.wait_ms, (180 + 115) * S);
     // Subagents: [20,80] = 60 s and [20,140] = 120 s.
     assert_eq!(m.agent_ms, (60 + 120) * S);
-    assert!(m.approximate, "the background subagent's hours");
     // Opus: req_a1 + a2 + a3 + b1 + b2 + b3; sonnet: f1 + g1.
     let usd = 0.018 + 5.0 * OPUS + 2.0 * SONNET;
     assert!(close(0.065, usd));
@@ -512,7 +511,7 @@ fn with_no_github_cache_issues_sit_under_their_repo() {
         (m.active_ms, m.wait_ms, m.agent_ms),
         (470 * S, 295 * S, 180 * S)
     );
-    assert!(close(0.065, m.cost_usd) && m.approximate);
+    assert!(close(0.065, m.cost_usd));
     let tk = &m.tokens;
     assert_eq!(
         (tk.input, tk.output, tk.cache_read, tk.cache_write),
@@ -531,38 +530,22 @@ fn with_no_github_cache_issues_sit_under_their_repo() {
 }
 
 #[test]
-fn a_background_dispatch_flags_its_agent_hours_approximate() {
+fn a_background_subagents_hours_are_its_own_run() {
     let t = Temp::new("background");
     let db = build(&t);
     let tree = october(&db, GroupBy::Hierarchy).root;
     let pr = child(issue(&tree, "9"), NodeKind::Pr, "12");
-    let first = labelled(pr, NodeKind::Session, "demo-9");
+    // demo-9-s2 launches it async (the string flag): [20,140] s.
     let second = labelled(pr, NodeKind::Session, "demo-9-s2");
-    assert!(!child(first, NodeKind::Agent, FG).metrics.approximate);
-    assert!(!first.metrics.approximate);
-    let bg = child(second, NodeKind::Agent, BG);
-    assert!(bg.metrics.approximate);
-    assert_eq!(bg.metrics.agent_ms, 120 * S);
-    assert!(second.metrics.approximate && tree.metrics.approximate);
-    assert!(!issue(&tree, "10").metrics.approximate);
-}
-
-#[test]
-fn a_background_dispatch_with_no_flag_is_known_by_its_launch() {
+    assert_eq!(child(second, NodeKind::Agent, BG).metrics.agent_ms, 120 * S);
     let t = Temp::new("background-no-flag");
     let db = build_nest(&t);
     let tree = october(&db, GroupBy::Hierarchy).root;
     let five = child(child(&tree, NodeKind::Repo, "nest"), NodeKind::Issue, "5");
+    // nest-5 launches it async with no flag: [6,9] s.
     let window = labelled(five, NodeKind::Session, "nest-5");
-    // No run_in_background on its Agent call; its tool_result is the async
-    // launch: [6,9] s.
     let bg = child(window, NodeKind::Agent, "a7000000000000001");
-    assert!(bg.metrics.approximate);
     assert_eq!(bg.metrics.agent_ms, 3 * S);
-    assert!(!child(window, NodeKind::Agent, "").metrics.approximate);
-    assert!(window.metrics.approximate && five.metrics.approximate);
-    let nest = child(&tree, NodeKind::Repo, "nest");
-    assert!(!child(nest, NodeKind::Epic, "1").metrics.approximate);
 }
 
 #[test]
@@ -656,7 +639,6 @@ fn group_bys_put_the_hierarchy_under_each_group() {
     assert_eq!(keys(&types), ["implementer", "orchestrator", "recon"]);
     let recon = child(&types.root, NodeKind::Group, "recon");
     assert_eq!(recon.metrics.agent_ms, 120 * S);
-    assert!(recon.metrics.approximate);
     let prs = october(&db, GroupBy::Pr);
     assert_eq!(keys(&prs), ["", "demo#12"]);
     assert!(close(
@@ -697,11 +679,6 @@ fn check_sums(node: &AuditNode, path: &str) {
     assert_eq!(m.sessions, sum(|k| k.sessions), "{path}: sessions");
     assert_eq!(m.agents, sum(|k| k.agents), "{path}: agents");
     assert_eq!(m.rotations, sum(|k| k.rotations), "{path}: rotations");
-    assert_eq!(
-        m.approximate,
-        kids().any(|k| k.approximate),
-        "{path}: approximate"
-    );
     // Agents run in parallel: a session is not the sum of its agents.
     if node.kind != NodeKind::Session {
         assert_eq!(m.active_ms, sum(|k| k.active_ms), "{path}: active");
@@ -870,7 +847,6 @@ fn the_filter_and_tree_use_the_webview_shape() {
             "activeMs",
             "agentMs",
             "agents",
-            "approximate",
             "costUsd",
             "elapsedMs",
             "open",

@@ -12,7 +12,7 @@ const lines = (csv: string) => csv.slice(BOM.length).split('\r\n').slice(0, -1)
 
 // Core keys an epic, issue or PR by its number, and a repo by its slug.
 const tree = audit([
-  node('repo', 'acme/web', { costUsd: 6.5, unpriced: 2, agentMs: 3_600_000, approximate: true }, [
+  node('repo', 'acme/web', { costUsd: 6.5, unpriced: 2, agentMs: 3_600_000 }, [
     node(
       'epic',
       '10',
@@ -41,7 +41,6 @@ const HEADER = [
   'Open',
   'Active (ms)',
   'Agent-hours wall (ms)',
-  'Approximate agent-hours',
   'Waiting on you (ms)',
   'Cost (USD)',
   'Unpriced requests',
@@ -116,7 +115,6 @@ describe('toCsv', () => {
     expect(at(web, 'GitHub')).toBe('false')
     expect(at(web, 'Elapsed (ms)')).toBe('')
     expect(at(web, 'Progress total')).toBe('')
-    expect(at(web, 'Approximate agent-hours')).toBe('true')
     expect(at(web, 'Agent-hours wall (ms)')).toBe('3600000')
     expect(at(web, 'Unpriced requests')).toBe('2')
   })

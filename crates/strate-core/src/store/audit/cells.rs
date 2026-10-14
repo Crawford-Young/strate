@@ -42,7 +42,6 @@ pub(crate) struct Share {
     pub(crate) unpriced: i64,
     pub(crate) tokens: Tokens,
     pub(crate) agent_ms: i64,
-    pub(crate) approximate: bool,
     /// Active and waiting on the session line: the orchestrator's cells only.
     pub(crate) line: Time,
     /// The cell's own active and waiting, for its Agent node.
@@ -155,12 +154,10 @@ impl Cells {
                 None => share.line = share.own,
                 Some(agent_id) => {
                     let key = (row.session_id.clone(), agent_id.clone());
-                    let agent = out
-                        .agents
+                    out.agents
                         .entry(key.clone())
                         .or_insert_with(|| Agent::unknown(agent_id));
                     share.agent_ms = row.wall_ms;
-                    share.approximate = agent.background;
                     share.agents = seen_agents.insert(key).into();
                 }
             }
@@ -414,71 +411,42 @@ fn linked_pr(prs: &[GhPr], links: &[PrLink], repo: &str) -> Option<i64> {
     })
 }
 
-/// Every subagent of the sessions with subagent cells on days `?1..=?2`
-/// (see [`Agent::load_all`]). The background flag reads only the events the
-/// `events_async_launch` index holds (v10, #46), so its predicate must stay
-/// `json_extract(e.raw, '$.toolUseResult.status') = 'async_launched'`.
-const AGENTS_SQL: &str = "WITH wanted (session_id) AS (
-         SELECT DISTINCT session_id FROM audit_cells
-         WHERE day BETWEEN ?1 AND ?2 AND agent_id IS NOT NULL
-     ),
-     dispatch (child, tool_use_id, parent_session) AS (
-         SELECT d.child, d.tool_use_id, p.session_id FROM edges AS d
-         JOIN agents AS c ON c.id = d.child
-         JOIN agents AS p ON p.id = d.parent
-         WHERE d.kind = 'dispatch' AND c.session_id IN (SELECT session_id FROM wanted)
-     ),
-     background (id) AS (
-         SELECT j.value
-         FROM events AS e, json_each(e.tool_results) AS j
-         WHERE e.session_id IN (SELECT parent_session FROM dispatch)
-           AND e.tool_results IS NOT NULL
-           AND json_extract(e.raw, '$.toolUseResult.status') = 'async_launched'
-     )
-     SELECT a.session_id, a.agent_id,
-         coalesce(a.registry_name, a.name, a.description, a.agent_type), a.agent_type,
-         a.run_ms,
-         EXISTS (SELECT 1 FROM dispatch AS d
-             WHERE d.child = a.id AND d.tool_use_id IN (SELECT id FROM background))
-     FROM agents AS a
-     WHERE a.session_id IN (SELECT session_id FROM wanted) AND a.agent_id IS NOT NULL";
-
 /// A subagent as its node shows it.
 pub(crate) struct Agent {
     pub(crate) label: String,
     pub(crate) agent_type: Option<String>,
     pub(crate) run_ms: Option<i64>,
-    /// Launched in the background: its dispatch's tool_result is the async
-    /// launch (`toolUseResult.status` `async_launched`), as #42 reads it.
-    /// Read at query time from the parent's stored record (no column of its
-    /// own). Not `run_in_background`: real Agent calls carry it as the
-    /// string "true", or not at all while still launching async (#55).
-    background: bool,
 }
 
 impl Agent {
     /// Every subagent of the sessions with subagent cells on days
-    /// `from..=to`, by (session, agent id), in one query: each parent
-    /// session's tool_results are read once for the background flags.
+    /// `from..=to`, by (session, agent id), in one query.
     fn load_all(
         conn: &Connection,
         from: &str,
         to: &str,
     ) -> Result<HashMap<(String, String), Self>> {
-        conn.prepare_cached(AGENTS_SQL)?
-            .query_map([from, to], |r| {
-                let agent_id: String = r.get(1)?;
-                Ok((
-                    (r.get(0)?, agent_id.clone()),
-                    Self {
-                        label: r.get::<_, Option<String>>(2)?.unwrap_or(agent_id),
-                        agent_type: r.get(3)?,
-                        run_ms: r.get(4)?,
-                        background: r.get(5)?,
-                    },
-                ))
-            })?
-            .collect()
+        conn.prepare_cached(
+            "SELECT session_id, agent_id,
+                 coalesce(registry_name, name, description, agent_type), agent_type, run_ms
+             FROM agents
+             WHERE agent_id IS NOT NULL AND session_id IN (
+                 SELECT session_id FROM audit_cells
+                 WHERE day BETWEEN ?1 AND ?2 AND agent_id IS NOT NULL
+             )",
+        )?
+        .query_map([from, to], |r| {
+            let agent_id: String = r.get(1)?;
+            Ok((
+                (r.get(0)?, agent_id.clone()),
+                Self {
+                    label: r.get::<_, Option<String>>(2)?.unwrap_or(agent_id),
+                    agent_type: r.get(3)?,
+                    run_ms: r.get(4)?,
+                },
+            ))
+        })?
+        .collect()
     }
 
     /// A subagent with cells but no `agents` row.
@@ -487,7 +455,6 @@ impl Agent {
             label: agent_id.to_string(),
             agent_type: None,
             run_ms: None,
-            background: false,
         }
     }
 }
@@ -514,10 +481,10 @@ mod tests {
     }
 
     /// `events` rows carry their whole record, so a scan of a session's
-    /// rows costs ~1 ms each: the Audit's two reads of them go through
-    /// their v10 indexes instead (#46).
+    /// rows costs ~1 ms each: its last activity comes from the v10 index
+    /// alone instead (#46).
     #[test]
-    fn the_audits_reads_of_events_use_their_indexes() {
+    fn a_sessions_last_activity_reads_its_index_alone() {
         let dir = test_dir("audit-plans");
         let db = dir.join("strate.db");
         drop(Store::open(&db).expect("open"));
@@ -527,8 +494,6 @@ mod tests {
             session.contains("COVERING INDEX events_session_time"),
             "{session}"
         );
-        let agents = plan(&conn, AGENTS_SQL);
-        assert!(agents.contains("INDEX events_async_launch"), "{agents}");
         drop(conn);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }

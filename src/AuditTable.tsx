@@ -120,18 +120,7 @@ function columnsFor(
     ),
     plain('Active', (m) => m.activeMs, duration),
     // Subagent wall time, which the row detail's non-idle timeline does not match.
-    column(
-      'Agent-hours (wall)',
-      (m) => m.agentMs,
-      (m) =>
-        m.approximate ? (
-          <span title="Approximate: includes a background subagent's estimated time">
-            ≈{duration(m.agentMs)}
-          </span>
-        ) : (
-          duration(m.agentMs)
-        ),
-    ),
+    plain('Agent-hours (wall)', (m) => m.agentMs, duration),
     plain('Waiting on you', (m) => m.waitMs, duration),
     column(
       '$',
