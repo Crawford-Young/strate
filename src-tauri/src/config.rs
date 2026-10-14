@@ -8,7 +8,7 @@
 
 use std::ffi::OsString;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use strate_core::discovery::resolve_config_dir;
@@ -21,6 +21,7 @@ use crate::engine::Config;
 
 pub const HOOK_PORT: &str = "STRATE_HOOK_PORT";
 pub const HOOK_TOKEN: &str = "STRATE_HOOK_TOKEN";
+pub const DB_PATH: &str = "STRATE_DB";
 
 /// At most four `store-changed` events a second.
 pub const DEBOUNCE: Duration = Duration::from_millis(250);
@@ -79,6 +80,25 @@ fn missing_gh() -> github::Runner {
             "gh not found on PATH",
         ))
     })
+}
+
+/// Where the store lives. `STRATE_DB` wins in any build and must be an
+/// absolute path to a file in an existing directory. Otherwise debug builds
+/// use `strate-dev.db` and release builds `strate.db` in `data`, so a dev
+/// run never migrates the real store.
+pub fn resolve_db(debug: bool, data: &Path, over: Option<OsString>) -> Result<PathBuf, String> {
+    let Some(over) = over else {
+        return Ok(data.join(if debug { "strate-dev.db" } else { "strate.db" }));
+    };
+    let path = PathBuf::from(over);
+    let parent_exists = path.parent().is_some_and(Path::is_dir);
+    if path.as_os_str().is_empty() || !path.is_absolute() || path.is_dir() || !parent_exists {
+        return Err(format!(
+            "{DB_PATH} must be an absolute path to a file in an existing directory, got {}",
+            path.display()
+        ));
+    }
+    Ok(path)
 }
 
 fn hook_options(
@@ -184,5 +204,46 @@ mod tests {
         let err = gh(&[]).expect_err("no gh");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
         assert_eq!(config.db, PathBuf::from("/data/strate.db"));
+    }
+
+    #[test]
+    fn the_store_defaults_to_dev_in_debug_builds_and_prod_in_release() {
+        let data = std::env::temp_dir();
+        assert_eq!(
+            resolve_db(true, &data, None).expect("debug"),
+            data.join("strate-dev.db")
+        );
+        assert_eq!(
+            resolve_db(false, &data, None).expect("release"),
+            data.join("strate.db")
+        );
+    }
+
+    #[test]
+    fn strate_db_overrides_the_path_in_any_build() {
+        let file = std::env::temp_dir().join("elsewhere.db");
+        for debug in [true, false] {
+            let got = resolve_db(
+                debug,
+                Path::new("/unused"),
+                Some(file.clone().into_os_string()),
+            );
+            assert_eq!(got.expect("override"), file);
+        }
+    }
+
+    #[test]
+    fn a_bad_strate_db_is_an_error_naming_the_variable() {
+        let tmp = std::env::temp_dir();
+        let missing_parent = tmp.join("strate-no-such-dir-45").join("x.db");
+        for bad in [
+            OsString::new(),
+            tmp.clone().into_os_string(),
+            missing_parent.into_os_string(),
+            OsString::from("relative.db"),
+        ] {
+            let err = resolve_db(true, &tmp, Some(bad.clone())).expect_err("bad");
+            assert!(err.contains(DB_PATH), "{bad:?}: {err}");
+        }
     }
 }
