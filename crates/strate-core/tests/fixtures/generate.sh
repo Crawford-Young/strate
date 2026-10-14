@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ for #26, perf-home/ for #51). Field names come from
+# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ for #26, perf-home/ for #51, directs-home/ for #53). Field names come from
 # the "~/.claude format, as observed" comment on strate #10; every value is a placeholder.
 set -eu
 cd "$(dirname "$0")/.."
@@ -443,3 +443,95 @@ ameta implementer toolu_r7 > "$GD/$G3/subagents/agent-$B7.meta.json"
 ameta implementer toolu_r8 > "$GD/$G3/subagents/agent-$B8.meta.json"
 aat $G4 /work/perf "\"isSidechain\":false,\"session_id\":\"$G3\""
 { aprompt 2026-10-13T10:30:00 i-01; areply 2026-10-13T10:31:00 i-02 req_s1 $OPUS "$UO" "$TEXT"; } > "$GD/$G4.jsonl"
+
+# ---- directs-home: director-launched units (#53); hand values in tests/directs.rs ----
+# Cross-session messages, 2026-10-07Z. The sender's SendMessage result carries
+# toolUseResult.msg_id; the receiver gets a user record whose origin (kind
+# peer) carries the same msg_id and the sender's name. Edges: director-demo
+# (R1) -> ticket-demo-repo-1 (N1), and -> ticket-demo-repo-2 (N2, messaged
+# from a subagent of R1); director-alpha (X1) -> director-beta (X2). No edge:
+# N1's reply to R1 (not a director's), R1's message to a session not on disk,
+# R2 (R1's /clear successor, also director-demo) messaging N1 later (the first
+# messager wins), general-notes (Q1) <-> ticket-demo-repo-3 (Q3), and X2's
+# message back to X1 (it would close a cycle). N2 never replies. N1 dispatches
+# a subagent (S2); ticket-demo-repo-2 later draws N3, a session nobody directed.
+# X2 in turn directs ticket-demo-repo-4 (N4): a unit of a unit.
+H=fixtures/directs-home
+R1=5e55d7d7-0000-4000-8000-0000000000c1
+# R2 sorts before R1 on purpose: the first messager is by time, not by id.
+R2=5e55d7d7-0000-4000-8000-0000000000c0
+N1=5e55d7d7-0000-4000-8000-0000000000e1
+N2=5e55d7d7-0000-4000-8000-0000000000e2
+N3=5e55d7d7-0000-4000-8000-0000000000e3
+N4=5e55d7d7-0000-4000-8000-0000000000e4
+Q1=5e55d7d7-0000-4000-8000-0000000000a1
+Q3=5e55d7d7-0000-4000-8000-0000000000a3
+X1=5e55d7d7-0000-4000-8000-0000000000b1
+X2=5e55d7d7-0000-4000-8000-0000000000b2
+S1=a7000000000000001
+S2=a7000000000000002
+HUB="$H/projects/-work-hub"
+UNITS="$H/projects/-work-demo-repo"
+rm -rf "$H"
+mkdir -p "$HUB/$R1/subagents" "$UNITS/$N1/subagents" "$H/projects/-work-notes"
+m() { echo "5e55ee00-0000-4000-8000-00000000000$1"; }
+dname() { atitle "$1"; echo "{\"type\":\"agent-name\",\"agentName\":\"$1\",\"sessionId\":\"$AS\"}"; }
+dsend() { # YYYY-MM-DDTHH:MM uuid to msgId: a SendMessage call at :00, its result at :01
+  areply "$1:00" "$2" "req_$2" $OPUS "$UO" "$(ktool "toolu_$2" SendMessage "{\"to\":\"$3\",\"message\":\"Lorem ipsum.\",\"summary\":\"Lorem\"}")"
+  R="{\"success\":true,\"message\":\"Lorem.\",\"display\":\"Lorem.\",\"msg_id\":\"$4\"}"
+  RE=$(printf '%s' "$R" | sed 's/"/\\"/g')
+  aenv "$1:01" "$2-r"; echo "{$AE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_$2\",\"content\":\"$RE\"}]},\"toolUseResult\":$R}"
+}
+dpeer() { # time uuid msgId senderName: a message received from another session
+  aenv "$1" "$2"; echo "{$AE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Lorem ipsum.\"},\"origin\":{\"kind\":\"peer\",\"from\":\"uds:cc-msg-0000\",\"msg_id\":\"$3\",\"name\":\"$4\",\"fromMode\":\"prompting\"}}"
+}
+DT=2026-10-07T10
+aat $R1 /work/hub "\"isSidechain\":false,\"session_id\":\"$R1\""
+{ dname director-demo
+  aprompt $DT:00:00 r1-01
+  dsend $DT:01 r1-02 ticket-demo-repo-1 "$(m 1)"
+  gdispatch $DT:01:30 r1-03 req_r1-03 toolu_r1d; aresult $DT:01:31 r1-04 toolu_r1d
+  dpeer $DT:03:02 r1-05 "$(m 3)" ticket-demo-repo-1
+  dsend $DT:04 r1-06 "ticket-demo-repo-9 [ref]" "$(m 4)"
+} > "$HUB/$R1.jsonl"
+aat $R1 /work/hub "\"isSidechain\":true,\"agentId\":\"$S1\""
+{ atask $DT:01:40 s1-01; dsend $DT:02 s1-02 ticket-demo-repo-2 "$(m 2)"; } > "$HUB/$R1/subagents/agent-$S1.jsonl"
+ameta implementer toolu_r1d > "$HUB/$R1/subagents/agent-$S1.meta.json"
+aat $N1 /work/demo-repo "\"isSidechain\":false,\"session_id\":\"$N1\""
+{ dname ticket-demo-repo-1
+  dpeer $DT:01:02 n1-01 "$(m 1)" director-demo
+  areply $DT:01:10 n1-02 req_n1-02 $OPUS "$UO" "$TEXT"
+  gdispatch $DT:01:20 n1-05 req_n1-05 toolu_n1d; aresult $DT:01:21 n1-06 toolu_n1d
+  dsend $DT:03 n1-03 director-demo "$(m 3)"
+  dpeer 2026-10-07T11:01:02 n1-04 "$(m 5)" director-demo
+} > "$UNITS/$N1.jsonl"
+aat $N1 /work/demo-repo "\"isSidechain\":true,\"agentId\":\"$S2\""
+{ atask $DT:01:25 s2-01; areply $DT:01:50 s2-02 req_s2-02 $SONNET "$US" "$TEXT"; } > "$UNITS/$N1/subagents/agent-$S2.jsonl"
+ameta implementer toolu_n1d > "$UNITS/$N1/subagents/agent-$S2.meta.json"
+aat $N2 /work/demo-repo "\"isSidechain\":false,\"session_id\":\"$N2\""
+{ dname ticket-demo-repo-2; dpeer $DT:02:02 n2-01 "$(m 2)" director-demo
+  areply $DT:02:10 n2-02 req_n2-02 $OPUS "$UO" "$TEXT"; } > "$UNITS/$N2.jsonl"
+aat $N3 /work/demo-repo "\"isSidechain\":false,\"session_id\":\"$N3\""
+{ dname ticket-demo-repo-2; aprompt 2026-10-07T13:00:00 n3-01
+  areply 2026-10-07T13:00:10 n3-02 req_n3-02 $OPUS "$UO" "$TEXT"; } > "$UNITS/$N3.jsonl"
+aat $R2 /work/hub "\"isSidechain\":false,\"session_id\":\"$R1\""
+{ dname director-demo; aprompt 2026-10-07T11:00:00 r2-01
+  dsend 2026-10-07T11:01 r2-02 ticket-demo-repo-1 "$(m 5)"; } > "$HUB/$R2.jsonl"
+aat $Q1 /work/notes "\"isSidechain\":false,\"session_id\":\"$Q1\""
+{ dname general-notes; aprompt 2026-10-07T09:00:00 q1-01
+  dsend 2026-10-07T09:00 q1-02 ticket-demo-repo-3 "$(m 6)"
+  dpeer 2026-10-07T09:01:02 q1-03 "$(m 7)" ticket-demo-repo-3; } > "$H/projects/-work-notes/$Q1.jsonl"
+aat $Q3 /work/demo-repo "\"isSidechain\":false,\"session_id\":\"$Q3\""
+{ dname ticket-demo-repo-3; dpeer 2026-10-07T09:00:02 q3-01 "$(m 6)" general-notes
+  dsend 2026-10-07T09:01 q3-02 general-notes "$(m 7)"; } > "$UNITS/$Q3.jsonl"
+aat $X1 /work/hub "\"isSidechain\":false,\"session_id\":\"$X1\""
+{ dname director-alpha; aprompt 2026-10-07T12:00:00 x1-01
+  dsend 2026-10-07T12:00 x1-02 director-beta "$(m 8)"
+  dpeer 2026-10-07T12:01:02 x1-03 "$(m 9)" director-beta; } > "$HUB/$X1.jsonl"
+aat $X2 /work/hub "\"isSidechain\":false,\"session_id\":\"$X2\""
+{ dname director-beta; dpeer 2026-10-07T12:00:02 x2-01 "$(m 8)" director-alpha
+  dsend 2026-10-07T12:01 x2-02 director-alpha "$(m 9)"
+  dsend 2026-10-07T12:02 x2-03 ticket-demo-repo-4 "$(m a)"; } > "$HUB/$X2.jsonl"
+aat $N4 /work/demo-repo "\"isSidechain\":false,\"session_id\":\"$N4\""
+{ dname ticket-demo-repo-4; dpeer 2026-10-07T12:02:02 n4-01 "$(m a)" director-beta
+  areply 2026-10-07T12:02:10 n4-02 req_n4-02 $OPUS "$UO" "$TEXT"; } > "$UNITS/$N4.jsonl"

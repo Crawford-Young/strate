@@ -11,6 +11,7 @@
 
 mod account;
 mod audit;
+mod directs;
 mod github;
 mod group;
 mod ingest;
@@ -304,10 +305,11 @@ impl Ingest<'_> {
     /// regroups the batch's session: its name segments and workstream, its
     /// subagents' segments, and its process root's continuation edges.
     /// Then it recomputes the cost, time and context rollups of that
-    /// session and of any session sharing one of the batch's requests.
-    /// Grouping and rollups are functions of the stored events, so batches
-    /// in any order converge to a cold build. A subagent that only a graph
-    /// has added gets its segment at its session's next batch.
+    /// session and of any session sharing one of the batch's requests, and
+    /// rebuilds `directs` when the batch stored a cross-session message.
+    /// Grouping, rollups and `directs` are functions of the stored events,
+    /// so batches in any order converge to a cold build. A subagent that
+    /// only a graph has added gets its segment at its session's next batch.
     pub fn batch(&self, batch: &Batch) -> Result<()> {
         ingest::batch(&self.tx, batch)
     }
@@ -380,6 +382,53 @@ mod tests {
         drop(store);
         let store = Store::open_in(&db, "UTC").expect("reopen");
         assert_eq!(ask(&store), 99);
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_populated_v8_store_reads_its_messages_and_builds_directs_on_upgrade() {
+        let dir = test_dir("store-v8-upgrade");
+        let db = dir.join("strate.db");
+        let mut v8 = Connection::open(&db).expect("v8 db");
+        migrate::migrate(&mut v8, &migrate::MIGRATIONS[..8]).expect("v8");
+        // Fully accounted by the build before rollup 4.
+        v8.execute(
+            "INSERT INTO meta (key, value) VALUES ('prices', ?1), ('tz', 'UTC'), ('rollup', '3')",
+            [crate::cost::PRICES_JSON],
+        )
+        .expect("meta");
+        v8.execute_batch(
+            r#"INSERT INTO sessions (session_id, path) VALUES ('d1', '/p/d1.jsonl'),
+                   ('u1', '/p/u1.jsonl');
+               INSERT INTO agents (session_id, kind) VALUES ('d1', 'orchestrator'),
+                   ('u1', 'orchestrator');
+               INSERT INTO events (session_id, type, uuid, timestamp, file, byte_offset, raw)
+               VALUES ('d1', 'user', 'd1-1', '2026-10-07T10:00:01.000Z', '/p/d1.jsonl', 0,
+                       '{"type":"user","message":{"content":[{"type":"tool_result",
+                         "tool_use_id":"toolu_1"}]},"toolUseResult":{"msg_id":"m1"}}'),
+                      ('u1', 'user', 'u1-1', '2026-10-07T10:00:02.000Z', '/p/u1.jsonl', 0,
+                       '{"type":"user","message":{"content":"Lorem."},
+                         "origin":{"kind":"peer","msg_id":"m1","name":"director-demo"}}');"#,
+        )
+        .expect("v8 rows");
+        drop(v8);
+
+        let store = Store::open_in(&db, "UTC").expect("upgrade");
+        let directs: Vec<(String, String, String)> = store
+            .conn
+            .prepare("SELECT parent, child, msg_id FROM directs")
+            .expect("directs")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("rows")
+            .collect::<Result<_>>()
+            .expect("edges");
+        assert_eq!(directs, [("d1".into(), "u1".into(), "m1".into())]);
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, 9);
         drop(store);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }

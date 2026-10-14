@@ -12,12 +12,12 @@ use jiff::tz::TimeZone;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
-use super::Result;
+use super::{Result, directs};
 use crate::cost::{self, SYNTHETIC, Usage, truthy};
 use crate::time::{self, Cat, IDLE_GAP_MS, Record, Split, Timed};
 
-/// The accounting columns of one event (see `0003_cost_time.sql` and
-/// `0008_performance.sql`).
+/// The accounting columns of one event (see `0003_cost_time.sql`,
+/// `0008_performance.sql` and `0009_directs.sql`).
 #[derive(Debug, Default, PartialEq)]
 pub(super) struct Fields {
     pub request_key: Option<String>,
@@ -32,6 +32,9 @@ pub(super) struct Fields {
     pub notification_status: Option<String>,
     pub message_to: Option<String>,
     pub api_error: Option<String>,
+    pub sent_msg_id: Option<String>,
+    pub peer_msg_id: Option<String>,
+    pub peer_name: Option<String>,
 }
 
 impl Fields {
@@ -46,8 +49,8 @@ impl Fields {
 }
 
 /// Reads one record's accounting fields, as audit-lib's `add` and
-/// `timeRecord` read them, plus its task notification, SendMessage targets
-/// and API error.
+/// `timeRecord` read them, plus its task notification, SendMessage targets,
+/// API error and the msg_id of a cross-session message it sent or received.
 pub(super) fn fields(value: &Value) -> Fields {
     match value["type"].as_str() {
         Some("assistant") => assistant_fields(value),
@@ -121,9 +124,15 @@ fn user_fields(value: &Value) -> Fields {
     let prompt = (results.is_empty() && !truthy(&value["isMeta"])).then(|| is_human(value));
     // A prompt nobody typed may be a task notification.
     let text = (prompt == Some(false)).then(|| message_text(value));
+    let id = |v: &Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_string);
+    let origin = &value["origin"];
+    let peer = origin["kind"] == "peer";
     Fields {
         tool_results: (!results.is_empty()).then(|| json!(results).to_string()),
         prompt,
+        sent_msg_id: id(&value["toolUseResult"]["msg_id"]),
+        peer_msg_id: peer.then(|| id(&origin["msg_id"])).flatten(),
+        peer_name: peer.then(|| id(&origin["name"])).flatten(),
         ..Fields::notified(text.as_deref())
     }
 }
@@ -240,13 +249,15 @@ fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
 /// build lacks: the next open re-reads and recomputes everything once.
 /// 2: `audit_cells.ask_ms`. 3: the notification, SendMessage and API-error
 /// event columns and the agents' outcome, follow-ups and context peak (v8).
-const ROLLUP_VERSION: &str = "3";
+/// 4: the sent and peer msg_id event columns, and `directs` from them (v9).
+const ROLLUP_VERSION: &str = "4";
 
 /// Recomputes every rollup and audit cell unless the store was last
 /// accounted at the vendored prices, in `zone` (an IANA name) and at
 /// [`ROLLUP_VERSION`]. A new price list or rollup version also re-reads
-/// every event's accounting fields from `raw`. A store from before v3 (no
-/// prices) or v6 (no zone) is filled here too.
+/// every event's accounting fields from `raw` and rebuilds `directs` from
+/// them. A store from before v3 (no prices) or v6 (no zone) is filled here
+/// too.
 pub(super) fn refresh(conn: &Connection, zone: &str) -> Result<()> {
     let repriced = meta(conn, "prices")?.as_deref() != Some(cost::PRICES_JSON);
     let rezoned = meta(conn, "tz")?.as_deref() != Some(zone);
@@ -256,6 +267,7 @@ pub(super) fn refresh(conn: &Connection, zone: &str) -> Result<()> {
     }
     if repriced || reversioned {
         reread_fields(conn)?;
+        directs::rebuild(conn)?;
     }
     set_meta(conn, "tz", zone)?;
     let ids: Vec<String> = conn
@@ -288,7 +300,7 @@ fn reread_fields(conn: &Connection) -> Result<()> {
                 "UPDATE events SET request_key = ?2, model = ?3, usage = ?4, output_tokens = ?5,
                      cost_usd = ?6, tool_uses = ?7, tool_results = ?8, prompt = ?9,
                      notification_task = ?10, notification_status = ?11, message_to = ?12,
-                     api_error = ?13
+                     api_error = ?13, sent_msg_id = ?14, peer_msg_id = ?15, peer_name = ?16
                  WHERE id = ?1",
             )?
             .execute(params![
@@ -304,7 +316,10 @@ fn reread_fields(conn: &Connection) -> Result<()> {
                 f.notification_task,
                 f.notification_status,
                 f.message_to,
-                f.api_error
+                f.api_error,
+                f.sent_msg_id,
+                f.peer_msg_id,
+                f.peer_name
             ])?;
         }
         after = last;
@@ -1074,6 +1089,50 @@ mod tests {
             Some("prompt_too_long")
         );
         assert_eq!(error("API Error: lorem").as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn cross_session_messages_are_read_from_user_records() {
+        let sent = fields(&json!({"type": "user",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": "toolu_1"}]},
+            "toolUseResult": {"success": true, "message": "Lorem.", "msg_id": "m1"}}));
+        assert_eq!(sent.sent_msg_id.as_deref(), Some("m1"));
+        assert_eq!((sent.peer_msg_id, sent.peer_name), (None, None));
+
+        let received = fields(&json!({"type": "user", "message": {"content": "Lorem."},
+            "origin": {"kind": "peer", "from": "uds:lorem", "msg_id": "m1",
+                "name": "director-demo", "fromMode": "prompting"}}));
+        assert_eq!(received.peer_msg_id.as_deref(), Some("m1"));
+        assert_eq!(received.peer_name.as_deref(), Some("director-demo"));
+        assert_eq!(received.sent_msg_id, None);
+
+        let none = |v: Value| {
+            let f = fields(&v);
+            (f.sent_msg_id, f.peer_msg_id, f.peer_name)
+        };
+        // A failed send's result is a string; an empty id is no id.
+        assert_eq!(
+            none(json!({"type": "user", "toolUseResult": "Error: lorem"})),
+            (None, None, None)
+        );
+        assert_eq!(
+            none(json!({"type": "user", "toolUseResult": {"msg_id": ""}})),
+            (None, None, None)
+        );
+        // Only a peer origin is a received message.
+        assert_eq!(
+            none(json!({"type": "user", "message": {"content": "Lorem."},
+                "origin": {"kind": "human", "msg_id": "m1", "name": "director-demo"}})),
+            (None, None, None)
+        );
+        // Only user records carry either.
+        assert_eq!(
+            none(
+                json!({"type": "assistant", "message": {}, "toolUseResult": {"msg_id": "m1"},
+                "origin": {"kind": "peer", "msg_id": "m1"}})
+            ),
+            (None, None, None)
+        );
     }
 
     #[test]

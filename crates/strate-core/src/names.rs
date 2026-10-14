@@ -22,17 +22,29 @@ pub struct ParsedName {
 /// Prefixes match in any case. A prefix with no repo after it (`ticket-51`)
 /// is an untyped name, as lib.mjs's legacy form reads it.
 pub fn parse_name(name: &str) -> Option<ParsedName> {
-    let (kind, rest) = name.split_once('-').unwrap_or((name, ""));
-    let typed = |k: &str| kind.eq_ignore_ascii_case(k) && !rest.is_empty();
-    if typed("director") || typed("general") {
+    if is_director(name) || typed(name, "general").is_some() {
         return None;
     }
-    if (typed("ticket") || typed("epic"))
-        && let Some(parsed) = parse_untyped(rest)
+    if let Some(parsed) = typed(name, "ticket")
+        .or_else(|| typed(name, "epic"))
+        .and_then(parse_untyped)
     {
         return Some(parsed);
     }
     parse_untyped(name)
+}
+
+/// Whether `name` is a director's: the typed `director-<scope>` prefix, in
+/// any case. A launch line pasted as a name (`claude -n director-x`) is not.
+pub fn is_director(name: &str) -> bool {
+    typed(name, "director").is_some()
+}
+
+/// What follows `name`'s typed `kind-` prefix (in any case), when something does.
+fn typed<'a>(name: &'a str, kind: &str) -> Option<&'a str> {
+    name.split_once('-')
+        .filter(|(k, rest)| k.eq_ignore_ascii_case(kind) && !rest.is_empty())
+        .map(|(_, rest)| rest)
 }
 
 /// `<repo>-<issue>` with its `-sN` or agent suffix.
