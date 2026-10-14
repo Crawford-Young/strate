@@ -1,8 +1,17 @@
 //! The Audit rollups (#26): a tree over `audit_cells`, plus a headline and
 //! the performance read, on a reader connection.
 //!
-//! Levels: Repo > Epic > Issue > PR > Session > Agent. A Session node is one
-//! `/rename` window. Its name (`<repo>-<issue>[-sN]`, bare or behind
+//! Levels: Repo > Epic > Issue > PR > Session > Agent. A Session node is a
+//! `/clear` chain's `/rename` windows in one workstream (#63): every file
+//! one process wrote across `/clear`s (its process root) under one name,
+//! with one orchestrator node and every link's subagents. A chain renamed
+//! into another workstream reads there as another row: a real store had
+//! 35 of 62 continuation edges cross workstreams, a process reused for the
+//! next ticket. A director's `--bg` unit (a row with a session in
+//! `directs`) nests under the director's row, the one holding the window
+//! that messaged it, and its work counts there, not under its own issue;
+//! a unit of a unit nests a level deeper. Rows that direct each other nest
+//! one way only. Its name (`<repo>-<issue>[-sN]`, bare or behind
 //! `ticket-` or `epic-`; see [`crate::names`]) places it under its repo and
 //! issue. When the GitHub cache holds that issue, it also goes under each
 //! epic above the issue, outermost first (an epic is one node, its own
@@ -11,8 +20,10 @@
 //! else none. An issue the cache doesn't hold (no `gh`, a failed fetch) has
 //! `github: false`, no epic, PR or progress, and is open. Only a window that
 //! is unnamed, has a fallback name or has a name that doesn't parse sits
-//! under "Unlinked". Any other group-by puts one Group node per value (local
-//! day, PR, agent type, model) above that hierarchy.
+//! under "Unlinked", and with it a director's row. Any other group-by puts
+//! one Group node per value (local day, PR, agent type, model) above that
+//! hierarchy; the PR group, the repo filter and the headline read a unit's
+//! own window, wherever its row nests.
 //!
 //! Every node sums the cells under it. $, tokens, agent-hours (subagent
 //! wall) and the counts are additive at every level. Sessions, agents and
@@ -142,8 +153,9 @@ pub struct Metrics {
 pub struct AuditNode {
     pub kind: NodeKind,
     /// Unique among its siblings: a repo slug, an issue or PR number, a
-    /// window's segment id (`session:<id>` with none), an agent id (`""`:
-    /// the orchestrator) or a group value.
+    /// Session row's `<process root>/<workstream id>` (`session:<id>` for a
+    /// session with no window), an agent id (`""`: the orchestrator) or a
+    /// group value.
     pub key: String,
     pub label: String,
     /// An epic, issue or PR read from the GitHub cache. False on an issue

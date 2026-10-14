@@ -54,6 +54,21 @@ impl Step {
         }
     }
 
+    /// Another cell's copy of this step: a Session row (or its
+    /// orchestrator) spans every window of its chain, and sorts by the
+    /// earliest. Every other step's copies are the same.
+    fn widen(&mut self, other: &Self) {
+        if let Some((start, end)) = other.span {
+            self.span = Some(match self.span {
+                Some((s, e)) => (s.min(start), e.max(end)),
+                None => (start, end),
+            });
+        }
+        if other.order < self.order {
+            self.order.clone_from(&other.order);
+        }
+    }
+
     fn new(kind: NodeKind, key: String, label: String, order: String) -> Self {
         Self {
             kind,
@@ -94,16 +109,17 @@ impl Step {
 }
 
 /// `cell`'s path from the root: its Group node under `group_by` (none under
-/// Hierarchy), then the place of its window (Repo > Epic > Issue > PR, or
-/// Unlinked), its window's Session node and its Agent node. The tree adds
-/// the cell to every node on it; the cells under a node are those whose
-/// path passes through that node's `(kind, key)` steps.
+/// Hierarchy), then the place of its outermost Session row (Repo > Epic >
+/// Issue > PR, or Unlinked), its Session rows (a unit's under its
+/// director's; see [`Cells::rows`]) and its Agent node. The tree adds the
+/// cell to every node on it; the cells under a node are those whose path
+/// passes through that node's `(kind, key)` steps.
 pub(crate) fn path(group_by: GroupBy, cell: &Cell, cells: &Cells, gh: &Gh) -> Vec<Step> {
-    let window = cells.window(cell);
-    let mut steps = Vec::with_capacity(7);
+    let rows = cells.rows(cell);
+    let mut steps = Vec::with_capacity(7 + rows.len());
     steps.extend(group_step(group_by, cell, cells, gh));
-    steps.extend(place_steps(&window.place, gh));
-    steps.push(window_step(window));
+    steps.extend(place_steps(&rows[0].place, gh));
+    steps.extend(rows.into_iter().map(window_step));
     steps.push(agent_step(cell, cells));
     steps
 }
@@ -225,14 +241,14 @@ fn pr_step(gh: &Gh, repo: &str, issue: i64, number: i64) -> Step {
     step
 }
 
-/// A window's Session node, sorted by its start.
+/// A window's Session row, sorted by its start.
 fn window_step(window: &Window) -> Step {
     let start = window.span.map_or(0, |s| s.0);
     let mut step = Step::new(
         NodeKind::Session,
-        window.key.clone(),
+        window.row.clone(),
         window.label.clone(),
-        format!("{start:020}/{}", window.key),
+        format!("{start:020}/{}", window.row),
     );
     step.end = End::Own;
     step.span = window.span;
@@ -293,14 +309,17 @@ impl Node {
     }
 
     /// Adds `share` to this node and to each node along `steps`, creating
-    /// the missing ones.
+    /// the missing ones and widening the rest.
     fn insert(&mut self, steps: Vec<Step>, share: &Share) {
         self.add(share);
         let mut node = self;
         for step in steps {
             let key = (step.kind, step.key.clone());
             let i = match node.index.get(&key) {
-                Some(&i) => i,
+                Some(&i) => {
+                    node.children[i].step.widen(&step);
+                    i
+                }
                 None => {
                     node.children.push(Node::new(step));
                     node.index.insert(key, node.children.len() - 1);

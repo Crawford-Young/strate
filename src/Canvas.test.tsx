@@ -216,6 +216,23 @@ describe('node cards', () => {
     expect(card('teammate')).toHaveTextContent('claude-opus-5-5')
   })
 
+  it("dims an earlier /clear link's agents, and only those", async () => {
+    const graph: LiveGraph = {
+      ...tiered,
+      agents: [
+        agent({ id: 1, kind: 'orchestrator', agentId: null, name: 'lead' }),
+        agent({ id: 2, parent: 1, name: 'current', state: 'done' }),
+        agent({ id: 3, parent: 1, name: 'cleared', state: 'done', earlier: true }),
+      ],
+      edges: [dispatch(1, 2), dispatch(1, 3)],
+    }
+    render(view({ graph }))
+    await screen.findByTestId('flow')
+    expect(card('cleared')).toHaveClass('border-border-subtle')
+    expect(card('current')).not.toHaveClass('border-border-subtle')
+    expect(card('lead')).not.toHaveClass('border-border-subtle')
+  })
+
   it("colours each gauge against that agent's own nudge and hard stop", async () => {
     const graph: LiveGraph = {
       ...tiered,
