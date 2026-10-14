@@ -5,17 +5,25 @@ import ELK from 'elkjs/lib/elk.bundled.js'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { centerCalls, flowProps, resetFlow, zoomCalls } from '../tests/xyflow-mock'
 import type { GraphAgent, GraphEdge, LiveGraph, Workstream } from './api'
-import { Canvas } from './Canvas'
+import { Canvas, REFIT_MS } from './Canvas'
 import { NODE_HEIGHT, NODE_WIDTH } from './graphLayout'
 
 const layout = vi.hoisted(() => vi.fn<(graph: ElkNode) => Promise<ElkNode>>())
 
 vi.mock('./elk', () => ({ elk: () => ({ layout }) }))
 
-vi.mock('@xyflow/react', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@xyflow/react')>()),
-  ...(await import('../tests/xyflow-mock')),
-}))
+const fitView = vi.hoisted(() => vi.fn(() => Promise.resolve(true)))
+
+vi.mock('@xyflow/react', async (importOriginal) => {
+  const mock = await import('../tests/xyflow-mock')
+  // Stable across renders, as the real instance is.
+  const flow = { ...mock.useReactFlow(), fitView }
+  return {
+    ...(await importOriginal<typeof import('@xyflow/react')>()),
+    ...mock,
+    useReactFlow: () => flow,
+  }
+})
 
 const real = new ELK()
 
@@ -468,6 +476,108 @@ describe('layout', () => {
     render(view({ graph: null }))
     expect(screen.getByText('No session to draw yet.')).toBeInTheDocument()
     expect(layout).not.toHaveBeenCalled()
+  })
+})
+
+describe('re-fit on resize', () => {
+  let observers: { callback: ResizeObserverCallback; targets: Set<Element> }[] = []
+  /** Every observed element reports `width` x `height`, as a real observer would on a resize. */
+  const resize = (width: number, height: number) =>
+    act(() => {
+      for (const o of observers) {
+        for (const target of o.targets) {
+          const entry = { target, contentRect: { width, height } } as ResizeObserverEntry
+          o.callback([entry], {} as ResizeObserver)
+        }
+      }
+    })
+  const settle = (ms = REFIT_MS) => act(() => vi.advanceTimersByTimeAsync(ms))
+
+  /** The graph drawn, then fake timers for the fit delay. */
+  async function drawn() {
+    const rendered = render(view({}))
+    await screen.findByTestId('flow')
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    return rendered
+  }
+
+  beforeEach(() => {
+    observers = []
+    fitView.mockClear()
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        targets = new Set<Element>()
+        constructor(public callback: ResizeObserverCallback) {
+          observers.push(this)
+        }
+        observe(target: Element) {
+          this.targets.add(target)
+        }
+        unobserve(target: Element) {
+          this.targets.delete(target)
+        }
+        disconnect() {
+          this.targets.clear()
+        }
+      },
+    )
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it('fits the graph to a new canvas size once the size settles', async () => {
+    await drawn()
+    // The first size is the one the flow already fit on its first draw.
+    await resize(800, 600)
+    await settle()
+    expect(fitView).not.toHaveBeenCalled()
+    // A handle drag: many sizes, one fit at the last.
+    await resize(900, 600)
+    await resize(1000, 600)
+    await settle(REFIT_MS - 1)
+    expect(fitView).not.toHaveBeenCalled()
+    await settle(1)
+    expect(fitView).toHaveBeenCalledOnce()
+    expect(fitView).toHaveBeenCalledWith({ maxZoom: 1 })
+    // The same size again is no change.
+    await resize(1000, 600)
+    await settle()
+    expect(fitView).toHaveBeenCalledOnce()
+  })
+
+  it('skips the hidden 0x0 size and fits on the next one, as on return from Audit', async () => {
+    await drawn()
+    await resize(800, 600)
+    await resize(900, 600)
+    // Audit opens before that fit lands: nothing fits a hidden canvas.
+    await resize(0, 0)
+    await settle()
+    expect(fitView).not.toHaveBeenCalled()
+    await resize(900, 600)
+    await settle()
+    expect(fitView).toHaveBeenCalledOnce()
+  })
+
+  it('fits on the first size of a graph first drawn while hidden', async () => {
+    await drawn()
+    await resize(0, 0)
+    await resize(800, 600)
+    await settle()
+    expect(fitView).toHaveBeenCalledOnce()
+  })
+
+  it('stops watching, and drops a pending fit, once the graph goes', async () => {
+    const { unmount } = await drawn()
+    await resize(800, 600)
+    await resize(900, 600)
+    unmount()
+    await settle()
+    expect(fitView).not.toHaveBeenCalled()
+    expect(observers.every((o) => o.targets.size === 0)).toBe(true)
   })
 })
 

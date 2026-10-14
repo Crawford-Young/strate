@@ -145,6 +145,8 @@ const EDGE_STYLES = {
   directs: { ...EDGE_STYLE, stroke: 'rgb(var(--muted-foreground))' },
 }
 const FIT_VIEW_OPTIONS = { maxZoom: 1 }
+/** How long the canvas size holds still before the graph re-fits: a handle drag fits once, at its end. */
+export const REFIT_MS = 150
 
 interface GraphViewProps {
   graph: LiveGraph
@@ -168,6 +170,32 @@ function GraphView({ graph, selected, onSelect }: GraphViewProps) {
     )
     if (sizes.length > 0) setMeasured((m) => new Map([...m, ...sizes]))
   }, [])
+  // The flow fits once, on its first draw; this re-fits on every later canvas size: a panel
+  // toggle, a handle drag, a window resize, a return from Audit. A hidden canvas reports 0x0
+  // and fits nothing; its next real size fits.
+  const refitOnResize = useCallback(
+    (box: HTMLDivElement) => {
+      let last: string | null | undefined
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const observer = new ResizeObserver(([entry]) => {
+        const { width, height } = (entry as ResizeObserverEntry).contentRect
+        const size = width > 0 && height > 0 ? `${width}x${height}` : null
+        if (size === last) return
+        const first = last === undefined
+        last = size
+        clearTimeout(timer)
+        if (!first && size !== null) {
+          timer = setTimeout(() => void flow.fitView(FIT_VIEW_OPTIONS), REFIT_MS)
+        }
+      })
+      observer.observe(box)
+      return () => {
+        observer.disconnect()
+        clearTimeout(timer)
+      }
+    },
+    [flow],
+  )
   const onNodeClick = useCallback(
     (_: unknown, node: AgentFlowNode) => onSelect(Number(node.id)),
     [onSelect],
@@ -209,36 +237,38 @@ function GraphView({ graph, selected, onSelect }: GraphViewProps) {
     }))
   return (
     <>
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        nodeTypes={nodeTypes}
-        onNodesChange={onNodesChange}
-        // A handler keeps pointer events on the otherwise inert nodes; a
-        // card's click (or Enter) bubbles up to it.
-        onNodeClick={onNodeClick}
-        colorMode="dark"
-        fitView
-        fitViewOptions={FIT_VIEW_OPTIONS}
-        minZoom={0.3}
-        maxZoom={2}
-        nodesDraggable={false}
-        nodesConnectable={false}
-        nodesFocusable={false}
-        edgesFocusable={false}
-        elementsSelectable={false}
-        deleteKeyCode={null}
-        // The default (Space) swallows Space app-wide.
-        panActivationKeyCode={null}
-        className="bg-transparent"
-      >
-        <Background
-          variant={BackgroundVariant.Dots}
-          gap={20}
-          size={1}
-          color="rgb(63 63 70 / 0.5)"
-        />
-      </ReactFlow>
+      <div ref={refitOnResize} className="h-full">
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={nodeTypes}
+          onNodesChange={onNodesChange}
+          // A handler keeps pointer events on the otherwise inert nodes; a
+          // card's click (or Enter) bubbles up to it.
+          onNodeClick={onNodeClick}
+          colorMode="dark"
+          fitView
+          fitViewOptions={FIT_VIEW_OPTIONS}
+          minZoom={0.3}
+          maxZoom={2}
+          nodesDraggable={false}
+          nodesConnectable={false}
+          nodesFocusable={false}
+          edgesFocusable={false}
+          elementsSelectable={false}
+          deleteKeyCode={null}
+          // The default (Space) swallows Space app-wide.
+          panActivationKeyCode={null}
+          className="bg-transparent"
+        >
+          <Background
+            variant={BackgroundVariant.Dots}
+            gap={20}
+            size={1}
+            color="rgb(63 63 70 / 0.5)"
+          />
+        </ReactFlow>
+      </div>
       {failure && (
         // A failed relayout keeps the last drawn graph up, under this line.
         <p role="alert" className="absolute bottom-3 left-4 z-10 text-xs text-destructive">
