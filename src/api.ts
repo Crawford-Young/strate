@@ -190,14 +190,14 @@ export type AuditPath = [NodeKind, string][]
  */
 export type SpanKind = 'active' | 'wait' | 'agent'
 
-/** `[startMs, endMs)` in ms since the day's local midnight. */
+/** `[startMs, endMs)` on the day's wall clock (ms from 00:00 to the clock time), even on a DST day. */
 export interface TimelineSpan {
   startMs: number
   endMs: number
   kind: SpanKind
 }
 
-/** `#N closed` or `PR #N merged`, in ms since the day's local midnight. */
+/** `#N closed` or `PR #N merged`, on the day's wall clock. */
 export interface TimelineMark {
   atMs: number
   label: string

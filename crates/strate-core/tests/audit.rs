@@ -2,9 +2,9 @@
 //! Invariants: the cells sum to the stored session and agent rollups and to
 //! the session's request tokens. Hand-computed cases: a window across local
 //! midnight in America/Toronto, DST days (25 h and 23 h), a renamed
-//! (2-segment) transcript, a request with no timestamp, and a zone change
-//! forcing a recompute. Every transcript is synthetic and every db lives in
-//! a temp dir.
+//! (2-segment) transcript, a request with no timestamp, a zone change
+//! forcing a recompute, and the row timeline on the DST days. Every
+//! transcript is synthetic and every db lives in a temp dir.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,9 @@ use serde_json::{Value, json};
 use strate_core::cost::Usage;
 use strate_core::discovery::discover;
 use strate_core::store::Store;
+use strate_core::store::views::{
+    AuditFilter, GroupBy, SpanKind, TimelineDay, TimelineSpan, audit_timeline,
+};
 use strate_core::tail::{Batch, Checkpoint, FileIdentity, TailEvent};
 
 const TORONTO: &str = "America/Toronto";
@@ -484,6 +487,101 @@ fn dst_days_are_25_and_23_hours() {
             (Some("2026-03-07".into()), 30 * MIN, 5 * MIN, 0),
             (Some("2026-03-08".into()), 23 * h, 0, 0),
             (Some("2026-03-09".into()), 30 * MIN, 10 * MIN, 0),
+        ]
+    );
+}
+
+#[test]
+fn a_dst_days_timeline_sits_on_the_wall_clock() {
+    let t = Temp::new("dst-timeline");
+    let mut store = Store::open_in(t.db(), TORONTO).expect("open");
+    // Spring forward on Mar 8 at 07:00Z (02:00 EST becomes 03:00 EDT): a
+    // request 01:55 EST to 03:05 EDT, then one at 10:00 EDT, 9 h after
+    // local midnight (05:00Z) on this 23 h day.
+    let spring = vec![
+        prompt("s1", "2026-03-08T06:55:00.000Z"),
+        reply(
+            "s2",
+            Some("2026-03-08T07:05:00.000Z"),
+            "req_s1",
+            HAIKU,
+            tokens(1, 1),
+        ),
+        prompt("s3", "2026-03-08T14:00:00.000Z"),
+        reply(
+            "s4",
+            Some("2026-03-08T14:05:00.000Z"),
+            "req_s2",
+            HAIKU,
+            tokens(1, 1),
+        ),
+    ];
+    // Fall back on Nov 1 at 06:00Z (02:00 EDT becomes 01:00 EST): a request
+    // 01:55 EDT to 01:05 EST, then one at 23:30 EST, 24.5 h after local
+    // midnight (04:00Z) on this 25 h day.
+    let fall = vec![
+        prompt("f1", "2026-11-01T05:55:00.000Z"),
+        reply(
+            "f2",
+            Some("2026-11-01T06:05:00.000Z"),
+            "req_f1",
+            HAIKU,
+            tokens(1, 1),
+        ),
+        prompt("f3", "2026-11-02T04:30:00.000Z"),
+        reply(
+            "f4",
+            Some("2026-11-02T04:40:00.000Z"),
+            "req_f2",
+            HAIKU,
+            tokens(1, 1),
+        ),
+    ];
+    store
+        .ingest(&batch(&t.transcript("spring", None), spring))
+        .expect("spring");
+    store
+        .ingest(&batch(&t.transcript("fall", None), fall))
+        .expect("fall");
+    let db = reader(&t);
+    let year = AuditFilter {
+        from: "2026-01-01".into(),
+        to: "2026-12-31".into(),
+        repos: vec![],
+        group_by: GroupBy::Hierarchy,
+    };
+    let days = audit_timeline(&db, &year, &[]).expect("timeline");
+    // The DayTimeline axis is the 24 h wall clock, so a span sits at its
+    // clock time. A request across the change is cut there: on Mar 8 the
+    // skipped hour 02:00-03:00 holds nothing, and on Nov 1 the hour
+    // 01:00-02:00 holds both passes. The gaps between requests are idle.
+    let h = 60 * MIN;
+    let active = |start_ms: i64, end_ms: i64| TimelineSpan {
+        start_ms,
+        end_ms,
+        kind: SpanKind::Active,
+    };
+    assert_eq!(
+        days,
+        [
+            TimelineDay {
+                day: "2026-03-08".into(),
+                spans: vec![
+                    active(h + 55 * MIN, 2 * h),
+                    active(3 * h, 3 * h + 5 * MIN),
+                    active(10 * h, 10 * h + 5 * MIN),
+                ],
+                marks: vec![],
+            },
+            TimelineDay {
+                day: "2026-11-01".into(),
+                spans: vec![
+                    active(h, h + 5 * MIN),
+                    active(h + 55 * MIN, 2 * h),
+                    active(23 * h + 30 * MIN, 23 * h + 40 * MIN),
+                ],
+                marks: vec![],
+            },
         ]
     );
 }
