@@ -3,11 +3,11 @@
 //! one. Every function runs inside the caller's transaction.
 //!
 //! A session transcript splits into name segments at each change of
-//! `custom-title`; records before the first title take it (a late rename
-//! backfills), and a non-final segment with no reply (the name `/clear`
-//! carries into a new file) merges forward. A segment joins the workstream
-//! of its name; a transcript with no title at all joins a fallback keyed by
-//! its dominant cwd and branch.
+//! `custom-title` (an empty one is no title); records before the first
+//! title take it (a late rename backfills), and a non-final segment with no
+//! reply (the name `/clear` carries into a new file) merges forward. A
+//! segment joins the workstream of its name; a transcript with no title at
+//! all joins a fallback keyed by its dominant cwd and branch.
 
 use rusqlite::{Connection, params};
 
@@ -49,7 +49,7 @@ fn split(rows: &[Row]) -> Vec<Segment> {
         false,
     )];
     for row in rows {
-        if let Some(title) = &row.title {
+        if let Some(title) = row.title.as_ref().filter(|t| !t.is_empty()) {
             let (current, _) = raw.last_mut().expect("never empty");
             match &current.title {
                 None => current.title = Some(title.clone()),
@@ -335,6 +335,17 @@ mod tests {
             row(20, true, Some("c")),
         ];
         assert_eq!(starts(&rows), vec![(0, Some("c".to_string()))]);
+    }
+
+    #[test]
+    fn an_empty_title_is_no_title() {
+        // Migration 0002 backfilled `custom_title` from any text, "" included.
+        let rows = [
+            row(0, true, Some("")),
+            row(10, true, Some("a")),
+            row(20, true, Some("")),
+        ];
+        assert_eq!(starts(&rows), vec![(0, Some("a".to_string()))]);
     }
 
     #[test]

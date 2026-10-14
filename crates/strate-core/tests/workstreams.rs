@@ -464,3 +464,36 @@ fn a_manual_merge_survives_regrouping_and_re_ingest_and_can_be_undone() {
     );
     assert!(store.unmerge_workstream(-1).is_err(), "unknown workstream");
 }
+
+#[test]
+fn an_empty_title_neither_splits_nor_names_a_workstream() {
+    let tmp = Temp::new("empty-title");
+    let mut store = Store::open(tmp.db()).expect("open");
+    let path: Arc<Path> = tmp.0.join("projects/-work-x/s1.jsonl").into();
+    let lines = [
+        r#"{"type":"custom-title","customTitle":"demo-1"}"#,
+        r#"{"type":"assistant","uuid":"a1","timestamp":"2026-01-01T00:00:00Z"}"#,
+        r#"{"type":"custom-title","customTitle":""}"#,
+        r#"{"type":"assistant","uuid":"a2","timestamp":"2026-01-01T00:01:00Z"}"#,
+    ];
+    let events = lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| TailEvent::Record {
+            path: path.clone(),
+            offset: i as u64 * 100,
+            value: serde_json::from_str(line).expect("json"),
+        })
+        .collect();
+    store.ingest(&batch(events)).expect("ingest");
+    let conn = Store::open_reader(tmp.db()).expect("reader");
+    assert_eq!(segments(&conn, "s1"), vec![named(0, "demo-1")]);
+    let empty: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM workstreams WHERE name = ''",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(empty, 0, "no workstream is named \"\"");
+}

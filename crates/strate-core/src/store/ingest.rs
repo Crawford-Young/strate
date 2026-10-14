@@ -189,8 +189,10 @@ fn record(
 ) -> Result<Stored> {
     let text = |key: &str| value.get(key).and_then(Value::as_str);
     let kind = text("type");
+    // An empty name is no name, as in claude-config's audit-lib.
+    let named = |key: &str| text(key).filter(|name| !name.is_empty());
     let custom_title = match kind {
-        Some("custom-title") => text("customTitle"),
+        Some("custom-title") => named("customTitle"),
         _ => None,
     };
     let acct = account::fields(value);
@@ -270,7 +272,7 @@ fn record(
         (None, None)
     };
     let name = match kind {
-        Some("agent-name") => text("agentName"),
+        Some("agent-name") => named("agentName"),
         _ => custom_title,
     };
     let update = [text("cwd"), text("gitBranch"), text("version"), model, name];
