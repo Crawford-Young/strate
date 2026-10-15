@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 use serde_json::json;
 use strate_core::hooks::{Hook, HookEvent};
 use strate_core::registry::{RegistryEntry, RegistryEvent, parse_snapshot};
@@ -110,16 +110,14 @@ fn needs_you(reader: &Connection) -> Vec<NeedsYou> {
     .expect("needs_you")
 }
 
-/// (registry_name, registry_state) of a session's orchestrator.
-fn orchestrator(reader: &Connection, session: &str) -> Option<(Option<String>, Option<String>)> {
+/// Whether a session has its orchestrator row.
+fn has_orchestrator(reader: &Connection, session: &str) -> bool {
     reader
         .query_row(
-            "SELECT registry_name, registry_state FROM agents
-             WHERE session_id = ?1 AND agent_id IS NULL",
+            "SELECT EXISTS (SELECT 1 FROM agents WHERE session_id = ?1 AND agent_id IS NULL)",
             [session],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )
-        .optional()
         .expect("orchestrator")
 }
 
@@ -185,10 +183,7 @@ fn a_registry_entry_shows_before_its_transcript_and_waiting_is_needs_you() {
         )
         .expect("session");
     assert_eq!(stub, (1, None));
-    assert_eq!(
-        orchestrator(&reader, "s-alpha"),
-        Some((Some("alpha-1".into()), Some("waiting".into())))
-    );
+    assert!(has_orchestrator(&reader, "s-alpha"));
     assert_eq!(
         needs_you(&reader),
         [(
@@ -207,10 +202,6 @@ fn a_registry_entry_shows_before_its_transcript_and_waiting_is_needs_you() {
         }])
         .expect("changed");
     assert!(needs_you(&reader).is_empty());
-    assert_eq!(
-        orchestrator(&reader, "s-alpha"),
-        Some((Some("alpha-1".into()), Some("busy".into())))
-    );
 
     // The transcript arrives: the same session and orchestrator, filled.
     store
@@ -228,10 +219,6 @@ fn a_registry_entry_shows_before_its_transcript_and_waiting_is_needs_you() {
         )
         .expect("session");
     assert_eq!(filled, (0, 1));
-    assert_eq!(
-        orchestrator(&reader, "s-alpha"),
-        Some((Some("alpha-1".into()), Some("busy".into())))
-    );
 
     store
         .apply_registry(&[RegistryEvent::Gone {
@@ -247,10 +234,36 @@ fn a_registry_entry_shows_before_its_transcript_and_waiting_is_needs_you() {
         )
         .expect("gone row");
     assert_eq!(gone, (1, 3000));
-    assert_eq!(
-        orchestrator(&reader, "s-alpha"),
-        Some((Some("alpha-1".into()), Some("gone".into())))
-    );
+}
+
+#[test]
+fn the_registry_name_and_state_stay_on_the_registry_row() {
+    let temp = Temp::new("registry-fields");
+    let (mut store, reader) = temp.open();
+    let alpha = waiting_alpha();
+    store
+        .apply_registry(&[
+            RegistryEvent::Appeared {
+                entry: alpha.clone(),
+                at_ms: 1000,
+            },
+            RegistryEvent::Gone {
+                entry: alpha,
+                last_seen_ms: 2000,
+            },
+        ])
+        .expect("apply");
+    // The views read them from the row, as its process's latest link's
+    // (#68): a copy on the orchestrator the row names would go stale.
+    let copied: i64 = reader
+        .query_row(
+            "SELECT count(*) FROM agents
+             WHERE registry_name IS NOT NULL OR registry_state IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(copied, 0);
 }
 
 fn registry_row(reader: &Connection, key: &str) -> (i64, i64) {
@@ -303,14 +316,6 @@ fn a_baseline_marks_gone_the_live_rows_it_does_not_list() {
         (1, 1000),
         "gone keeps the last poll that saw it"
     );
-    assert_eq!(
-        orchestrator(&reader, "s-gamma"),
-        Some((Some("gamma-1".into()), Some("gone".into())))
-    );
-    assert_eq!(
-        orchestrator(&reader, "s-alpha"),
-        Some((Some("alpha-1".into()), Some("busy".into())))
-    );
 }
 
 #[test]
@@ -341,10 +346,6 @@ fn a_finished_background_entry_is_stored_but_not_live() {
         )
         .expect("state");
     assert_eq!(state, "done");
-    assert_eq!(
-        orchestrator(&reader, "s-beta"),
-        Some((Some("beta-3".into()), Some("gone".into())))
-    );
 }
 
 #[test]
@@ -371,10 +372,7 @@ fn background_entries_keep_their_state_and_unnamed_sessions_still_list() {
             },
         ])
         .expect("apply");
-    assert_eq!(
-        orchestrator(&reader, "s-beta"),
-        Some((Some("beta-2".into()), Some("running".into())))
-    );
+    assert!(has_orchestrator(&reader, "s-beta"));
     let bg: (String, String) = reader
         .query_row(
             "SELECT bg_id, state FROM registry WHERE session_id = 's-beta'",
@@ -402,7 +400,8 @@ fn a_clear_moves_the_registry_entry_to_the_new_session() {
         r#"{"pid":4101,"cwd":"/work/alpha","kind":"interactive","startedAt":1791000000000,
             "sessionId":"s-alpha-2","name":"alpha-1","status":"busy"}"#,
     );
-    assert_eq!(before.key(), after.key());
+    let before_key = before.key();
+    assert_eq!(before_key, after.key());
     store
         .apply_registry(&[RegistryEvent::Appeared {
             entry: before,
@@ -415,11 +414,15 @@ fn a_clear_moves_the_registry_entry_to_the_new_session() {
             at_ms: 2,
         }])
         .expect("changed");
-    assert_eq!(orchestrator(&reader, "s-alpha"), Some((None, None)));
-    assert_eq!(
-        orchestrator(&reader, "s-alpha-2"),
-        Some((Some("alpha-1".into()), Some("busy".into())))
-    );
+    let session: String = reader
+        .query_row(
+            "SELECT session_id FROM registry WHERE key = ?1",
+            [before_key],
+            |r| r.get(0),
+        )
+        .expect("row");
+    assert_eq!(session, "s-alpha-2");
+    assert!(has_orchestrator(&reader, "s-alpha-2"));
 }
 
 fn hook(at_ms: i64, event: HookEvent) -> Hook {

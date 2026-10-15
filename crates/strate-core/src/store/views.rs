@@ -14,7 +14,8 @@
 //! earlier link is never live, so a finished ticket whose process moved on
 //! to the next has no tab. A background session `blocked` on the user is
 //! not running either: no tab and no unit node, only a needs-you
-//! ([`needs_you`]) on its latest link.
+//! ([`needs_you`]) on its latest link. A hook's needs-you is on a latest
+//! link only (#68): a `/clear` left an earlier link's prompt behind.
 //!
 //! A workstream draws one session: of the sessions with a segment in it, a
 //! live one first, then the latest segment start. Its live graph is that
@@ -190,24 +191,16 @@ pub struct GraphEdge {
 }
 
 /// What the registry says of one session: the newest registry row whose
-/// process's `/clear` chain has it as its latest link, a live row first
-/// (as `live.rs` picks an orchestrator's `registry_state`).
+/// process's `/clear` chain has it as its latest link, a live row first.
 struct Listing {
     /// The row is running: not gone, and not blocked on the user.
     live: bool,
     /// Its status or background state, `gone` once gone.
     state: Option<String>,
     name: Option<String>,
-    /// It waits on the user (see [`REGISTRY_WAITS`]).
+    /// It waits on the user: a registry row of the `needs_you` view.
     waiting: bool,
 }
-
-/// A registry row `r` waiting on the user: not gone, and a session
-/// `waiting` with something named to wait for (the v4 `needs_you` view's
-/// registry rows), or a background session `blocked` (#63; the CLI lists
-/// it with no pid, status or `waitingFor`).
-const REGISTRY_WAITS: &str = "r.gone = 0 AND (r.status IS 'waiting' AND r.waiting_for IS NOT NULL
-         OR r.state IS 'blocked')";
 
 /// A session no registry row describes.
 const NOT_LISTED: Listing = Listing {
@@ -217,29 +210,18 @@ const NOT_LISTED: Listing = Listing {
     waiting: false,
 };
 
-/// The latest link (by start, then id) of the `/clear` chain of the
-/// session `{session}` names: the sessions sharing its process root, or
-/// having its id as theirs. The session itself when it has no row.
-const LATEST_LINK: &str = "ifnull((SELECT s.session_id FROM sessions AS s
-         WHERE s.session_id = {session} OR s.process_root = ifnull(
-             (SELECT k.process_root FROM sessions AS k WHERE k.session_id = {session}),
-             {session})
-         ORDER BY s.started_at IS NULL, s.started_at DESC, s.session_id DESC LIMIT 1),
-     {session})";
-
 /// Every session the registry describes, by id: each row counts for its
-/// chain's latest link, whichever link it names.
+/// chain's latest link (the `latest_links` view), whichever link it names.
 fn listings(conn: &Connection) -> Result<HashMap<String, Listing>> {
-    let sql = format!(
-        "SELECT {}, r.gone = 0 AND r.state IS NOT 'blocked',
-             CASE WHEN r.gone = 1 THEN 'gone' ELSE coalesce(r.status, r.state) END, r.name,
-             {REGISTRY_WAITS}
-         FROM registry AS r WHERE r.session_id IS NOT NULL
-         ORDER BY r.gone, r.last_seen_ms DESC, r.id DESC",
-        LATEST_LINK.replace("{session}", "r.session_id")
-    );
     let mut out = HashMap::new();
-    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT ifnull(l.latest, r.session_id), r.gone = 0 AND r.state IS NOT 'blocked',
+             CASE WHEN r.gone = 1 THEN 'gone' ELSE coalesce(r.status, r.state) END, r.name,
+             r.id IN (SELECT registry FROM needs_you WHERE source = 'registry')
+         FROM registry AS r LEFT JOIN latest_links AS l ON l.session_id = r.session_id
+         WHERE r.session_id IS NOT NULL
+         ORDER BY r.gone, r.last_seen_ms DESC, r.id DESC",
+    )?;
     let rows = stmt.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -476,26 +458,18 @@ pub fn workstream_costs(conn: &Connection) -> Result<Vec<WorkstreamCost>> {
     .collect()
 }
 
-/// Everything waiting on the user, oldest first: the `needs_you` view's
-/// hook rows, and the registry rows that wait ([`REGISTRY_WAITS`], which
-/// adds blocked background sessions to the view's). A registry wait is its
-/// process's latest link's (see [`listings`]), so it names that session
-/// and counts toward its workstream.
+/// Everything waiting on the user, oldest first: the `needs_you` view, on
+/// latest links (#68). A registry wait is its process's latest link's (see
+/// [`listings`]), and a hook wait is listed only on a latest link, so each
+/// names that session and counts toward its workstream.
 pub fn needs_you(conn: &Connection) -> Result<Vec<NeedsYou>> {
-    let sql = format!(
+    let mut stmt = conn.prepare_cached(
         "SELECT n.source, n.session_id, n.agent_id, n.waiting_for, n.since_ms, w.root
-         FROM (SELECT 'registry' AS source, {} AS session_id, NULL AS agent_id,
-                   r.waiting_for, r.last_seen_ms AS since_ms
-               FROM registry AS r WHERE {REGISTRY_WAITS}
-               UNION ALL
-               SELECT source, session_id, agent_id, waiting_for, since_ms
-               FROM needs_you WHERE source = 'hook') AS n
+         FROM needs_you AS n
          LEFT JOIN sessions AS s ON s.session_id = n.session_id
          LEFT JOIN workstream_roots AS w ON w.id = s.workstream_id
          ORDER BY n.since_ms, n.session_id, n.agent_id",
-        LATEST_LINK.replace("{session}", "r.session_id")
-    );
-    let mut stmt = conn.prepare_cached(&sql)?;
+    )?;
     stmt.query_map([], |r| {
         Ok(NeedsYou {
             source: r.get(0)?,
@@ -534,9 +508,6 @@ fn session_agents(
     listings: &HashMap<String, Listing>,
 ) -> Result<Vec<Row>> {
     let listing = listings.get(session_id).unwrap_or(&NOT_LISTED);
-    // The orchestrator's `registry_name` and `registry_state` sit on the
-    // link the registry names, not the one it describes, and a registry
-    // wait is on that link's orchestrator too: both come from `listing`.
     let mut stmt = conn.prepare_cached(
         "SELECT a.id, a.agent_id, a.kind, a.name, a.agent_type,
              a.description, a.model, a.cost_usd, a.context_tokens, a.context_pct,
