@@ -2,6 +2,7 @@ import { act, cleanup, fireEvent, render, screen, within } from '@testing-librar
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { audit } from '../tests/audit-fixtures'
 import { defaultLayoutOf, dragTo, resetGroups } from '../tests/resizable-mock'
+import { fitView, resetFlow } from '../tests/xyflow-mock'
 import {
   auditRollup,
   liveGraph,
@@ -13,6 +14,7 @@ import {
   type Workstream,
 } from './api'
 import { App } from './App'
+import { REFIT_MS } from './Canvas'
 import { PREFS_KEY } from './layout'
 
 vi.mock('./api', () => ({
@@ -142,6 +144,7 @@ function deferred<T>() {
 }
 
 beforeEach(() => {
+  resetFlow()
   localStorage.clear()
   resetGroups()
   unlisten.mockReset()
@@ -162,6 +165,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers()
+  vi.unstubAllGlobals()
 })
 
 const tab = (name: RegExp) => screen.getByRole('tab', { name })
@@ -717,5 +721,45 @@ describe('audit view', () => {
     expect(tab(/app@main/)).toHaveAttribute('aria-selected', 'true')
     expect(screen.getByRole('button', { name: 'Harness' })).toHaveAttribute('aria-pressed', 'true')
     expect(localStorage.getItem(PREFS_KEY)).toBe(before)
+  })
+  it('re-fits the graph on return from Audit, but not while the canvas is hidden', async () => {
+    const observed = new Set<{ callback: ResizeObserverCallback; target: Element }>()
+    vi.stubGlobal(
+      'ResizeObserver',
+      class {
+        constructor(private callback: ResizeObserverCallback) {}
+        observe(target: Element) {
+          observed.add({ callback: this.callback, target })
+        }
+        disconnect() {
+          observed.clear()
+        }
+      },
+    )
+    // What a real observer reports for the canvas box: a size, or 0x0 once Audit hides it.
+    const resize = (width: number, height: number) =>
+      act(() => {
+        for (const { callback, target } of observed) {
+          const entry = { target, contentRect: { width, height } } as ResizeObserverEntry
+          callback([entry], {} as ResizeObserver)
+        }
+      })
+    const settle = () => act(() => vi.advanceTimersByTimeAsync(REFIT_MS))
+    render(<App />)
+    await screen.findByTestId('flow')
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    // The first size is the one the flow fit on its first draw.
+    await resize(800, 600)
+    await settle()
+    expect(fitView).not.toHaveBeenCalled()
+    openAudit()
+    await resize(0, 0)
+    await settle()
+    expect(fitView).not.toHaveBeenCalled()
+    back()
+    await resize(800, 600)
+    await settle()
+    expect(fitView).toHaveBeenCalledOnce()
+    expect(fitView).toHaveBeenCalledWith({ maxZoom: 1 })
   })
 })

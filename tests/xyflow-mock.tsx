@@ -5,7 +5,8 @@
 // Use it as `vi.mock('@xyflow/react', ...)` spread over the real module, which
 // keeps the enums (Position, BackgroundVariant) real.
 import type { BackgroundProps, HandleProps, ReactFlowProps } from '@xyflow/react'
-import { useLayoutEffect, useRef, type ComponentType, type ReactNode } from 'react'
+import { useLayoutEffect, useRef, type ComponentType, type ReactNode, type Ref } from 'react'
+import { vi } from 'vitest'
 
 /** Every zoom button press, in order. */
 export const zoomCalls: ('in' | 'out')[] = []
@@ -18,22 +19,28 @@ export const flowProps = (): ReactFlowProps => renders.at(-1) ?? {}
 /** Every `setCenter` call: where the view was centred, at what zoom. */
 export const centerCalls: { x: number; y: number; zoom?: number }[] = []
 
+/** Every `fitView` call, as the flow's own re-fit would make it. */
+export const fitView = vi.fn<(options?: unknown) => Promise<boolean>>(() => Promise.resolve(true))
+
 export function resetFlow() {
+  fitView.mockClear()
   zoomCalls.length = 0
   centerCalls.length = 0
   renders.length = 0
 }
 
-export function useReactFlow() {
-  return {
-    zoomIn: () => Promise.resolve(zoomCalls.push('in') > 0),
-    zoomOut: () => Promise.resolve(zoomCalls.push('out') > 0),
-    getZoom: () => 1,
-    flowToScreenPosition: (p: { x: number; y: number }) => p,
-    setCenter: (x: number, y: number, options?: { zoom?: number }) =>
-      Promise.resolve(centerCalls.push({ x, y, zoom: options?.zoom }) > 0),
-  }
+// One instance, as the real hook returns a stable one.
+const flow = {
+  zoomIn: () => Promise.resolve(zoomCalls.push('in') > 0),
+  zoomOut: () => Promise.resolve(zoomCalls.push('out') > 0),
+  getZoom: () => 1,
+  flowToScreenPosition: (p: { x: number; y: number }) => p,
+  setCenter: (x: number, y: number, options?: { zoom?: number }) =>
+    Promise.resolve(centerCalls.push({ x, y, zoom: options?.zoom }) > 0),
+  fitView,
 }
+
+export const useReactFlow = () => flow
 
 export function ReactFlowProvider({ children }: { children?: ReactNode }) {
   return <>{children}</>
@@ -50,14 +57,16 @@ type NodeComponent = ComponentType<{
 export const MEASURED = { width: 192, height: 74 }
 
 /**
- * Two contracts of the real flow are kept here:
+ * Three contracts of the real flow are kept here:
+ * - Its `ref` is the root element, so a caller can observe the canvas box.
  * - It measures each node once and reports the size through `onNodesChange`.
  *   A controlled node passed back without that `measured` stays hidden
  *   (`data-measured="false"`), and its edges are not drawn.
  * - A node that is neither selectable, draggable, nor has a click or hover
  *   handler gets `pointer-events: none`; clicks never reach its content.
  */
-export function ReactFlow(props: ReactFlowProps) {
+export function ReactFlow({ ref, ...rest }: ReactFlowProps & { ref?: Ref<HTMLDivElement> }) {
+  const props: ReactFlowProps = rest
   const reported = useRef(new Set<string>())
   const { nodes = [], edges = [], nodeTypes = {}, children, onNodesChange, onNodeClick } = props
   useLayoutEffect(() => {
@@ -72,7 +81,7 @@ export function ReactFlow(props: ReactFlowProps) {
   })
   const measured = new Set(nodes.filter((n) => n.measured?.width).map((n) => n.id))
   return (
-    <div data-testid="flow" className="react-flow">
+    <div ref={ref} data-testid="flow" className="react-flow">
       {nodes.map((n) => {
         const Node = nodeTypes[n.type as string] as unknown as NodeComponent
         const live =
