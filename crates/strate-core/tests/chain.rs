@@ -723,15 +723,16 @@ fn placed(g: &LiveGraph) -> Vec<(i64, Option<i64>, bool)> {
         .collect()
 }
 
-/// Lists `session` in the registry as a live background process.
-fn run(t: &Temp, session: &str) {
+/// Lists `session` in the registry as a background process (no pid, no
+/// status) in `state`.
+fn background(t: &Temp, session: &str, state: &str) {
     Connection::open(t.db())
         .expect("raw")
         .execute(
             "INSERT INTO registry (key, kind, session_id, cwd, started_at_ms, state,
                  first_seen_ms, last_seen_ms)
-             VALUES ('bg:' || ?1, 'background', ?1, '/work/x', 1, 'running', 1, 1)",
-            [session],
+             VALUES ('bg:' || ?1, 'background', ?1, '/work/x', 1, ?2, 1, 1)",
+            [session, state],
         )
         .expect("listed");
 }
@@ -746,7 +747,7 @@ fn a_unit_chain_directed_in_two_workstreams_draws_only_its_live_link() {
     // The registry lists the process by its first link, y: u2, its latest,
     // runs. ticket-x-2's link u1 has finished, so it is not drawn, and its
     // k1 (in ticket-x-1) hangs under u2 as an earlier link's.
-    run(&t, "y");
+    background(&t, "y", "running");
     let g = views::live_graph(&db, 1).expect("query").expect("graph");
     assert_eq!(
         placed(&g),
@@ -780,13 +781,24 @@ const WINDOWLESS_UNIT: &str = "
 fn a_windowless_directed_link_draws_its_chains_live_latest_link() {
     let t = Temp::new("unit-windowless");
     let db = synthetic(&t, WINDOWLESS_UNIT);
-    run(&t, "l");
+    background(&t, "l", "running");
     let g = views::live_graph(&db, 1).expect("query").expect("graph");
     // a (ticket-x-1's unit) has finished; b runs, with l's k1 once.
     assert_eq!(
         placed(&g),
         [(1, None, false), (3, Some(1), false), (4, None, true)]
     );
+}
+
+#[test]
+fn a_blocked_background_unit_is_not_drawn() {
+    let t = Temp::new("unit-blocked");
+    let db = synthetic(&t, TWO_WORKSTREAM_UNIT);
+    // Blocked on the user, the unit's process is not running: the canvas
+    // leaves it out, as it does a finished one.
+    background(&t, "y", "blocked");
+    let g = views::live_graph(&db, 1).expect("query").expect("graph");
+    assert_eq!(placed(&g), [(1, None, false)]);
 }
 
 /// One process (pp): p1 (alpha-1, renamed to beta-2 at 10:30), p2
@@ -1108,4 +1120,46 @@ fn the_repo_filter_keeps_a_directors_own_work_under_its_placement() {
     );
     assert!(close(3.0, yrepo.metrics.cost_usd));
     assert!(close(6.0, root.metrics.cost_usd));
+}
+
+#[test]
+fn a_blocked_background_session_has_no_tab_but_needs_you() {
+    let t = Temp::new("registry-blocked");
+    let db = synthetic(&t, RENAMED_PROCESS);
+    // The CLI lists a background session waiting on the user as state
+    // blocked, with no pid, status or waitingFor.
+    Connection::open(t.db())
+        .expect("raw")
+        .execute_batch(
+            "UPDATE registry SET status = NULL, waiting_for = NULL, state = 'blocked';
+             UPDATE agents SET registry_state = 'blocked' WHERE id = 1;",
+        )
+        .expect("blocked");
+    let rows = views::workstreams(&db).expect("workstreams");
+    let shown = |name: &str| {
+        let w = tab(&rows, name);
+        (w.session_id.as_deref(), w.live, w.needs_you, w.state)
+    };
+    // No tab: neither link is live. The wait counts toward the latest
+    // link's workstream.
+    assert_eq!(
+        shown("ticket-x-18"),
+        (Some("g"), false, 1, AgentState::NeedsYou)
+    );
+    assert_eq!(
+        shown("ticket-x-17"),
+        (Some("f"), false, 0, AgentState::Done)
+    );
+    let needs: Vec<(String, Option<String>, Option<i64>)> = views::needs_you(&db)
+        .expect("needs you")
+        .into_iter()
+        .map(|n| (n.source, n.session_id, n.workstream))
+        .collect();
+    assert_eq!(
+        needs,
+        [("registry".to_string(), Some("g".to_string()), Some(2))]
+    );
+    let g = views::live_graph(&db, 2).expect("query").expect("graph");
+    assert!(!g.live);
+    assert_eq!(head(&g), (Some("ticket-x-18"), AgentState::NeedsYou));
 }
