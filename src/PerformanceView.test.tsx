@@ -7,7 +7,7 @@ import {
   outcome,
   performance,
   waste,
-  week,
+  day,
 } from '../tests/performance-fixtures'
 import type { Headline, Performance } from './api'
 import { PerformanceView } from './PerformanceView'
@@ -21,10 +21,10 @@ const range: Headline = headline({
   usdPerMergedPr: 6.2,
 })
 
-const twoWeeks = outcome({
-  weeks: [
-    week({
-      week: '2026-10-05',
+const twoDays = outcome({
+  days: [
+    day({
+      day: '2026-10-11',
       issuesClosed: 17,
       usdPerClosedIssue: 8.63,
       activeMsPerClosedIssue: 0.63 * HOUR,
@@ -32,9 +32,8 @@ const twoWeeks = outcome({
       usdPerMergedPr: 5.58,
       spendUsd: 223.8,
     }),
-    week({
-      week: '2026-10-12',
-      days: 2,
+    day({
+      day: '2026-10-12',
       issuesClosed: 11,
       usdPerClosedIssue: 7.58,
       activeMsPerClosedIssue: 0.85 * HOUR,
@@ -50,7 +49,7 @@ const twoWeeks = outcome({
 })
 
 function show(perf: Partial<Parameters<typeof performance>[0]> = {}, h: Headline = range) {
-  const p: Performance = performance({ outcome: twoWeeks, ...perf })
+  const p: Performance = performance({ outcome: twoDays, ...perf })
   return render(<PerformanceView headline={h} performance={p} />)
 }
 
@@ -94,28 +93,13 @@ describe('outcome', () => {
     expect(region('Outcome')).toHaveTextContent('Is the harness getting better?')
   })
 
-  it('shows the latest week, a delta from the week before, and the range over the weeks in the hint', () => {
+  it('shows each tile over the whole range, with no delta', () => {
     show()
-    expect(tile('$ per closed issue')).toEqual([
-      '$7.58',
-      '▼down 12% vs $8.63, better',
-      'range: $8.22 over 28',
-    ])
-    expect(tile('Hours per closed issue')).toEqual([
-      '0.85 h',
-      '▲up 35% vs 0.63 h, worse',
-      'range: 0.72 h over 28',
-    ])
-    expect(tile('$ per merged PR')).toEqual([
-      '$7.58',
-      '▲up 36% vs $5.58, worse',
-      'range: $6.39 over 27 PRs',
-    ])
-    expect(tile('Issues closed')).toEqual([
-      '11',
-      '▼down 35% vs 17, worse',
-      'range: 28, completed only',
-    ])
+    expect(tile('$ per closed issue')).toEqual(['$8.22'])
+    expect(tile('Hours per closed issue')).toEqual(['0.72 h', 'active orchestrator time'])
+    expect(tile('$ per merged PR')).toEqual(['$6.39'])
+    expect(tile('Issues closed')).toEqual(['28', 'completed only'])
+    expect(region('Outcome')).not.toHaveTextContent(/vs|Tiles:/)
   })
 
   it('shows the spend with no outcome, and the median elapsed over the range', () => {
@@ -129,28 +113,12 @@ describe('outcome', () => {
     expect(tile('Median elapsed')).toEqual(['1d 4h', 'range: first window to close'])
   })
 
-  it('names the weeks the tiles compare, and what their hours are', () => {
-    show()
-    expect(region('Outcome')).toHaveTextContent(
-      'Tiles: w/c Oct 12 (2 days) vs w/c Oct 5. Hints: the whole range. Hours: active orchestrator time.',
-    )
-  })
-
-  it('has no delta with one week in range', () => {
-    show({ outcome: outcome({ weeks: twoWeeks.weeks.slice(1) }) })
-    expect(tile('$ per closed issue')).toEqual(['$7.58', 'range: $7.58 over 11'])
-    expect(tile('Issues closed')).toEqual(['11', 'range: 11, completed only'])
-    expect(tile('Hours per closed issue')).toEqual(['0.85 h', 'range: 0.85 h over 11'])
-    expect(tile('$ per merged PR')).toEqual(['$7.58', 'range: $7.58 over 11 PRs'])
-    expect(region('Outcome')).toHaveTextContent('w/c Oct 12 (2 days). Hints')
-  })
-
   it('shows dashes when nothing closed or merged', () => {
     show({ outcome: outcome() }, headline())
-    expect(tile('$ per closed issue')).toEqual(['$—', 'range: none'])
-    expect(tile('Hours per closed issue')).toEqual(['—', 'range: none'])
-    expect(tile('$ per merged PR')).toEqual(['$—', 'range: none'])
-    expect(tile('Issues closed')).toEqual(['0', 'range: 0, completed only'])
+    expect(tile('$ per closed issue')).toEqual(['$—'])
+    expect(tile('Hours per closed issue')).toEqual(['—', 'active orchestrator time'])
+    expect(tile('$ per merged PR')).toEqual(['$—'])
+    expect(tile('Issues closed')).toEqual(['0', 'completed only'])
     expect(tile('Median elapsed')[0]).toBe('—')
   })
 
@@ -162,20 +130,20 @@ describe('outcome', () => {
     expect(screen.getByText(/Cloud sessions are not counted/)).toBeInTheDocument()
   })
 
-  it('charts $ per closed issue and merged PR by week over the week’s spend, gaps as dashes', () => {
+  it('charts $ per closed issue and merged PR by day over the day’s spend, gaps as dashes', () => {
     show({
-      outcome: outcome({ weeks: [week({ week: '2026-09-28', spendUsd: 40 }), ...twoWeeks.weeks] }),
+      outcome: outcome({ days: [day({ day: '2026-10-10', spendUsd: 40 }), ...twoDays.days] }),
     })
-    expect(headers('Per outcome, by week')).toEqual([
-      'Week',
+    expect(headers('Per outcome, by day')).toEqual([
+      'Day',
       '$ per closed issue',
       '$ per merged PR',
-      'total spend that week',
+      'total spend that day',
     ])
-    expect(rows('Per outcome, by week')).toEqual([
-      ['w/c Sep 28', '—', '—', '$40.00'],
-      ['w/c Oct 5', '$8.63', '$5.58', '$223.80'],
-      ['w/c Oct 12 (2 days)', '$7.58', '$7.58', '$218.10'],
+    expect(rows('Per outcome, by day')).toEqual([
+      ['Oct 10', '—', '—', '$40.00'],
+      ['Oct 11', '$8.63', '$5.58', '$223.80'],
+      ['Oct 12', '$7.58', '$7.58', '$218.10'],
     ])
   })
 })

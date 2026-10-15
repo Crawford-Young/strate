@@ -1,85 +1,55 @@
 import { describe, expect, it } from 'vitest'
-import { agentRow, bottleneckDay, week } from '../tests/performance-fixtures'
+import { agentRow, bottleneckDay, day } from '../tests/performance-fixtures'
 import {
   bottleneckChart,
   byRepo,
-  change,
   hours,
   rangeMean,
   share,
   successPct,
   totals,
   trendRows,
-  weekLabel,
 } from './performance'
 
 const HOUR = 3_600_000
 
-describe('weekLabel', () => {
-  it('names a week by its Monday, with its days in range when fewer than 7', () => {
-    expect(weekLabel(week({ week: '2026-10-05' }))).toBe('w/c Oct 5')
-    expect(weekLabel(week({ week: '2026-10-12', days: 2 }))).toBe('w/c Oct 12 (2 days)')
-    expect(weekLabel(week({ week: '2026-10-12', days: 1 }))).toBe('w/c Oct 12 (1 day)')
-  })
-})
-
-describe('change', () => {
-  it('is the signed fraction from the earlier value', () => {
-    expect(change(7.5, 10)).toBeCloseTo(-0.25)
-    expect(change(12, 8)).toBeCloseTo(0.5)
-  })
-
-  it('is undefined when either side is missing or the earlier is 0', () => {
-    expect(change(null, 10)).toBeUndefined()
-    expect(change(3, null)).toBeUndefined()
-    expect(change(3, undefined)).toBeUndefined()
-    expect(change(3, 0)).toBeUndefined()
-  })
-})
-
 describe('rangeMean', () => {
-  const weeks = [
-    week({ issuesClosed: 3, usdPerClosedIssue: 10, prsMerged: 1, usdPerMergedPr: 4 }),
-    week({ issuesClosed: 1, usdPerClosedIssue: 2 }),
-    week({ spendUsd: 50 }),
+  const days = [
+    day({ issuesClosed: 3, usdPerClosedIssue: 10, prsMerged: 1, usdPerMergedPr: 4 }),
+    day({ issuesClosed: 1, usdPerClosedIssue: 2 }),
+    day({ spendUsd: 50 }),
   ]
 
-  it('weights each week by its count, over the weeks that count something', () => {
+  it('weights each day by its count, over the days that count something', () => {
     expect(
       rangeMean(
-        weeks,
-        (w) => w.usdPerClosedIssue,
-        (w) => w.issuesClosed,
+        days,
+        (d) => d.usdPerClosedIssue,
+        (d) => d.issuesClosed,
       ),
-    ).toEqual({
-      mean: 8,
-      count: 4,
-    })
+    ).toBe(8)
     expect(
       rangeMean(
-        weeks,
-        (w) => w.usdPerMergedPr,
-        (w) => w.prsMerged,
+        days,
+        (d) => d.usdPerMergedPr,
+        (d) => d.prsMerged,
       ),
-    ).toEqual({
-      mean: 4,
-      count: 1,
-    })
+    ).toBe(4)
   })
 
-  it('is null when no week counts anything', () => {
+  it('is null when no day counts anything', () => {
     expect(
       rangeMean(
-        [week()],
-        (w) => w.usdPerClosedIssue,
-        (w) => w.issuesClosed,
+        [day()],
+        (d) => d.usdPerClosedIssue,
+        (d) => d.issuesClosed,
       ),
     ).toBeNull()
     expect(
       rangeMean(
         [],
-        (w) => w.usdPerClosedIssue,
-        (w) => w.issuesClosed,
+        (d) => d.usdPerClosedIssue,
+        (d) => d.issuesClosed,
       ),
     ).toBeNull()
   })
@@ -102,14 +72,14 @@ describe('share', () => {
 })
 
 describe('trendRows', () => {
-  it('has a row per week: $ per closed issue and merged PR, gaps kept, and the spend', () => {
+  it('has a row per day: $ per closed issue and merged PR, gaps kept, and the spend', () => {
     const rows = trendRows([
-      week({ week: '2026-09-28', spendUsd: 40 }),
-      week({ week: '2026-10-05', usdPerClosedIssue: 8.6, usdPerMergedPr: 5.5, spendUsd: 220 }),
+      day({ day: '2026-10-04', spendUsd: 40 }),
+      day({ day: '2026-10-05', usdPerClosedIssue: 8.6, usdPerMergedPr: 5.5, spendUsd: 220 }),
     ])
     expect(rows).toEqual([
-      { week: 'w/c Sep 28', perIssue: null, perPr: null, spend: 40 },
-      { week: 'w/c Oct 5', perIssue: 8.6, perPr: 5.5, spend: 220 },
+      { day: 'Oct 4', perIssue: null, perPr: null, spend: 40 },
+      { day: 'Oct 5', perIssue: 8.6, perPr: 5.5, spend: 220 },
     ])
   })
 })

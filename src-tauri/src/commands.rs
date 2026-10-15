@@ -100,7 +100,7 @@ fn timeline(
 }
 
 /// The Audit performance read for `filter` (its group-by is ignored):
-/// outcome per ISO week, agents per type and model, bottleneck per day and
+/// outcome per local day, agents per type and model, bottleneck per day and
 /// repo, and waste. A bad day in the filter is an error.
 #[tauri::command(async)]
 pub fn audit_performance(
@@ -187,7 +187,11 @@ mod tests {
         assert!(!err.is_empty());
         let perf = performance(&reader, &filter("2026-10-01")).expect("an empty store reads");
         assert!(perf.agents.is_empty() && perf.bottleneck.days.is_empty());
-        assert_eq!(perf.outcome.weeks.len(), 5, "w/c 09-28 to w/c 10-26");
+        assert_eq!(
+            perf.outcome.days.len(),
+            31,
+            "a point per day of 10-01 to 10-31"
+        );
         let err = performance(&reader, &filter("October")).expect_err("a bad day");
         assert!(!err.is_empty());
 

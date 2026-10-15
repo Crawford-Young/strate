@@ -3,15 +3,14 @@ import type {
   AgentRow,
   BottleneckDay,
   Outcome,
-  OutcomeWeek,
+  OutcomeDay,
   Performance,
   PermissionWaits,
   Waste,
 } from '../src/api'
 
-export const week = (over: Partial<OutcomeWeek> = {}): OutcomeWeek => ({
-  week: '2026-10-12',
-  days: 7,
+export const day = (over: Partial<OutcomeDay> = {}): OutcomeDay => ({
+  day: '2026-10-12',
   issuesClosed: 0,
   usdPerClosedIssue: null,
   activeMsPerClosedIssue: null,
@@ -22,7 +21,7 @@ export const week = (over: Partial<OutcomeWeek> = {}): OutcomeWeek => ({
 })
 
 export const outcome = (over: Partial<Outcome> = {}): Outcome => ({
-  weeks: [],
+  days: [],
   unlinkedUsd: 0,
   unlinkedWorkstreams: 0,
   openUsd: 0,

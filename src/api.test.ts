@@ -156,10 +156,9 @@ describe('commands', () => {
     const tokens = { input: 2000, output: 200, cacheRead: 20000, cacheWrite: 0 }
     const performance: Performance = {
       outcome: {
-        weeks: [
+        days: [
           {
-            week: '2026-10-05',
-            days: 6,
+            day: '2026-10-06',
             issuesClosed: 1,
             usdPerClosedIssue: 0.05,
             activeMsPerClosedIssue: 900000,
@@ -168,8 +167,7 @@ describe('commands', () => {
             spendUsd: 0.04,
           },
           {
-            week: '2026-10-12',
-            days: 2,
+            day: '2026-10-13',
             issuesClosed: 0,
             usdPerClosedIssue: null,
             activeMsPerClosedIssue: null,
