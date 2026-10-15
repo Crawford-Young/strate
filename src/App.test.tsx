@@ -6,11 +6,13 @@ import { fitView, resetFlow } from '../tests/xyflow-mock'
 import {
   auditRollup,
   liveGraph,
+  needsYou,
   onStoreChanged,
   status,
   workstreams,
   type GraphAgent,
   type LiveGraph,
+  type NeedsYou,
   type Workstream,
 } from './api'
 import { App } from './App'
@@ -21,6 +23,7 @@ vi.mock('./api', () => ({
   status: vi.fn(),
   workstreams: vi.fn(),
   liveGraph: vi.fn(),
+  needsYou: vi.fn(),
   onStoreChanged: vi.fn(),
   auditRollup: vi.fn(),
   auditRefresh: vi.fn(),
@@ -45,6 +48,7 @@ vi.mock('@crawfordyoung/ui', async (importOriginal) => ({
 const statusMock = vi.mocked(status)
 const workstreamsMock = vi.mocked(workstreams)
 const liveGraphMock = vi.mocked(liveGraph)
+const needsYouMock = vi.mocked(needsYou)
 const onStoreChangedMock = vi.mocked(onStoreChanged)
 const auditRollupMock = vi.mocked(auditRollup)
 
@@ -155,6 +159,7 @@ beforeEach(() => {
     .mockImplementation((id) =>
       Promise.resolve(id === 2 ? shellGraph : id === 3 ? unnamedGraph : null),
     )
+  needsYouMock.mockReset().mockResolvedValue([])
   listeners = []
   auditRollupMock.mockReset().mockResolvedValue(audit([]))
   onStoreChangedMock.mockReset().mockImplementation((callback) => {
@@ -427,6 +432,70 @@ describe('refetching', () => {
     unmount()
     await act(async () => ready.resolve(unlisten))
     expect(unlisten).toHaveBeenCalledTimes(onStoreChangedMock.mock.calls.length)
+  })
+})
+
+describe('needs-you chip', () => {
+  const wait = (over: Partial<NeedsYou>): NeedsYou => ({
+    source: 'registry',
+    sessionId: null,
+    agentId: null,
+    waitingFor: null,
+    sinceMs: null,
+    workstream: null,
+    ...over,
+  })
+  // A background session blocked with no tab, and a permission prompt on a tabbed one.
+  const blocked = wait({ sessionId: 's-1', workstream: 1 })
+  const prompt = wait({ source: 'hook', sessionId: 's-3', waitingFor: 'Bash', workstream: 3 })
+  const chip = () => screen.queryByRole('button', { name: /^\d+ needs? you$/ })
+
+  it('takes no space when nothing waits', async () => {
+    render(<App />)
+    await screen.findByRole('tab', { name: /strate-17/ })
+    expect(chip()).not.toBeInTheDocument()
+  })
+
+  it('sits on the header line, before the panel toggles', async () => {
+    needsYouMock.mockResolvedValue([blocked])
+    render(<App />)
+    await screen.findByRole('button', { name: '1 needs you' })
+    const header = screen.getByRole('banner')
+    const buttons = within(header).getAllByRole('button')
+    expect(buttons.map((b) => b.textContent)).toEqual([
+      '1 needs you',
+      'Harness',
+      'Terminal',
+      'Audit',
+    ])
+  })
+
+  it('lists every wait, a session with no tab too, and goes to a tabbed one', async () => {
+    needsYouMock.mockResolvedValue([blocked, prompt])
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: '2 need you' }))
+    const list = screen.getByRole('dialog', { name: 'Waiting on you' })
+    expect(within(list).getByText('docs-cleanup')).toBeInTheDocument()
+    expect(within(list).getByRole('button', { name: 'copy resume for docs-cleanup' })).toBeVisible()
+    fireEvent.click(within(list).getByRole('button', { name: 'go to tab for /work/app@main' }))
+    expect(tab(/app@main/)).toHaveAttribute('aria-selected', 'true')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  })
+
+  it('follows the store, leaving when the last wait is answered and returning closed', async () => {
+    needsYouMock.mockResolvedValue([blocked])
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: '1 needs you' }))
+    expect(screen.getByRole('dialog', { name: 'Waiting on you' })).toBeInTheDocument()
+    needsYouMock.mockResolvedValue([])
+    await act(async () => storeChanged())
+    expect(chip()).not.toBeInTheDocument()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    needsYouMock.mockResolvedValue([blocked, prompt])
+    await act(async () => storeChanged())
+    expect(chip()).toHaveTextContent('2 need you')
+    expect(chip()).toHaveAttribute('aria-expanded', 'false')
+    expect(needsYouMock).toHaveBeenCalledTimes(3)
   })
 })
 
