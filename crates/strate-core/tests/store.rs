@@ -868,6 +868,74 @@ fn fixture_ingest_produces_the_expected_sessions_agents_and_edges() {
     assert_eq!(subtype, "turn_duration");
 }
 
+/// The fixture's teammate edge after `edit` changes its team config.
+fn teammate_edge(name: &str, edit: impl FnOnce(&Path)) -> (String, String, String, String) {
+    let tmp = Temp::new(name);
+    let root = fixture(&tmp);
+    edit(&root.join("teams/session-0a1b2c3d"));
+    let mut store = Store::open(tmp.db()).expect("open");
+    ingest_root(&mut store, &root);
+    edges(&reader(&tmp.db()))
+        .into_iter()
+        .find(|(kind, ..)| kind == "teammate")
+        .expect("teammate edge")
+}
+
+#[test]
+fn a_teammate_with_no_resolvable_lead_hangs_under_its_own_sessions_orchestrator() {
+    // Its transcript sits under SA's subagents/, so SA's orchestrator leads.
+    let under_a = (
+        "teammate".to_string(),
+        format!("orchestrator:{SA}"),
+        "a1000000000000006".to_string(),
+        "demo-team".to_string(),
+    );
+    let unknown_lead = teammate_edge("teammate-unknown-lead", |team| {
+        let config =
+            r#"{"name":"demo-team","leadSessionId":"5e55c0c0-0000-4000-8000-00000000000c"}"#;
+        fs::write(team.join("config.json"), config).expect("config");
+    });
+    assert_eq!(unknown_lead, under_a, "a lead with no session in the store");
+    let no_team = teammate_edge("teammate-no-team", |team| {
+        fs::remove_dir_all(team).expect("remove team");
+    });
+    assert_eq!(no_team, under_a, "a team whose config is gone");
+}
+
+#[test]
+fn a_stored_lead_outlives_its_team_config_and_a_late_lead_replaces_the_fallback() {
+    let tmp = Temp::new("teammate-rescan");
+    let root = fixture(&tmp);
+    let team = root.join("teams/session-0a1b2c3d");
+    let lead = |session: &str| {
+        let config = format!(r#"{{"name":"demo-team","leadSessionId":"{session}"}}"#);
+        fs::write(team.join("config.json"), config).expect("config");
+    };
+    let mut store = Store::open(tmp.db()).expect("open");
+    let conn = reader(&tmp.db());
+    let mut parent_after_scan = || {
+        store
+            .ingest_graph(&discover(&root).expect("discover"))
+            .expect("scan");
+        edges(&conn)
+            .into_iter()
+            .find(|(kind, ..)| kind == "teammate")
+            .expect("teammate edge")
+            .1
+    };
+    let (under_a, under_b) = (format!("orchestrator:{SA}"), format!("orchestrator:{SB}"));
+
+    // An unknown lead: the fallback, SA's orchestrator. Once the config
+    // names SB, SB's orchestrator replaces it.
+    lead("5e55c0c0-0000-4000-8000-00000000000c");
+    assert_eq!(parent_after_scan(), under_a);
+    lead(SB);
+    assert_eq!(parent_after_scan(), under_b);
+    // The config is deleted: the stored lead stays, not the fallback.
+    fs::remove_dir_all(&team).expect("remove team");
+    assert_eq!(parent_after_scan(), under_b);
+}
+
 #[test]
 fn re_ingesting_the_fixture_is_idempotent() {
     let tmp = Temp::new("idempotent");

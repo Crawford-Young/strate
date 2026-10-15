@@ -30,8 +30,6 @@ const X2: &str = "5e55d7d7-0000-4000-8000-0000000000b2";
 const N4: &str = "5e55d7d7-0000-4000-8000-0000000000e4";
 /// R1's subagent.
 const S1: &str = "a7000000000000001";
-/// N1's subagent.
-const S2: &str = "a7000000000000002";
 
 fn msg(n: u8) -> String {
     format!("5e55ee00-0000-4000-8000-{n:012x}")
@@ -495,10 +493,10 @@ fn the_director_canvas_draws_every_live_unit_any_of_its_sessions_directed() {
     let graph = views::live_graph(&reader, tab(&rows, "director-demo").id)
         .expect("query")
         .expect("a graph");
-    // R2 is drawn; R1 directed both units. R1, R2's earlier link, draws its
-    // subagent S1 as an earlier one, under R2's orchestrator (#63).
+    // R2 is drawn; R1 directed both units. R1's subagent S1 (an earlier
+    // link's) and N1's subagent are done, so neither is drawn (#81).
     assert_eq!(graph.session_id, R2);
-    let drawn: Vec<(&str, Option<&str>, &str, AgentState, bool)> = graph
+    let drawn: Vec<(&str, Option<&str>, &str, AgentState)> = graph
         .agents
         .iter()
         .map(|a| {
@@ -507,52 +505,35 @@ fn the_director_canvas_draws_every_live_unit_any_of_its_sessions_directed() {
                 a.agent_id.as_deref(),
                 a.name.as_deref().unwrap_or("-"),
                 a.state,
-                a.earlier,
             )
         })
         .collect();
     assert_eq!(
         drawn,
         [
-            (
-                "orchestrator",
-                None,
-                "director-demo",
-                AgentState::Working,
-                false
-            ),
-            ("subagent", Some(S1), "-", AgentState::Done, true),
+            ("orchestrator", None, "director-demo", AgentState::Working),
             (
                 "orchestrator",
                 None,
                 "ticket-demo-repo-1",
-                AgentState::Working,
-                false
+                AgentState::Working
             ),
-            ("subagent", Some(S2), "-", AgentState::Done, false),
             // N2, also directed by R1, is not live: a finished unit is not
             // drawn.
         ]
     );
     let id = |i: usize| graph.agents[i].id;
-    let (director, s1, n1, s2) = (id(0), id(1), id(2), id(3));
+    let (director, n1) = (id(0), id(1));
     assert_eq!(
         graph.agents.iter().map(|a| a.parent).collect::<Vec<_>>(),
-        [None, Some(director), Some(director), Some(n1)]
+        [None, Some(director)]
     );
     let edge = |kind: &str, parent, child| GraphEdge {
         kind: kind.into(),
         parent,
         child,
     };
-    assert_eq!(
-        graph.edges,
-        [
-            edge("dispatch", director, s1),
-            edge("directs", director, n1),
-            edge("dispatch", n1, s2),
-        ]
-    );
+    assert_eq!(graph.edges, [edge("directs", director, n1)]);
 
     // A live unit that is itself a director: alpha's canvas draws beta.
     let graph = views::live_graph(&reader, tab(&rows, "director-alpha").id)

@@ -3,8 +3,8 @@
 //! workstream, a director's `--bg` unit nested under the director's row
 //! (which sits under its units' repo), and the live view: a registry row
 //! read as its process's latest link (and a hook wait listed on that link
-//! only), the graph drawing every link's subagents (earlier links' marked)
-//! and a director's live units only. Every db lives in a temp dir.
+//! only), and the graph drawing a director's live units only, with no
+//! finished worker on any link (#81). Every db lives in a temp dir.
 
 use std::path::PathBuf;
 
@@ -358,16 +358,14 @@ fn graph(db: &Connection, name: &str) -> LiveGraph {
         .expect("a graph")
 }
 
-/// Each drawn agent: its agent id (`-` for an orchestrator), name and
-/// whether it is of an earlier link.
-fn drawn(g: &LiveGraph) -> Vec<(&str, &str, bool)> {
+/// Each drawn agent: its agent id (`-` for an orchestrator) and name.
+fn drawn(g: &LiveGraph) -> Vec<(&str, &str)> {
     g.agents
         .iter()
         .map(|a: &GraphAgent| {
             (
                 a.agent_id.as_deref().unwrap_or("-"),
                 a.name.as_deref().unwrap_or("-"),
-                a.earlier,
             )
         })
         .collect()
@@ -382,87 +380,44 @@ fn edge(kind: &str, parent: i64, child: i64) -> GraphEdge {
 }
 
 #[test]
-fn the_director_draws_every_links_subagents_and_its_live_units_chain() {
+fn the_director_draws_its_live_units_chain_and_no_finished_subagent() {
     let t = Temp::new("graph");
     let (mut store, db) = build(&t);
-    // The unit's process is not running: the canvas leaves it out.
+    // The unit's process is not running: the canvas leaves it out. Every
+    // link's subagent has answered, so none is drawn either.
     let g = graph(&db, "director-chain");
     assert_eq!(g.session_id, L3);
-    assert_eq!(
-        drawn(&g),
-        [
-            ("-", "director-chain", false),
-            (J[2], "-", false),
-            (J[0], "-", true),
-            (J[1], "-", true),
-        ]
-    );
+    assert_eq!(drawn(&g), [("-", "director-chain")]);
     // The registry keys a background process by its first session, U1:
     // the unit drawn is its process's latest link, U2.
     store
         .apply_registry(&[listed(4202, U1, "ticket-chain-repo-7")])
         .expect("unit live");
     let g = graph(&db, "director-chain");
+    // The unit draws its last link, U2, under the drawn orchestrator.
     assert_eq!(
         drawn(&g),
-        [
-            ("-", "director-chain", false),
-            (J[2], "-", false),
-            // L1's and L2's, in link order: under the drawn orchestrator.
-            (J[0], "-", true),
-            (J[1], "-", true),
-            // The unit draws its last link, U2, and U1's subagent.
-            ("-", "ticket-chain-repo-7", false),
-            (J[7], "-", false),
-            (J[3], "-", true),
-        ]
+        [("-", "director-chain"), ("-", "ticket-chain-repo-7"),]
     );
     let id = |i: usize| g.agents[i].id;
-    assert_eq!(
-        g.edges,
-        [
-            edge("dispatch", id(0), id(1)),
-            edge("dispatch", id(0), id(2)),
-            edge("dispatch", id(0), id(3)),
-            edge("directs", id(0), id(4)),
-            edge("dispatch", id(4), id(5)),
-            edge("dispatch", id(4), id(6)),
-        ]
-    );
+    assert_eq!(g.edges, [edge("directs", id(0), id(1))]);
     assert_eq!(
         g.agents.iter().map(|a| a.parent).collect::<Vec<_>>(),
-        [
-            None,
-            Some(id(0)),
-            Some(id(0)),
-            Some(id(0)),
-            Some(id(0)),
-            Some(id(4)),
-            Some(id(4))
-        ]
+        [None, Some(id(0))]
     );
 }
 
 #[test]
-fn a_chain_draws_only_its_links_in_the_drawn_workstream() {
+fn a_chain_draws_its_latest_link_in_the_drawn_workstream() {
     let t = Temp::new("graph-workstreams");
     let (_store, db) = build(&t);
+    // Each link's subagent has answered, so only orchestrators are drawn.
     let five = graph(&db, "chain-repo-5");
     assert_eq!(five.session_id, P3);
-    assert_eq!(
-        drawn(&five),
-        [
-            ("-", "chain-repo-5", false),
-            (J[6], "-", false),
-            (J[4], "-", true),
-        ]
-    );
+    assert_eq!(drawn(&five), [("-", "chain-repo-5")]);
     let six = graph(&db, "chain-repo-6");
     assert_eq!(six.session_id, P2);
-    assert_eq!(
-        drawn(&six),
-        [("-", "chain-repo-6", false), (J[5], "-", false)]
-    );
+    assert_eq!(drawn(&six), [("-", "chain-repo-6")]);
 }
 
 #[test]
@@ -687,12 +642,9 @@ const TWO_WORKSTREAM_UNIT: &str = "
         ('y', 'd', 'm0'), ('u1', 'd', 'm1'), ('u2', 'd', 'm2');
 ";
 
-/// Each drawn agent's row id, parent and whether it is of an earlier link.
-fn placed(g: &LiveGraph) -> Vec<(i64, Option<i64>, bool)> {
-    g.agents
-        .iter()
-        .map(|a| (a.id, a.parent, a.earlier))
-        .collect()
+/// Each drawn agent's row id and parent.
+fn placed(g: &LiveGraph) -> Vec<(i64, Option<i64>)> {
+    g.agents.iter().map(|a| (a.id, a.parent)).collect()
 }
 
 /// Lists `session` in the registry as a background process (no pid, no
@@ -715,16 +667,13 @@ fn a_unit_chain_directed_in_two_workstreams_draws_only_its_live_link() {
     let db = synthetic(&t, TWO_WORKSTREAM_UNIT);
     // No unit process runs: the director is drawn alone.
     let g = views::live_graph(&db, 1).expect("query").expect("graph");
-    assert_eq!(placed(&g), [(1, None, false)]);
+    assert_eq!(placed(&g), [(1, None)]);
     // The registry lists the process by its first link, y: u2, its latest,
-    // runs. ticket-x-2's link u1 has finished, so it is not drawn, and its
-    // k1 (in ticket-x-1) hangs under u2 as an earlier link's.
+    // runs. ticket-x-2's link u1 has finished, so it is not drawn, and nor
+    // is its k1 (in ticket-x-1): an earlier link's worker reads done.
     background(&t, "y", "running");
     let g = views::live_graph(&db, 1).expect("query").expect("graph");
-    assert_eq!(
-        placed(&g),
-        [(1, None, false), (3, Some(1), false), (4, Some(3), true)]
-    );
+    assert_eq!(placed(&g), [(1, None), (3, Some(1))]);
 }
 
 /// The chain pu is l (ticket-x-1, which dispatched k1), a (ticket-x-1) and
@@ -755,11 +704,9 @@ fn a_windowless_directed_link_draws_its_chains_live_latest_link() {
     let db = synthetic(&t, WINDOWLESS_UNIT);
     background(&t, "l", "running");
     let g = views::live_graph(&db, 1).expect("query").expect("graph");
-    // a (ticket-x-1's unit) has finished; b runs, with l's k1 once.
-    assert_eq!(
-        placed(&g),
-        [(1, None, false), (3, Some(1), false), (4, None, true)]
-    );
+    // a (ticket-x-1's unit) has finished; b runs. l's k1, an earlier
+    // link's worker, reads done and is not drawn.
+    assert_eq!(placed(&g), [(1, None), (3, Some(1))]);
 }
 
 #[test]
@@ -770,40 +717,7 @@ fn a_blocked_background_unit_is_not_drawn() {
     // leaves it out, as it does a finished one.
     background(&t, "y", "blocked");
     let g = views::live_graph(&db, 1).expect("query").expect("graph");
-    assert_eq!(placed(&g), [(1, None, false)]);
-}
-
-/// One process (pp): p1 (alpha-1, renamed to beta-2 at 10:30), p2
-/// (alpha-1) and p3 (beta-2). p1 dispatched k1, which no window holds, and
-/// k2 in its alpha-1 window.
-const WINDOWLESS_EARLIER: &str = "
-    INSERT INTO workstreams (id, name, fallback) VALUES (1, 'alpha-1', 0), (2, 'beta-2', 0);
-    INSERT INTO sessions (session_id, path, started_at, process_root, workstream_id) VALUES
-        ('p1', '/p/p1.jsonl', '2026-10-02T10:00:00.000Z', 'pp', 2),
-        ('p2', '/p/p2.jsonl', '2026-10-02T11:00:00.000Z', 'pp', 1),
-        ('p3', '/p/p3.jsonl', '2026-10-02T12:00:00.000Z', 'pp', 2);
-    INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id) VALUES
-        (1, 'p1', 0, '2026-10-02T10:00:00.000Z', 1), (2, 'p1', 100, '2026-10-02T10:30:00.000Z', 2),
-        (3, 'p2', 0, '2026-10-02T11:00:00.000Z', 1), (4, 'p3', 0, '2026-10-02T12:00:00.000Z', 2);
-    INSERT INTO agents (id, session_id, agent_id, kind, segment_id) VALUES
-        (1, 'p1', NULL, 'orchestrator', NULL), (2, 'p2', NULL, 'orchestrator', NULL),
-        (3, 'p3', NULL, 'orchestrator', NULL), (4, 'p1', 'k1', 'subagent', NULL),
-        (5, 'p1', 'k2', 'subagent', 1);
-    INSERT INTO edges (kind, parent, child, tool_use_id) VALUES
-        ('dispatch', 1, 4, 't1'), ('dispatch', 1, 5, 't2');
-";
-
-#[test]
-fn an_earlier_links_windowless_agent_reads_in_its_links_workstream_only() {
-    let t = Temp::new("windowless-earlier");
-    let db = synthetic(&t, WINDOWLESS_EARLIER);
-    let alpha = views::live_graph(&db, 1).expect("query").expect("graph");
-    assert_eq!(alpha.session_id, "p2");
-    assert_eq!(placed(&alpha), [(2, None, false), (5, Some(2), true)]);
-    // k1 reads where p1 ended: beta-2.
-    let beta = views::live_graph(&db, 2).expect("query").expect("graph");
-    assert_eq!(beta.session_id, "p3");
-    assert_eq!(placed(&beta), [(3, None, false), (4, Some(3), true)]);
+    assert_eq!(placed(&g), [(1, None)]);
 }
 
 /// Unit chain pk (ticket-x-3): director-a's da directed k1, then
@@ -1179,17 +1093,16 @@ fn a_hook_wait_is_listed_only_on_its_processs_latest_link() {
     assert_eq!(hook_waits(&db), [(Some(U2.into()), Some(J[7].into()))]);
     let rows = views::workstreams(&db).expect("workstreams");
     assert_eq!(tab(&rows, "ticket-chain-repo-7").needs_you, 1);
-    // The director's canvas draws U1's subagent dimmed and done.
+    // The director's canvas draws U2's waiting subagent, not U1's done one.
     let g = graph(&db, "director-chain");
     let state = |id: &str| {
         g.agents
             .iter()
             .find(|a| a.agent_id.as_deref() == Some(id))
-            .expect("drawn")
-            .state
+            .map(|a| a.state)
     };
-    assert_eq!(state(J[3]), AgentState::Done);
-    assert_eq!(state(J[7]), AgentState::NeedsYou);
+    assert_eq!(state(J[3]), None);
+    assert_eq!(state(J[7]), Some(AgentState::NeedsYou));
 }
 
 /// Each orchestrator permission wait: its session, start and end.

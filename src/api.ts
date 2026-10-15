@@ -68,8 +68,6 @@ export interface GraphAgent {
   /** The agent's resolved context hard stop, in percent (gear, default 95). */
   hardStopPct: number
   parent: number | null
-  /** Of an earlier `/clear` link of the drawn session's chain (or a unit's); absent when not. */
-  earlier?: boolean
 }
 
 export interface GraphEdge {
@@ -78,7 +76,7 @@ export interface GraphEdge {
   child: number
 }
 
-/** The live session of a workstream, with its `/clear` chain's earlier links' agents. */
+/** The live session of a workstream and its directed units, with their running workers. */
 export interface LiveGraph {
   sessionId: string
   live: boolean

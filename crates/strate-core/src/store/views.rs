@@ -20,30 +20,26 @@
 //! A workstream draws one session: of the sessions with a segment in it, a
 //! live one first, then the latest segment start. Its live graph is that
 //! session's orchestrator plus the session's subagents and teammates that
-//! joined one of the workstream's segments (or none yet), with dispatch and
-//! teammate edges among them.
+//! joined one of the workstream's segments (or none yet) and still run,
+//! with dispatch and teammate edges among them. A worker that reads done is
+//! not drawn (#81): finished workers are the Audit's.
 //!
 //! A `/clear` chain (the sessions of one process root) reads as one
-//! session, per workstream (#63): the graph also draws the subagents and
-//! teammates of the drawn session's earlier links that have a segment in
-//! the workstream, those that joined one of its segments, marked
-//! [`GraphAgent::earlier`] (one with no segment reads in its link's current
-//! workstream, so in one graph only). One that hung under its link's
-//! orchestrator hangs under the drawn one. A link renamed into another
+//! session, per workstream (#63). An earlier link is never live, so its
+//! workers read done and none is drawn; a worker of the drawn session that
+//! hangs under an earlier link's orchestrator (a teammate's lead can be
+//! another link's) hangs under the drawn one. A link renamed into another
 //! workstream reads there, never here: 35 of 62 continuation edges in a
 //! real store crossed workstreams, a process reused for the next ticket.
-//! The header's $ and run time sum the same links (#65).
+//! The header's $ and run time sum the drawn session and its earlier links
+//! in the workstream (#65).
 //!
 //! Director-launched units (#53, the `directs` table): a director's graph
 //! also draws the units any of the workstream's sessions directed that are
 //! still running (#63; a finished one is left to the Audit): per unit
 //! chain, its latest link in the unit's workstream, when that link is
-//! live, with its earlier links' agents in that workstream, as above. Each
-//! unit's orchestrator hangs under the drawn orchestrator by a `directs`
-//! edge. An agent is drawn once: a link the graph draws as itself (the
-//! drawn session or a unit) is no other chain's earlier link, so its agents
-//! hang under its own orchestrator; past that, the first reading wins (the
-//! drawn chain, then the units in order).
+//! live, with its running workers. Each unit's orchestrator hangs under the
+//! drawn orchestrator by a `directs` edge.
 //!
 //! A workstream nests under a director's tab ([`Workstream::director`])
 //! when any link of its drawn session's chain with a segment in it was
@@ -55,7 +51,7 @@
 //! hidden twice over. A nested tab's needs-you and state count toward its
 //! director's tab.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
@@ -135,7 +131,7 @@ pub struct LiveGraph {
     pub session_id: String,
     pub live: bool,
     /// The priced requests of the drawn session and its chain's earlier
-    /// links the graph draws that count toward this workstream
+    /// links in it that count toward this workstream
     /// (`event_workstreams`); `None` with none.
     pub session_cost_usd: Option<f64>,
     /// Those links' wall times summed, each first record to last
@@ -175,10 +171,6 @@ pub struct GraphAgent {
     /// The dispatching or team-lead agent, or for a unit's orchestrator the
     /// director's drawn orchestrator, when it is drawn too.
     pub parent: Option<i64>,
-    /// Of an earlier link of the drawn session's `/clear` chain (or of a
-    /// unit's): the canvas dims it. Left out of the JSON when false.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub earlier: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -491,13 +483,9 @@ type Row = (GraphAgent, Option<(i64, String)>);
 
 /// The agents of `session_id`, orchestrator first: with `root`, only the
 /// subagents and teammates that joined one of that workstream's segments.
-/// One with no segment is a drawn session's worker starting now, so it
-/// passes; an `earlier` link's has no window as evidence (its session was
-/// grouped before it started, or its window was dropped), so it reads in
-/// its session's current workstream, the one group.rs gives a worker with
-/// no record yet, and so in one graph only. The orchestrator's name, state
-/// and registry wait come from the session's listing ([`listings`]), and
-/// workers' states read its liveness; an `earlier` link's are marked so.
+/// One with no segment is a worker starting now, so it passes. The
+/// orchestrator's name, state and registry wait come from the session's
+/// listing ([`listings`]), and workers' states read its liveness.
 ///
 /// A worker has finished once its dispatch is answered or its task
 /// notification arrives. A background dispatch's tool_result is the
@@ -507,7 +495,6 @@ fn session_agents(
     conn: &Connection,
     session_id: &str,
     root: Option<i64>,
-    earlier: bool,
     listings: &HashMap<String, Listing>,
 ) -> Result<Vec<Row>> {
     let listing = listings.get(session_id).unwrap_or(&NOT_LISTED);
@@ -531,16 +518,12 @@ fn session_agents(
          FROM agents AS a
          JOIN gear_effective AS ge ON ge.agent = a.id
          LEFT JOIN segments AS g ON g.id = a.segment_id
-         LEFT JOIN sessions AS s ON s.session_id = a.session_id
-         LEFT JOIN workstream_roots AS r ON r.id = CASE
-             WHEN a.segment_id IS NOT NULL THEN g.workstream_id
-             WHEN ?3 THEN s.workstream_id END
+         LEFT JOIN workstream_roots AS r ON r.id = g.workstream_id
          WHERE a.session_id = ?1
-           AND (?2 IS NULL OR a.agent_id IS NULL OR r.root = ?2
-               OR (NOT ?3 AND a.segment_id IS NULL))
+           AND (?2 IS NULL OR a.agent_id IS NULL OR a.segment_id IS NULL OR r.root = ?2)
          ORDER BY a.agent_id IS NOT NULL, a.id",
     )?;
-    let rows = stmt.query_map(rusqlite::params![session_id, root, earlier], |r| {
+    let rows = stmt.query_map(rusqlite::params![session_id, root], |r| {
         let agent_id: Option<String> = r.get(1)?;
         let needs: bool = r.get(11)?;
         let (name, state) = match agent_id {
@@ -577,7 +560,6 @@ fn session_agents(
                 nudge_pct: r.get(15)?,
                 hard_stop_pct: r.get(16)?,
                 parent: None,
-                earlier,
             },
             edge,
         ))
@@ -588,8 +570,6 @@ fn session_agents(
 /// A unit to draw: its chain's latest link in its workstream.
 struct Unit {
     session_id: String,
-    /// The directed session's workstream (merge-resolved).
-    workstream: Option<i64>,
 }
 
 /// The units any session of workstream `root` directed, other than `drawn`
@@ -635,20 +615,17 @@ fn units(
             && is_live(listings, &session_id)
             && !out.iter().any(|u| u.session_id == session_id)
         {
-            out.push(Unit {
-                session_id,
-                workstream,
-            });
+            out.push(Unit { session_id });
         }
     }
     Ok(out)
 }
 
 /// The earlier links of `session_id`'s `/clear` chain (its process root's
-/// sessions that started before it) that the graph reads as such, in start
-/// order: with `root`, only those with a segment in that workstream, and
-/// never one in `drawn_sessions` (the graph draws it as itself: the drawn
-/// session or a unit).
+/// sessions that started before it) that the header sums, in start order:
+/// with `root`, only those with a segment in that workstream, and never one
+/// in `drawn_sessions` (the graph draws it as itself: the drawn session or a
+/// unit).
 fn earlier_links(
     conn: &Connection,
     session_id: &str,
@@ -674,29 +651,19 @@ fn earlier_links(
         .collect())
 }
 
-/// `session_id`'s agents as [`session_agents`] reads them with `root`,
-/// then the subagents and teammates of its earlier links in workstream
-/// `links` (see [`earlier_links`]: one the graph draws as itself is
-/// skipped, so its agents hang under their own orchestrator, once) that
-/// joined it, marked `earlier`. One that hangs under any link's
-/// orchestrator (a teammate's lead can be another link's) hangs under
-/// `session_id`'s.
+/// `session_id`'s agents as [`session_agents`] reads them with `root`.
+/// One that hangs under the orchestrator of any link of its `/clear` chain
+/// (a teammate's lead can be another link's) hangs under `session_id`'s.
 fn chain_agents(
     conn: &Connection,
     session_id: &str,
-    links: Option<i64>,
     root: Option<i64>,
     listings: &HashMap<String, Listing>,
-    drawn_sessions: &[&str],
 ) -> Result<Vec<Row>> {
-    let mut rows = session_agents(conn, session_id, root, false, listings)?;
+    let mut rows = session_agents(conn, session_id, root, listings)?;
     let Some(head) = orchestrator(&rows) else {
         return Ok(rows);
     };
-    for link in earlier_links(conn, session_id, links, drawn_sessions)? {
-        let workers = session_agents(conn, &link, links, true, listings)?;
-        rows.extend(workers.into_iter().filter(|(a, _)| a.agent_id.is_some()));
-    }
     let leads: Vec<i64> = conn
         .prepare_cached(
             "SELECT a.id FROM sessions AS me
@@ -712,6 +679,18 @@ fn chain_agents(
         }
     }
     Ok(rows)
+}
+
+/// `parent`, else its nearest ancestor by `parents` (child to parent), of
+/// the `drawn` agents; `None` past the top or round a cycle.
+fn drawn_ancestor(mut parent: i64, parents: &HashMap<i64, i64>, drawn: &[i64]) -> Option<i64> {
+    for _ in 0..=parents.len() {
+        if drawn.contains(&parent) {
+            return Some(parent);
+        }
+        parent = *parents.get(&parent)?;
+    }
+    None
 }
 
 /// The orchestrator's id among `rows`.
@@ -753,10 +732,10 @@ fn session_totals(
 }
 
 /// The graph of the session `workstream` draws (any id of a merge chain
-/// resolves to its root) with its chain's earlier links' agents, plus every
-/// unit any of the workstream's sessions directed: its orchestrator under
-/// the drawn one by a `directs` edge, and its chain's subagents and
-/// teammates. `None` when the workstream has no session.
+/// resolves to its root), plus every unit any of the workstream's sessions
+/// directed: its orchestrator under the drawn one by a `directs` edge, and
+/// its subagents and teammates. No worker that reads done is drawn. `None`
+/// when the workstream has no session.
 pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph>> {
     let root: Option<i64> = conn
         .prepare_cached("SELECT root FROM workstream_roots WHERE id = ?1")?
@@ -781,24 +760,10 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
         &drawn_sessions,
     )?);
     let (session_cost_usd, run_ms) = session_totals(conn, &links, root)?;
-    let mut rows = chain_agents(
-        conn,
-        &shown.session_id,
-        Some(root),
-        Some(root),
-        &listings,
-        &drawn_sessions,
-    )?;
+    let mut rows = chain_agents(conn, &shown.session_id, Some(root), &listings)?;
     let director = orchestrator(&rows);
     for unit in &units {
-        let unit_rows = chain_agents(
-            conn,
-            &unit.session_id,
-            unit.workstream,
-            None,
-            &listings,
-            &drawn_sessions,
-        )?;
+        let unit_rows = chain_agents(conn, &unit.session_id, None, &listings)?;
         for (agent, edge) in unit_rows {
             let edge = match (&agent.agent_id, director) {
                 (None, Some(d)) => Some((d, "directs".to_string())),
@@ -807,18 +772,24 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
             rows.push((agent, edge));
         }
     }
-    // An agent is drawn once, where it is first read: the drawn chain, then
-    // each unit in order. Units are live, so no two are of one chain; what
-    // can still repeat is a unit of the drawn session's own chain with no
-    // workstream (a directed link with no window yet), which reads its
-    // chain's earlier links in every workstream.
-    let mut seen = HashSet::new();
-    rows.retain(|(a, _)| seen.insert(a.id));
+    let parents: HashMap<i64, i64> = rows
+        .iter()
+        .filter_map(|(a, edge)| Some((a.id, edge.as_ref()?.0)))
+        .collect();
+    // A finished worker is left to the Audit (#81).
+    rows.retain(|(a, _)| a.agent_id.is_none() || a.state != AgentState::Done);
     let drawn_ids: Vec<i64> = rows.iter().map(|(a, _)| a.id).collect();
     let mut agents = Vec::with_capacity(rows.len());
     let mut edges = Vec::new();
     for (mut agent, edge) in rows {
-        if let Some((parent, kind)) = edge.filter(|(p, _)| drawn_ids.contains(p)) {
+        // One whose parent is not drawn (a finished dispatcher, or a lead
+        // outside the graph) hangs under its nearest drawn ancestor, else
+        // the drawn orchestrator.
+        let edge = edge.and_then(|(parent, kind)| {
+            let parent = drawn_ancestor(parent, &parents, &drawn_ids).or(director)?;
+            Some((parent, kind))
+        });
+        if let Some((parent, kind)) = edge {
             agent.parent = Some(parent);
             edges.push(GraphEdge {
                 kind,
@@ -840,6 +811,8 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
@@ -1066,9 +1039,9 @@ mod tests {
 
     #[test]
     fn a_teammate_led_from_another_link_hangs_under_the_drawn_orchestrator() {
-        // p1 then p2: one process (root p1) in workstream 1. The team lead
-        // is p1's orchestrator; one teammate's transcript is p2's, the
-        // other's p1's.
+        // p1 then p2: one live process (root p1) in workstream 1. The team
+        // lead is p1's orchestrator; one teammate's transcript is p2's, the
+        // other's p1's, so it reads done and is not drawn.
         let (dir, store) = seeded(
             "views-chain-teammates",
             "INSERT INTO workstreams (id, name) VALUES (1, 'demo');
@@ -1081,19 +1054,99 @@ mod tests {
              INSERT INTO agents (id, session_id, agent_id, kind, segment_id) VALUES
                  (1, 'p1', NULL, 'orchestrator', NULL), (2, 'p2', NULL, 'orchestrator', NULL),
                  (3, 'p2', 'm1', 'teammate', 2), (4, 'p1', 'm2', 'teammate', 1);
-             INSERT INTO edges (kind, parent, child) VALUES ('teammate', 1, 3), ('teammate', 1, 4);",
+             INSERT INTO edges (kind, parent, child) VALUES ('teammate', 1, 3), ('teammate', 1, 4);
+             INSERT INTO registry (key, kind, session_id, cwd, started_at_ms, status,
+                 first_seen_ms, last_seen_ms)
+             VALUES ('pid:1:1', 'interactive', 'p2', '/work/x', 1, 'busy', 1, 1);",
         );
         let graph = live_graph(&store.conn, 1).expect("query").expect("graph");
         assert_eq!(graph.session_id, "p2");
-        let drawn: Vec<(i64, Option<i64>, bool)> = graph
-            .agents
+        let drawn: Vec<(i64, Option<i64>)> =
+            graph.agents.iter().map(|a| (a.id, a.parent)).collect();
+        assert_eq!(drawn, [(2, None), (3, Some(2))]);
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn the_graph_draws_no_finished_worker_on_any_link() {
+        // p1 then p2: one live process (root p1) in workstream 1, which
+        // directed the live unit u. Each of p2 and u has a running and a
+        // finished worker; p1's teammate is an earlier link's.
+        let (dir, store) = seeded(
+            "views-no-done-workers",
+            "INSERT INTO workstreams (id, name) VALUES (1, 'demo'), (2, 'ticket');
+             INSERT INTO sessions (session_id, workstream_id, process_root, started_at) VALUES
+                 ('p1', 1, 'p1', '2026-10-07T10:00:00.000Z'),
+                 ('p2', 1, 'p1', '2026-10-07T11:00:00.000Z'),
+                 ('u', 2, 'u', '2026-10-07T10:30:00.000Z');
+             INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id) VALUES
+                 (1, 'p1', 0, '2026-10-07T10:00:00.000Z', 1),
+                 (2, 'p2', 0, '2026-10-07T11:00:00.000Z', 1),
+                 (3, 'u', 0, '2026-10-07T10:30:00.000Z', 2);
+             INSERT INTO agents (id, session_id, agent_id, kind, segment_id, hook_state) VALUES
+                 (1, 'p1', NULL, 'orchestrator', NULL, NULL),
+                 (2, 'p2', NULL, 'orchestrator', NULL, NULL),
+                 (3, 'p2', 'w1', 'subagent', 2, NULL), (4, 'p2', 'w2', 'subagent', 2, 'done'),
+                 (5, 'p1', 'm1', 'teammate', 1, NULL),
+                 (6, 'u', NULL, 'orchestrator', NULL, NULL),
+                 (7, 'u', 'w3', 'subagent', 3, NULL), (8, 'u', 'w4', 'subagent', 3, 'done');
+             INSERT INTO edges (kind, parent, child, tool_use_id) VALUES
+                 ('dispatch', 2, 3, 't1'), ('dispatch', 2, 4, 't2'), ('teammate', 1, 5, NULL),
+                 ('dispatch', 6, 7, 't3'), ('dispatch', 6, 8, 't4');
+             INSERT INTO registry (key, kind, session_id, cwd, started_at_ms, status,
+                 first_seen_ms, last_seen_ms) VALUES
+                 ('pid:1:1', 'interactive', 'p2', '/work/x', 1, 'busy', 1, 1),
+                 ('pid:2:1', 'interactive', 'u', '/work/x', 1, 'busy', 1, 1);
+             INSERT INTO directs (child, parent, msg_id) VALUES ('u', 'p2', 'm1');",
+        );
+        let graph = live_graph(&store.conn, 1).expect("query").expect("graph");
+        let drawn: Vec<(i64, Option<i64>)> =
+            graph.agents.iter().map(|a| (a.id, a.parent)).collect();
+        assert_eq!(drawn, [(2, None), (3, Some(2)), (6, Some(2)), (7, Some(6))]);
+        let edges: Vec<(&str, i64, i64)> = graph
+            .edges
             .iter()
-            .map(|a| (a.id, a.parent, a.earlier))
+            .map(|e| (e.kind.as_str(), e.parent, e.child))
             .collect();
         assert_eq!(
-            drawn,
-            [(2, None, false), (3, Some(2), false), (4, Some(2), true)]
+            edges,
+            [("dispatch", 2, 3), ("directs", 2, 6), ("dispatch", 6, 7)]
         );
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_running_worker_under_a_hidden_parent_hangs_under_its_nearest_drawn_ancestor() {
+        // p is live: its subagent 2 finished, but 2's own dispatch 3 runs,
+        // and so does 4, a teammate whose lead is q's undrawn orchestrator.
+        let (dir, store) = seeded(
+            "views-hidden-parent",
+            "INSERT INTO workstreams (id, name) VALUES (1, 'demo'), (2, 'other');
+             INSERT INTO sessions (session_id, workstream_id) VALUES ('p', 1), ('q', 2);
+             INSERT INTO segments (session_id, start_offset, started_at, workstream_id) VALUES
+                 ('p', 0, '2026-10-07T10:00:00.000Z', 1), ('q', 0, '2026-10-07T09:00:00.000Z', 2);
+             INSERT INTO agents (id, session_id, agent_id, kind, hook_state) VALUES
+                 (1, 'p', NULL, 'orchestrator', NULL), (2, 'p', 'w1', 'subagent', 'done'),
+                 (3, 'p', 'w2', 'subagent', NULL), (4, 'p', 'm1', 'teammate', NULL),
+                 (5, 'q', NULL, 'orchestrator', NULL);
+             INSERT INTO edges (kind, parent, child, tool_use_id) VALUES
+                 ('dispatch', 1, 2, 't1'), ('dispatch', 2, 3, 't2'), ('teammate', 5, 4, NULL);
+             INSERT INTO registry (key, kind, session_id, cwd, started_at_ms, status,
+                 first_seen_ms, last_seen_ms)
+             VALUES ('pid:1:1', 'interactive', 'p', '/work/x', 1, 'busy', 1, 1);",
+        );
+        let graph = live_graph(&store.conn, 1).expect("query").expect("graph");
+        let drawn: Vec<(i64, Option<i64>)> =
+            graph.agents.iter().map(|a| (a.id, a.parent)).collect();
+        assert_eq!(drawn, [(1, None), (3, Some(1)), (4, Some(1))]);
+        let edges: Vec<(&str, i64, i64)> = graph
+            .edges
+            .iter()
+            .map(|e| (e.kind.as_str(), e.parent, e.child))
+            .collect();
+        assert_eq!(edges, [("dispatch", 1, 3), ("teammate", 1, 4)]);
         drop(store);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
@@ -1158,19 +1211,10 @@ mod tests {
             nudge_pct: 80,
             hard_stop_pct: 95,
             parent: None,
-            earlier: false,
         };
         assert_eq!(
             serde_json::to_value(agent.state).expect("json"),
             "needs_you"
-        );
-        let earlier = GraphAgent {
-            earlier: true,
-            ..agent.clone()
-        };
-        assert_eq!(
-            serde_json::to_value(&earlier).expect("json")["earlier"],
-            true
         );
         let mut got = keys(&agent);
         got.sort();
