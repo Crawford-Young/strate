@@ -218,7 +218,8 @@ impl Store {
     /// ingest), and sets the agent's `hook_state`. A PermissionRequest opens
     /// a permission wait (a repeat while one is open is the same wait), and
     /// any other hook on the agent ends it, as its next user or assistant
-    /// record does at that record's time.
+    /// record, or the next `/clear` link's first record, does at that
+    /// record's time.
     pub fn apply_hook(&mut self, hook: &Hook) -> Result<()> {
         let tx = self.transaction()?;
         live::hook(&tx.tx, hook)?;

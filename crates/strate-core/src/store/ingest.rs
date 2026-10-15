@@ -54,8 +54,9 @@ fn owner_of(path: &Path) -> Owner {
 }
 
 /// Stores a batch's events and its checkpoint, then regroups the batch's
-/// session and recomputes the rollups it touches, and `directs` when it
-/// stored a cross-session message.
+/// session, ends the waits left open on its `/clear` chain's earlier links
+/// and recomputes the rollups it touches, and `directs` when it stored a
+/// cross-session message.
 pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
     let owner = owner_of(&batch.path);
     let file = text_of(&batch.path);
@@ -84,6 +85,9 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
         }
     }
     group::sessions(conn, [owner.session_id.as_str()])?;
+    if agent.is_some() {
+        end_cleared_waits(conn, &owner.session_id)?;
+    }
     let touched = account::touched(conn, &owner.session_id, &requests)?;
     account::rollup(conn, touched.iter().map(String::as_str))?;
     if messaged {
@@ -101,6 +105,37 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
             c.identity.volume as i64,
             c.identity.index.to_string()
         ])?;
+    }
+    Ok(())
+}
+
+/// A `/clear` takes the prompts on screen with it: each agent still
+/// waiting on an earlier link of `session_id`'s chain stops waiting at the
+/// next link's first record (its start). A request received after that
+/// start was not on screen at the `/clear`, so it is left open.
+fn end_cleared_waits(conn: &Connection, session_id: &str) -> Result<()> {
+    let cleared: Vec<(i64, i64)> = conn
+        .prepare_cached(
+            "WITH me AS (SELECT ifnull(process_root, session_id) AS root FROM sessions
+                 WHERE session_id = ?1),
+             links AS (SELECT l.session_id, unixepoch(l.started_at, 'subsec') * 1000 AS start_ms
+                 FROM me JOIN sessions AS l ON l.session_id = me.root OR l.process_root = me.root
+                 WHERE l.started_at IS NOT NULL)
+             SELECT a.id, CAST(round(min(n.start_ms)) AS INTEGER)
+             FROM links AS l JOIN links AS n ON n.start_ms > l.start_ms
+             JOIN agents AS a ON a.session_id = l.session_id AND a.hook_state = 'needs_you'
+             GROUP BY a.id HAVING min(n.start_ms) > a.hook_at_ms",
+        )?
+        .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_>>()?;
+    for (agent, end_ms) in cleared {
+        conn.prepare_cached(
+            "UPDATE agents SET hook_waiting_for = NULL,
+                 hook_state = CASE WHEN agent_id IS NULL THEN NULL ELSE 'running' END
+             WHERE id = ?1",
+        )?
+        .execute([agent])?;
+        live::end_wait(conn, agent, end_ms)?;
     }
     Ok(())
 }
