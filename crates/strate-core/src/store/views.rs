@@ -353,18 +353,7 @@ fn nest(candidates: impl IntoIterator<Item = (i64, i64)>) -> HashMap<i64, i64> {
 /// link's (by start, then session id) is the one, as the Audit nests a row
 /// under its earliest directed link's director.
 fn directors(conn: &Connection, drawn: &HashMap<i64, Drawn>) -> Result<HashMap<i64, i64>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT r.root FROM sessions AS me
-         JOIN sessions AS c ON c.session_id = me.session_id OR c.process_root = me.process_root
-         JOIN directs AS x ON x.child = c.session_id
-         JOIN sessions AS s ON s.session_id = x.parent
-         JOIN workstream_roots AS r ON r.id = s.workstream_id
-         WHERE me.session_id = ?1
-           AND EXISTS (SELECT 1 FROM segments AS g
-               JOIN workstream_roots AS gr ON gr.id = g.workstream_id
-               WHERE g.session_id = c.session_id AND gr.root = ?2)
-         ORDER BY c.started_at IS NULL, c.started_at, c.session_id",
-    )?;
+    let mut stmt = conn.prepare_cached(DIRECTORS_SQL)?;
     let mut candidates = Vec::new();
     for (&root, shown) in drawn {
         let live_director = |d: &i64| *d != root && drawn.get(d).is_some_and(|x| x.live);
@@ -375,6 +364,19 @@ fn directors(conn: &Connection, drawn: &HashMap<i64, Drawn>) -> Result<HashMap<i
     }
     Ok(nest(candidates))
 }
+
+/// [`directors`]' query: the workstream of each session that directed a
+/// link of drawn session `?1`'s chain with a segment in workstream `?2`.
+const DIRECTORS_SQL: &str = "SELECT r.root FROM sessions AS me
+     JOIN sessions AS c ON c.session_id = me.session_id OR c.process_root = me.process_root
+     JOIN directs AS x ON x.child = c.session_id
+     JOIN sessions AS s ON s.session_id = x.parent
+     JOIN workstream_roots AS r ON r.id = s.workstream_id
+     WHERE me.session_id = ?1
+       AND EXISTS (SELECT 1 FROM segments AS g
+           JOIN workstream_roots AS gr ON gr.id = g.workstream_id
+           WHERE g.session_id = c.session_id AND gr.root = ?2)
+     ORDER BY c.started_at IS NULL, c.started_at, c.session_id";
 
 /// Adds each nested workstream's own needs-you count and state to its
 /// director's, so a hidden unit's wait shows on the tab it nests under.
@@ -872,6 +874,50 @@ mod tests {
         // A cycle: no tab hides another.
         assert_eq!(sorted(nest([(1, 2), (2, 1)])), []);
         assert_eq!(sorted(nest([(1, 2), (2, 3), (3, 1), (4, 3)])), []);
+    }
+
+    /// `workstreams()` runs [`directors`]' query once per drawn workstream:
+    /// it finds the drawn session's chain by the session key and the
+    /// process-root index, each link's director by key, and scans no
+    /// table but `workstream_roots`' merge walk over `workstreams` (#67).
+    #[test]
+    fn a_tabs_director_is_read_by_index() {
+        let dir = crate::tail::test_dir("directors-plan");
+        let db = dir.join("strate.db");
+        drop(super::super::Store::open(&db).expect("open"));
+        let conn = super::super::Store::open_reader(&db).expect("reader");
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {DIRECTORS_SQL}"))
+            .expect("plan")
+            .query_map(["", ""], |r| r.get::<_, String>(3))
+            .expect("steps")
+            .collect::<Result<Vec<_>>>()
+            .expect("detail");
+        let on = |table: &[&str]| -> Vec<&str> {
+            plan.iter()
+                .map(String::as_str)
+                .filter(|step| table.iter().any(|t| step.split(' ').nth(1) == Some(t)))
+                .collect()
+        };
+        assert_eq!(
+            on(&["me", "c", "x", "s"]),
+            [
+                "SEARCH me USING INDEX sqlite_autoindex_sessions_1 (session_id=?)",
+                "SEARCH c USING INDEX sqlite_autoindex_sessions_1 (session_id=?)",
+                "SEARCH c USING INDEX sessions_process_root (process_root=?)",
+                "SEARCH x USING INDEX sqlite_autoindex_directs_1 (child=?)",
+                "SEARCH s USING INDEX sqlite_autoindex_sessions_1 (session_id=?)",
+            ],
+            "{plan:?}"
+        );
+        let scans = plan.iter().filter(|step| step.starts_with("SCAN "));
+        assert_eq!(
+            scans.collect::<HashSet<_>>(),
+            HashSet::from([&"SCAN workstreams".to_string(), &"SCAN r".to_string()]),
+            "{plan:?}"
+        );
+        drop(conn);
+        std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
     /// A store at `name` with `sql` run on it.

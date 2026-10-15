@@ -194,9 +194,9 @@ fn a_clear_chain_is_one_session_row_holding_every_links_subagents() {
     // One orchestrator node for the three links, and each link's subagent.
     assert_eq!(agents(row), ["", J[0], J[1], J[2]]);
     let orchestrator = row.children.iter().find(|c| c.key.is_empty()).unwrap();
-    // L1 10:00:00 to L3's last record 12:00:55: the chain's span.
-    assert_eq!(row.metrics.elapsed_ms, Some(7255 * S));
-    assert_eq!(orchestrator.metrics.elapsed_ms, Some(7255 * S));
+    // L1 and L3 55 s, L2 121 s: its links, not the hours between them.
+    assert_eq!(row.metrics.elapsed_ms, Some((55 + 121 + 55) * S));
+    assert_eq!(orchestrator.metrics.elapsed_ms, Some((55 + 121 + 55) * S));
 }
 
 #[test]
@@ -216,8 +216,8 @@ fn a_directed_unit_and_its_clear_successor_nest_under_the_directors_row() {
     let unit = labelled(director, NodeKind::Session, "ticket-chain-repo-7");
     // U1 (messaged) and U2 (its /clear successor): one row, both subagents.
     assert_eq!(agents(unit), ["", J[3], J[7]]);
-    // U1's first record 11:02:02 to U2's last 11:30:55.
-    assert_eq!(unit.metrics.elapsed_ms, Some(1733 * S));
+    // U1's run and U2's, without the gap between them.
+    assert_eq!(unit.metrics.elapsed_ms, Some(168 * S));
     let m = &unit.metrics;
     assert_eq!((m.sessions, m.agents, m.rotations), (2, 2, 0));
     assert!(
@@ -275,8 +275,8 @@ fn a_chain_reads_per_workstream_where_each_name_puts_it() {
     assert_eq!(labels(issue("5"), NodeKind::Session), ["chain-repo-5"]);
     assert_eq!(agents(five), ["", J[4], J[6]]);
     assert_eq!(five.metrics.sessions, 2);
-    // P1 13:00:00 to P3's last record 15:00:55.
-    assert_eq!(five.metrics.elapsed_ms, Some(7255 * S));
+    // P1 and P3, 55 s each: P2's hour between them is chain-repo-6's.
+    assert_eq!(five.metrics.elapsed_ms, Some(2 * 55 * S));
     let six = labelled(issue("6"), NodeKind::Session, "chain-repo-6");
     assert_eq!(agents(six), ["", J[5]]);
     assert_eq!(six.metrics.sessions, 1);

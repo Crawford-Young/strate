@@ -154,7 +154,7 @@ pub struct Metrics {
     /// Windows named `-sN`.
     pub rotations: i64,
     /// First window start to the close (epic, issue) or merge (PR), else to
-    /// the last activity. A session's is its window, an agent's its run.
+    /// the last activity. A session's is its windows in range, an agent's its run.
     pub elapsed_ms: Option<i64>,
     /// Elapsed runs to the last activity: the issue, epic or PR is open.
     pub open: bool,
