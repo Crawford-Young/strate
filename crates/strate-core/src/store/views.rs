@@ -5,11 +5,20 @@
 //! [`super::Store::open_reader`] and serializes in camelCase for the
 //! webview.
 //!
+//! A registry row describes its process's `/clear` chain's latest link
+//! (#63): `claude agents` keys a background process by the session it
+//! started with, so after a `/clear` the row still names the first link
+//! while the latest one runs. A session is live when a registry row of its
+//! chain that is not gone makes it that latest link ([`listings`]), and
+//! its orchestrator's registry name, state and wait come from that row. An
+//! earlier link is never live, so a finished ticket whose process moved on
+//! to the next has no tab.
+//!
 //! A workstream draws one session: of the sessions with a segment in it, a
-//! live one (a registry entry that is not gone) first, then the latest
-//! segment start. Its live graph is that session's orchestrator plus the
-//! session's subagents and teammates that joined one of the workstream's
-//! segments (or none yet), with dispatch and teammate edges among them.
+//! live one first, then the latest segment start. Its live graph is that
+//! session's orchestrator plus the session's subagents and teammates that
+//! joined one of the workstream's segments (or none yet), with dispatch and
+//! teammate edges among them.
 //!
 //! A `/clear` chain (the sessions of one process root) reads as one
 //! session, per workstream (#63): the graph also draws the subagents and
@@ -22,23 +31,25 @@
 //! real store crossed workstreams, a process reused for the next ticket.
 //!
 //! Director-launched units (#53, the `directs` table): a director's graph
-//! also draws every unit any of the workstream's sessions directed,
-//! finished ones too: per unit chain, its latest link in the unit's
-//! workstream with its earlier links' agents in that workstream, as above.
-//! Each unit's orchestrator hangs under the drawn orchestrator by a
-//! `directs` edge, its states by its own session's liveness. An agent is
-//! drawn once: a link the graph draws as itself (the drawn session or a
-//! unit's latest link) is no other unit's earlier link, so its agents hang
-//! under its own orchestrator; past that, the first reading wins (the drawn
-//! chain, then the units in order). A workstream nests under a director's
-//! tab ([`Workstream::director`]) when any link of its drawn session's
-//! chain with a segment in it was directed by a session of a live
-//! workstream (the earliest such link's, if several): one that has since
-//! drawn a session of another chain, one nobody directed, keeps its own
-//! tab, while the director's graph still draws the directed one. A
-//! director is always a top-level tab: a unit of a nested unit keeps its
-//! own tab, so no live session is hidden twice over. A nested tab's
-//! needs-you and state count toward its director's tab.
+//! also draws the units any of the workstream's sessions directed that are
+//! still running (#63; a finished one is left to the Audit): per unit
+//! chain, its latest link in the unit's workstream, when that link is
+//! live, with its earlier links' agents in that workstream, as above. Each
+//! unit's orchestrator hangs under the drawn orchestrator by a `directs`
+//! edge. An agent is drawn once: a link the graph draws as itself (the
+//! drawn session or a unit) is no other chain's earlier link, so its agents
+//! hang under its own orchestrator; past that, the first reading wins (the
+//! drawn chain, then the units in order).
+//!
+//! A workstream nests under a director's tab ([`Workstream::director`])
+//! when any link of its drawn session's chain with a segment in it was
+//! directed by a session of a live workstream (the earliest such link's,
+//! if several): one that has since drawn a session of another chain, one
+//! nobody directed, keeps its own tab, while the director's graph still
+//! draws the directed one while it runs. A director is always a top-level
+//! tab: a unit of a nested unit keeps its own tab, so no live session is
+//! hidden twice over. A nested tab's needs-you and state count toward its
+//! director's tab.
 
 use std::collections::{HashMap, HashSet};
 
@@ -82,7 +93,8 @@ pub struct Workstream {
     pub needs_you: i64,
     /// The session [`live_graph`] draws.
     pub session_id: Option<String>,
-    /// Whether that session is listed by the registry.
+    /// Whether that session is live: the latest link of a process the
+    /// registry lists as running.
     pub live: bool,
     /// The latest segment start in the workstream.
     pub started_at: Option<String>,
@@ -172,6 +184,73 @@ pub struct GraphEdge {
     pub child: i64,
 }
 
+/// What the registry says of one session: the newest registry row whose
+/// process's `/clear` chain has it as its latest link, a live row first
+/// (as `live.rs` picks an orchestrator's `registry_state`).
+struct Listing {
+    /// The row is not gone.
+    live: bool,
+    /// Its status or background state, `gone` once gone.
+    state: Option<String>,
+    name: Option<String>,
+    /// Live, waiting, with something named to wait for: a `needs_you` row.
+    waiting: bool,
+}
+
+/// A session no registry row describes.
+const NOT_LISTED: Listing = Listing {
+    live: false,
+    state: None,
+    name: None,
+    waiting: false,
+};
+
+/// The latest link (by start, then id) of the `/clear` chain of the
+/// session `{session}` names: the sessions sharing its process root, or
+/// having its id as theirs. The session itself when it has no row.
+const LATEST_LINK: &str = "ifnull((SELECT s.session_id FROM sessions AS s
+         WHERE s.session_id = {session} OR s.process_root = ifnull(
+             (SELECT k.process_root FROM sessions AS k WHERE k.session_id = {session}),
+             {session})
+         ORDER BY s.started_at IS NULL, s.started_at DESC, s.session_id DESC LIMIT 1),
+     {session})";
+
+/// Every session the registry describes, by id: each row counts for its
+/// chain's latest link, whichever link it names.
+fn listings(conn: &Connection) -> Result<HashMap<String, Listing>> {
+    let sql = format!(
+        "SELECT {}, r.gone = 0,
+             CASE WHEN r.gone = 1 THEN 'gone' ELSE coalesce(r.status, r.state) END, r.name,
+             r.gone = 0 AND r.status = 'waiting' AND r.waiting_for IS NOT NULL
+         FROM registry AS r WHERE r.session_id IS NOT NULL
+         ORDER BY r.gone, r.last_seen_ms DESC, r.id DESC",
+        LATEST_LINK.replace("{session}", "r.session_id")
+    );
+    let mut out = HashMap::new();
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            Listing {
+                live: r.get(1)?,
+                state: r.get(2)?,
+                name: r.get(3)?,
+                waiting: r.get(4)?,
+            },
+        ))
+    })?;
+    for row in rows {
+        let (session_id, listing) = row?;
+        out.entry(session_id).or_insert(listing);
+    }
+    Ok(out)
+}
+
+/// Whether `session_id` is live (see [`listings`]).
+fn is_live(listings: &HashMap<String, Listing>, session_id: &str) -> bool {
+    listings.get(session_id).is_some_and(|l| l.live)
+}
+
 /// Per workstream root: the session it draws, whether that one is live and
 /// the workstream's latest segment start.
 struct Drawn {
@@ -181,22 +260,25 @@ struct Drawn {
 }
 
 /// The drawn session of every workstream root (or of the one `root`).
-fn drawn(conn: &Connection, root: Option<i64>) -> Result<HashMap<i64, Drawn>> {
+fn drawn(
+    conn: &Connection,
+    root: Option<i64>,
+    listings: &HashMap<String, Listing>,
+) -> Result<HashMap<i64, Drawn>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT r.root, g.session_id,
-             EXISTS (SELECT 1 FROM registry AS x WHERE x.session_id = g.session_id AND x.gone = 0),
-             max(g.started_at)
+        "SELECT r.root, g.session_id, max(g.started_at)
          FROM segments AS g JOIN workstream_roots AS r ON r.id = g.workstream_id
          WHERE ?1 IS NULL OR r.root = ?1
          GROUP BY r.root, g.session_id",
     )?;
     let rows = stmt.query_map([root], |r| {
+        let session_id: String = r.get(1)?;
         Ok((
             r.get::<_, i64>(0)?,
             Drawn {
-                session_id: r.get(1)?,
-                live: r.get(2)?,
-                started_at: r.get(3)?,
+                live: is_live(listings, &session_id),
+                session_id,
+                started_at: r.get(2)?,
             },
         ))
     })?;
@@ -317,7 +399,8 @@ fn fold_nested(rows: &mut [Workstream], directors: &HashMap<i64, i64>) {
 
 /// Every merge-resolved workstream, live first, then by latest start.
 pub fn workstreams(conn: &Connection) -> Result<Vec<Workstream>> {
-    let drawn = drawn(conn, None)?;
+    let listings = listings(conn)?;
+    let drawn = drawn(conn, None, &listings)?;
     let directors = directors(conn, &drawn)?;
     let mut needs: HashMap<i64, i64> = HashMap::new();
     for row in needs_you(conn)? {
@@ -329,9 +412,6 @@ pub fn workstreams(conn: &Connection) -> Result<Vec<Workstream>> {
         "SELECT w.id, w.name, w.fallback, c.cost_usd, ifnull(c.unpriced, 0)
          FROM workstreams AS w LEFT JOIN workstream_costs AS c ON c.workstream = w.id
          WHERE w.merged_into IS NULL",
-    )?;
-    let mut state = conn.prepare_cached(
-        "SELECT registry_state FROM agents WHERE session_id = ?1 AND agent_id IS NULL",
     )?;
     let mut out = Vec::new();
     let rows = stmt.query_map([], |r| {
@@ -346,13 +426,9 @@ pub fn workstreams(conn: &Connection) -> Result<Vec<Workstream>> {
     for row in rows {
         let (id, name, fallback, cost_usd, unpriced) = row?;
         let shown = drawn.get(&id);
-        let registry_state: Option<String> = match shown {
-            Some(d) => state
-                .query_row([&d.session_id], |r| r.get(0))
-                .optional()?
-                .flatten(),
-            None => None,
-        };
+        let registry_state = shown
+            .and_then(|d| listings.get(&d.session_id))
+            .and_then(|l| l.state.as_deref());
         let needs_you = needs.get(&id).copied().unwrap_or(0);
         out.push(Workstream {
             id,
@@ -360,7 +436,7 @@ pub fn workstreams(conn: &Connection) -> Result<Vec<Workstream>> {
             fallback,
             cost_usd,
             unpriced,
-            state: orchestrator_state(needs_you > 0, registry_state.as_deref()),
+            state: orchestrator_state(needs_you > 0, registry_state),
             needs_you,
             session_id: shown.map(|d| d.session_id.clone()),
             live: shown.is_some_and(|d| d.live),
@@ -388,15 +464,21 @@ pub fn workstream_costs(conn: &Connection) -> Result<Vec<WorkstreamCost>> {
     .collect()
 }
 
-/// Everything waiting on the user, oldest first.
+/// Everything waiting on the user, oldest first. A registry wait is its
+/// process's latest link's (see [`listings`]), so it names that session
+/// and counts toward its workstream.
 pub fn needs_you(conn: &Connection) -> Result<Vec<NeedsYou>> {
-    let mut stmt = conn.prepare_cached(
+    let sql = format!(
         "SELECT n.source, n.session_id, n.agent_id, n.waiting_for, n.since_ms, r.root
-         FROM needs_you AS n
+         FROM (SELECT w.source, w.agent_id, w.waiting_for, w.since_ms,
+                   CASE WHEN w.source = 'registry' THEN {} ELSE w.session_id END AS session_id
+               FROM needs_you AS w) AS n
          LEFT JOIN sessions AS s ON s.session_id = n.session_id
          LEFT JOIN workstream_roots AS r ON r.id = s.workstream_id
          ORDER BY n.since_ms, n.session_id, n.agent_id",
-    )?;
+        LATEST_LINK.replace("{session}", "w.session_id")
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
     stmt.query_map([], |r| {
         Ok(NeedsYou {
             source: r.get(0)?,
@@ -419,8 +501,9 @@ type Row = (GraphAgent, Option<(i64, String)>);
 /// passes; an `earlier` link's has no window as evidence (its session was
 /// grouped before it started, or its window was dropped), so it reads in
 /// its session's current workstream, the one group.rs gives a worker with
-/// no record yet, and so in one graph only. Workers' states read `live` as
-/// their session's liveness; an `earlier` link's are marked so.
+/// no record yet, and so in one graph only. The orchestrator's name, state
+/// and registry wait come from the session's listing ([`listings`]), and
+/// workers' states read its liveness; an `earlier` link's are marked so.
 ///
 /// A worker has finished once its dispatch is answered or its task
 /// notification arrives. A background dispatch's tool_result is the
@@ -431,13 +514,17 @@ fn session_agents(
     session_id: &str,
     root: Option<i64>,
     earlier: bool,
-    live: bool,
+    listings: &HashMap<String, Listing>,
 ) -> Result<Vec<Row>> {
+    let listing = listings.get(session_id).unwrap_or(&NOT_LISTED);
+    // The orchestrator's `registry_name` and `registry_state` sit on the
+    // link the registry names, not the one it describes, and a registry
+    // wait is on that link's orchestrator too: both come from `listing`.
     let mut stmt = conn.prepare_cached(
-        "SELECT a.id, a.agent_id, a.kind, coalesce(a.registry_name, a.name), a.agent_type,
+        "SELECT a.id, a.agent_id, a.kind, a.name, a.agent_type,
              a.description, a.model, a.cost_usd, a.context_tokens, a.context_pct,
-             a.registry_state, a.hook_state,
-             EXISTS (SELECT 1 FROM needs_you AS n WHERE n.agent = a.id),
+             a.hook_state,
+             EXISTS (SELECT 1 FROM needs_you AS n WHERE n.agent = a.id AND n.source = 'hook'),
              EXISTS (SELECT 1 FROM edges AS d
                  JOIN events AS e ON e.session_id = a.session_id AND e.tool_results IS NOT NULL
                  JOIN json_each(e.tool_results) AS j ON j.value = d.tool_use_id
@@ -464,25 +551,31 @@ fn session_agents(
     )?;
     let rows = stmt.query_map(rusqlite::params![session_id, root, earlier], |r| {
         let agent_id: Option<String> = r.get(1)?;
-        let needs: bool = r.get(12)?;
-        let state = match agent_id {
-            None => orchestrator_state(needs, r.get::<_, Option<String>>(10)?.as_deref()),
-            Some(_) => worker_state(
-                needs,
-                r.get::<_, Option<String>>(11)?.as_deref(),
-                r.get(13)?,
-                live,
+        let needs: bool = r.get(11)?;
+        let (name, state) = match agent_id {
+            None => (
+                listing.name.clone().or(r.get(3)?),
+                orchestrator_state(needs || listing.waiting, listing.state.as_deref()),
+            ),
+            Some(_) => (
+                r.get(3)?,
+                worker_state(
+                    needs,
+                    r.get::<_, Option<String>>(10)?.as_deref(),
+                    r.get(12)?,
+                    listing.live,
+                ),
             ),
         };
         let edge: Option<(i64, String)> = r
-            .get::<_, Option<i64>>(14)?
-            .zip(r.get::<_, Option<String>>(15)?);
+            .get::<_, Option<i64>>(13)?
+            .zip(r.get::<_, Option<String>>(14)?);
         Ok((
             GraphAgent {
                 id: r.get(0)?,
                 agent_id,
                 kind: r.get(2)?,
-                name: r.get(3)?,
+                name,
                 agent_type: r.get(4)?,
                 description: r.get(5)?,
                 model: r.get(6)?,
@@ -490,8 +583,8 @@ fn session_agents(
                 cost_usd: r.get(7)?,
                 context_tokens: r.get(8)?,
                 context_pct: r.get(9)?,
-                nudge_pct: r.get(16)?,
-                hard_stop_pct: r.get(17)?,
+                nudge_pct: r.get(15)?,
+                hard_stop_pct: r.get(16)?,
                 parent: None,
                 earlier,
             },
@@ -504,7 +597,6 @@ fn session_agents(
 /// A unit to draw: its chain's latest link in its workstream.
 struct Unit {
     session_id: String,
-    live: bool,
     /// The directed session's workstream (merge-resolved).
     workstream: Option<i64>,
 }
@@ -512,8 +604,14 @@ struct Unit {
 /// The units any session of workstream `root` directed, other than `drawn`
 /// and the workstream's own sessions, in the directed sessions' start
 /// order: per unit chain and workstream, the latest link of the chain with
-/// a segment in that workstream, once.
-fn units(conn: &Connection, root: i64, drawn: &str) -> Result<Vec<Unit>> {
+/// a segment in that workstream, once, while it is live (#63: a finished
+/// unit is not drawn).
+fn units(
+    conn: &Connection,
+    root: i64,
+    drawn: &str,
+    listings: &HashMap<String, Listing>,
+) -> Result<Vec<Unit>> {
     let directed: Vec<(String, Option<i64>)> = conn
         .prepare_cached(
             "SELECT ifnull(c.process_root, c.session_id), cr.root
@@ -530,9 +628,7 @@ fn units(conn: &Connection, root: i64, drawn: &str) -> Result<Vec<Unit>> {
         })?
         .collect::<Result<_>>()?;
     let mut latest = conn.prepare_cached(
-        "SELECT s.session_id,
-             EXISTS (SELECT 1 FROM registry AS g WHERE g.session_id = s.session_id AND g.gone = 0)
-         FROM sessions AS s
+        "SELECT s.session_id FROM sessions AS s
          WHERE (s.process_root = ?1 OR s.session_id = ?1)
            AND (?2 IS NULL OR EXISTS (SELECT 1 FROM segments AS g
                JOIN workstream_roots AS r ON r.id = g.workstream_id
@@ -542,14 +638,14 @@ fn units(conn: &Connection, root: i64, drawn: &str) -> Result<Vec<Unit>> {
     )?;
     let mut out: Vec<Unit> = Vec::new();
     for (chain, workstream) in directed {
-        let (session_id, live): (String, bool) = latest
-            .query_row(rusqlite::params![chain, workstream], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?;
-        if session_id != drawn && !out.iter().any(|u| u.session_id == session_id) {
+        let session_id: String =
+            latest.query_row(rusqlite::params![chain, workstream], |r| r.get(0))?;
+        if session_id != drawn
+            && is_live(listings, &session_id)
+            && !out.iter().any(|u| u.session_id == session_id)
+        {
             out.push(Unit {
                 session_id,
-                live,
                 workstream,
             });
         }
@@ -587,10 +683,10 @@ fn chain_agents(
     session_id: &str,
     links: Option<i64>,
     root: Option<i64>,
-    live: bool,
+    listings: &HashMap<String, Listing>,
     drawn_sessions: &[&str],
 ) -> Result<Vec<Row>> {
-    let mut rows = session_agents(conn, session_id, root, false, live)?;
+    let mut rows = session_agents(conn, session_id, root, false, listings)?;
     let Some(head) = orchestrator(&rows) else {
         return Ok(rows);
     };
@@ -598,7 +694,7 @@ fn chain_agents(
         if drawn_sessions.contains(&link.as_str()) {
             continue;
         }
-        let workers = session_agents(conn, &link, links, true, false)?;
+        let workers = session_agents(conn, &link, links, true, listings)?;
         rows.extend(workers.into_iter().filter(|(a, _)| a.agent_id.is_some()));
     }
     let leads: Vec<i64> = conn
@@ -656,12 +752,12 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
     let Some(root) = root else {
         return Ok(None);
     };
-    let Some(shown) = drawn(conn, Some(root))?.remove(&root) else {
+    let listings = listings(conn)?;
+    let Some(shown) = drawn(conn, Some(root), &listings)?.remove(&root) else {
         return Ok(None);
     };
-    let live = shown.live;
     let (session_cost_usd, run_ms) = session_totals(conn, &shown.session_id, root)?;
-    let units = units(conn, root, &shown.session_id)?;
+    let units = units(conn, root, &shown.session_id, &listings)?;
     let drawn_sessions: Vec<&str> = std::iter::once(shown.session_id.as_str())
         .chain(units.iter().map(|u| u.session_id.as_str()))
         .collect();
@@ -670,7 +766,7 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
         &shown.session_id,
         Some(root),
         Some(root),
-        live,
+        &listings,
         &drawn_sessions,
     )?;
     let director = orchestrator(&rows);
@@ -680,7 +776,7 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
             &unit.session_id,
             unit.workstream,
             None,
-            unit.live,
+            &listings,
             &drawn_sessions,
         )?;
         for (agent, edge) in unit_rows {
@@ -692,10 +788,10 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
         }
     }
     // An agent is drawn once, where it is first read: the drawn chain, then
-    // each unit in order. Only an earlier link two units share can repeat
-    // past the workstream filters: a unit with no workstream (a directed
-    // session with no window yet, so ordered last) reads its chain's
-    // earlier links in every workstream.
+    // each unit in order. Units are live, so no two are of one chain; what
+    // can still repeat is a unit of the drawn session's own chain with no
+    // workstream (a directed link with no window yet), which reads its
+    // chain's earlier links in every workstream.
     let mut seen = HashSet::new();
     rows.retain(|(a, _)| seen.insert(a.id));
     let drawn_ids: Vec<i64> = rows.iter().map(|(a, _)| a.id).collect();
@@ -713,8 +809,8 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
         agents.push(agent);
     }
     Ok(Some(LiveGraph {
+        live: shown.live,
         session_id: shown.session_id,
-        live,
         session_cost_usd,
         run_ms,
         agents,
