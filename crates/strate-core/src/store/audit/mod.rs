@@ -15,9 +15,10 @@
 //! `ticket-` or `epic-`; see [`crate::names`]) places it under its repo and
 //! issue. When the GitHub cache holds that issue, it also goes under each
 //! epic above the issue, outermost first (an epic is one node, its own
-//! windows under its "Direct work"), and under a PR: the issue's
-//! PR that the session's `github_links` names, else the issue's only PR,
-//! else none. An issue the cache doesn't hold (no `gh`, a failed fetch) has
+//! windows under its "Direct work"), and under a PR: the issue's PR that
+//! the newest `github_links` entry of any of the row's sessions names, else
+//! the issue's only PR, else none. A row has one place, whichever of its
+//! windows a link came from, so it is one node. An issue the cache doesn't hold (no `gh`, a failed fetch) has
 //! `github: false`, no epic, PR or progress, and is open. Only a window that
 //! is unnamed, has a fallback name or has a name that doesn't parse sits
 //! under "Unlinked", and with it a director's row. Any other group-by puts

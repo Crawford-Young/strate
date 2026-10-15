@@ -610,3 +610,220 @@ fn rows_that_direct_each_other_nest_one_way_only() {
     assert!(inner[0].children.iter().all(|c| c.kind == NodeKind::Agent));
     assert!(close(4.0, outer.metrics.cost_usd));
 }
+
+/// One process (pa) under issue xrepo#9, which has PRs 11 and 12: s1 linked
+/// no PR, s2 linked PR 12. Each has one $1 orchestrator cell on Oct 2.
+const ROW_PR: &str = "
+    INSERT INTO workstreams (id, name, fallback) VALUES (1, 'xrepo-9', 0);
+    INSERT INTO sessions (session_id, path, started_at, process_root, workstream_id) VALUES
+        ('s1', '/p/s1.jsonl', '2026-10-02T10:00:00.000Z', 'pa', 1),
+        ('s2', '/p/s2.jsonl', '2026-10-02T11:00:00.000Z', 'pa', 1);
+    INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id) VALUES
+        (1, 's1', 0, '2026-10-02T10:00:00.000Z', 1), (2, 's2', 0, '2026-10-02T11:00:00.000Z', 1);
+    INSERT INTO gh_repos (slug, owner, name, fetched_at) VALUES ('xrepo', 'o', 'xrepo', 1);
+    INSERT INTO gh_issues (repo, number, title, state, created_at, sub_total, sub_completed)
+        VALUES ('xrepo', 9, 'T', 'OPEN', '2026-10-01T00:00:00Z', 0, 0);
+    INSERT INTO gh_prs (repo, issue, number, state, created_at, merged_at, url) VALUES
+        ('xrepo', 9, 11, 'MERGED', '2026-10-02T00:00:00Z', '2026-10-02T12:00:00Z',
+         'https://github.com/o/xrepo/pull/11'),
+        ('xrepo', 9, 12, 'OPEN', '2026-10-02T00:00:00Z', NULL,
+         'https://github.com/o/xrepo/pull/12');
+    INSERT INTO github_links (session_id, pr_number, pr_url, pr_repository) VALUES
+        ('s2', 12, 'https://github.com/o/xrepo/pull/12', 'o/xrepo');
+    INSERT INTO audit_cells (session_id, agent_id, segment_id, day, model, wall_ms,
+        active_ms, wait_ms, cost_usd, unpriced, input_tokens, output_tokens,
+        cache_read_tokens, cache_write_tokens) VALUES
+        ('s1', NULL, 1, '2026-10-02', 'm', 1000, 1000, 0, 1.0, 0, 10, 1, 0, 0),
+        ('s2', NULL, 2, '2026-10-02', 'm', 1000, 1000, 0, 1.0, 0, 10, 1, 0, 0);
+";
+
+#[test]
+fn a_chains_row_reads_under_the_pr_any_of_its_links_names() {
+    let t = Temp::new("row-pr");
+    let db = synthetic(&t, ROW_PR);
+    let root = oct2(&db);
+    check_sums(&root);
+    let issue = root
+        .children
+        .iter()
+        .find(|c| c.kind == NodeKind::Repo && c.key == "xrepo")
+        .expect("repo")
+        .children
+        .iter()
+        .find(|c| c.kind == NodeKind::Issue && c.key == "9")
+        .expect("issue");
+    // One place for the whole row: PR 12, which s2 linked. s1 is not left
+    // directly under the issue as a second row with the same key.
+    let under: Vec<(NodeKind, &str)> = issue
+        .children
+        .iter()
+        .map(|c| (c.kind, c.key.as_str()))
+        .collect();
+    assert_eq!(under, [(NodeKind::Pr, "12")]);
+    let row = labelled(&issue.children[0], NodeKind::Session, "xrepo-9");
+    assert_eq!(row.key, "pa/1");
+    assert_eq!(row.metrics.sessions, 2);
+}
+
+/// Director d (workstream 1) directed y, u1 and u2, one process (pu). y is
+/// in ticket-x-1; u1 was renamed from ticket-x-1 (where it dispatched k1)
+/// into ticket-x-2, and u2 is back in ticket-x-1. So the unit chain reads
+/// in both workstreams, and u1 is both ticket-x-2's latest link and an
+/// earlier link in ticket-x-1. y, directed first, puts ticket-x-1's unit
+/// (u2) first.
+const TWO_WORKSTREAM_UNIT: &str = "
+    INSERT INTO workstreams (id, name, fallback) VALUES (1, 'director-d', 0),
+        (2, 'ticket-x-1', 0), (3, 'ticket-x-2', 0);
+    INSERT INTO sessions (session_id, path, started_at, process_root, workstream_id) VALUES
+        ('d', '/p/d.jsonl', '2026-10-02T09:00:00.000Z', 'd', 1),
+        ('y', '/p/y.jsonl', '2026-10-02T09:30:00.000Z', 'pu', 2),
+        ('u1', '/p/u1.jsonl', '2026-10-02T10:00:00.000Z', 'pu', 3),
+        ('u2', '/p/u2.jsonl', '2026-10-02T11:00:00.000Z', 'pu', 2);
+    INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id) VALUES
+        (1, 'd', 0, '2026-10-02T09:00:00.000Z', 1),
+        (2, 'u1', 0, '2026-10-02T10:00:00.000Z', 2), (3, 'u1', 100, '2026-10-02T10:30:00.000Z', 3),
+        (4, 'u2', 0, '2026-10-02T11:00:00.000Z', 2), (5, 'y', 0, '2026-10-02T09:30:00.000Z', 2);
+    INSERT INTO agents (id, session_id, agent_id, kind, segment_id) VALUES
+        (1, 'd', NULL, 'orchestrator', NULL), (2, 'u1', NULL, 'orchestrator', NULL),
+        (3, 'u2', NULL, 'orchestrator', NULL), (4, 'u1', 'k1', 'subagent', 2);
+    INSERT INTO edges (kind, parent, child, tool_use_id) VALUES ('dispatch', 2, 4, 't1');
+    INSERT INTO directs (child, parent, msg_id) VALUES
+        ('y', 'd', 'm0'), ('u1', 'd', 'm1'), ('u2', 'd', 'm2');
+";
+
+/// Each drawn agent's row id, parent and whether it is of an earlier link.
+fn placed(g: &LiveGraph) -> Vec<(i64, Option<i64>, bool)> {
+    g.agents
+        .iter()
+        .map(|a| (a.id, a.parent, a.earlier))
+        .collect()
+}
+
+#[test]
+fn a_unit_chain_directed_in_two_workstreams_draws_each_agent_once() {
+    let t = Temp::new("unit-two-workstreams");
+    let db = synthetic(&t, TWO_WORKSTREAM_UNIT);
+    let g = views::live_graph(&db, 1).expect("query").expect("graph");
+    // u1 is drawn as itself (ticket-x-2's unit), so k1 hangs under u1's
+    // orchestrator, though u2 (ticket-x-1's unit, read first) has u1 as an
+    // earlier link.
+    assert_eq!(
+        placed(&g),
+        [
+            (1, None, false),
+            (3, Some(1), false),
+            (2, Some(1), false),
+            (4, Some(2), false),
+        ]
+    );
+}
+
+/// The chain pu is l (ticket-x-1, which dispatched k1), a (ticket-x-1) and
+/// b (ticket-x-2). Director d directed a, and n: a link of pu with no
+/// window yet, so no workstream and no start. n's unit draws the chain's
+/// latest link b, whose earlier links in any workstream include l.
+const WINDOWLESS_UNIT: &str = "
+    INSERT INTO workstreams (id, name, fallback) VALUES (1, 'director-d', 0),
+        (2, 'ticket-x-1', 0), (3, 'ticket-x-2', 0);
+    INSERT INTO sessions (session_id, path, started_at, process_root, workstream_id) VALUES
+        ('d', '/p/d.jsonl', '2026-10-02T09:00:00.000Z', 'd', 1),
+        ('l', '/p/l.jsonl', '2026-10-02T10:00:00.000Z', 'pu', 2),
+        ('a', '/p/a.jsonl', '2026-10-02T11:00:00.000Z', 'pu', 2),
+        ('b', '/p/b.jsonl', '2026-10-02T12:00:00.000Z', 'pu', 3),
+        ('n', '/p/n.jsonl', NULL, 'pu', NULL);
+    INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id) VALUES
+        (1, 'd', 0, '2026-10-02T09:00:00.000Z', 1), (2, 'l', 0, '2026-10-02T10:00:00.000Z', 2),
+        (3, 'a', 0, '2026-10-02T11:00:00.000Z', 2), (4, 'b', 0, '2026-10-02T12:00:00.000Z', 3);
+    INSERT INTO agents (id, session_id, agent_id, kind, segment_id) VALUES
+        (1, 'd', NULL, 'orchestrator', NULL), (2, 'a', NULL, 'orchestrator', NULL),
+        (3, 'b', NULL, 'orchestrator', NULL), (4, 'l', 'k1', 'subagent', 2);
+    INSERT INTO directs (child, parent, msg_id) VALUES ('a', 'd', 'm1'), ('n', 'd', 'm2');
+";
+
+#[test]
+fn an_earlier_link_two_units_share_is_drawn_once() {
+    let t = Temp::new("unit-windowless");
+    let db = synthetic(&t, WINDOWLESS_UNIT);
+    let g = views::live_graph(&db, 1).expect("query").expect("graph");
+    // a's unit (ticket-x-1) draws l's k1 first, and b's does not again.
+    assert_eq!(
+        placed(&g),
+        [
+            (1, None, false),
+            (2, Some(1), false),
+            (4, None, true),
+            (3, Some(1), false),
+        ]
+    );
+}
+
+/// One process (pp): p1 (alpha-1, renamed to beta-2 at 10:30), p2
+/// (alpha-1) and p3 (beta-2). p1 dispatched k1, which no window holds, and
+/// k2 in its alpha-1 window.
+const WINDOWLESS_EARLIER: &str = "
+    INSERT INTO workstreams (id, name, fallback) VALUES (1, 'alpha-1', 0), (2, 'beta-2', 0);
+    INSERT INTO sessions (session_id, path, started_at, process_root, workstream_id) VALUES
+        ('p1', '/p/p1.jsonl', '2026-10-02T10:00:00.000Z', 'pp', 2),
+        ('p2', '/p/p2.jsonl', '2026-10-02T11:00:00.000Z', 'pp', 1),
+        ('p3', '/p/p3.jsonl', '2026-10-02T12:00:00.000Z', 'pp', 2);
+    INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id) VALUES
+        (1, 'p1', 0, '2026-10-02T10:00:00.000Z', 1), (2, 'p1', 100, '2026-10-02T10:30:00.000Z', 2),
+        (3, 'p2', 0, '2026-10-02T11:00:00.000Z', 1), (4, 'p3', 0, '2026-10-02T12:00:00.000Z', 2);
+    INSERT INTO agents (id, session_id, agent_id, kind, segment_id) VALUES
+        (1, 'p1', NULL, 'orchestrator', NULL), (2, 'p2', NULL, 'orchestrator', NULL),
+        (3, 'p3', NULL, 'orchestrator', NULL), (4, 'p1', 'k1', 'subagent', NULL),
+        (5, 'p1', 'k2', 'subagent', 1);
+    INSERT INTO edges (kind, parent, child, tool_use_id) VALUES
+        ('dispatch', 1, 4, 't1'), ('dispatch', 1, 5, 't2');
+";
+
+#[test]
+fn an_earlier_links_windowless_agent_reads_in_its_links_workstream_only() {
+    let t = Temp::new("windowless-earlier");
+    let db = synthetic(&t, WINDOWLESS_EARLIER);
+    let alpha = views::live_graph(&db, 1).expect("query").expect("graph");
+    assert_eq!(alpha.session_id, "p2");
+    assert_eq!(placed(&alpha), [(2, None, false), (5, Some(2), true)]);
+    // k1 reads where p1 ended: beta-2.
+    let beta = views::live_graph(&db, 2).expect("query").expect("graph");
+    assert_eq!(beta.session_id, "p3");
+    assert_eq!(placed(&beta), [(3, None, false), (4, Some(3), true)]);
+}
+
+/// Unit chain pk (ticket-x-3): director-a's da directed k1, then
+/// director-b's db directed k2. Only db is live.
+const TWO_DIRECTORS: &str = "
+    INSERT INTO workstreams (id, name, fallback) VALUES (1, 'director-a', 0),
+        (2, 'director-b', 0), (3, 'ticket-x-3', 0);
+    INSERT INTO sessions (session_id, path, started_at, process_root, workstream_id) VALUES
+        ('da', '/p/da.jsonl', '2026-10-02T08:00:00.000Z', 'da', 1),
+        ('db', '/p/db.jsonl', '2026-10-02T09:00:00.000Z', 'db', 2),
+        ('k1', '/p/k1.jsonl', '2026-10-02T10:00:00.000Z', 'pk', 3),
+        ('k2', '/p/k2.jsonl', '2026-10-02T11:00:00.000Z', 'pk', 3);
+    INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id) VALUES
+        (1, 'da', 0, '2026-10-02T08:00:00.000Z', 1), (2, 'db', 0, '2026-10-02T09:00:00.000Z', 2),
+        (3, 'k1', 0, '2026-10-02T10:00:00.000Z', 3), (4, 'k2', 0, '2026-10-02T11:00:00.000Z', 3);
+    INSERT INTO directs (child, parent, msg_id) VALUES ('k1', 'da', 'm1'), ('k2', 'db', 'm2');
+    INSERT INTO registry (key, kind, session_id, cwd, started_at_ms, status, first_seen_ms,
+        last_seen_ms) VALUES ('pid:2:1', 'interactive', 'db', '/work/x', 1, 'busy', 1, 1);
+";
+
+#[test]
+fn a_unit_tab_nests_under_a_live_director_of_any_of_its_links() {
+    let t = Temp::new("two-directors");
+    let db = synthetic(&t, TWO_DIRECTORS);
+    let rows = views::workstreams(&db).expect("workstreams");
+    // k1's director is not live; k2's is.
+    assert_eq!(tab(&rows, "ticket-x-3").director, Some(2));
+    // With both live, the earliest directed link's director.
+    Connection::open(t.db())
+        .expect("raw")
+        .execute_batch(
+            "INSERT INTO registry (key, kind, session_id, cwd, started_at_ms, status,
+                 first_seen_ms, last_seen_ms)
+             VALUES ('pid:1:1', 'interactive', 'da', '/work/x', 1, 'busy', 1, 1);",
+        )
+        .expect("live");
+    let rows = views::workstreams(&db).expect("workstreams");
+    assert_eq!(tab(&rows, "ticket-x-3").director, Some(1));
+}
