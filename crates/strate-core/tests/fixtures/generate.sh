@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ and github/audit-home.json for #26, nest-home/ and github/nest-home.json for #47, perf-home/ and github/perf-home.json for #51, directs-home/ for #53, chain-home/ for #63). Field names come from
+# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ and github/audit-home.json for #26, nest-home/ and github/nest-home.json for #47, perf-home/ and github/perf-home.json for #51, directs-home/ for #53, chain-home/ for #63, teams-home/ for #83). Field names come from
 # the "~/.claude format, as observed" comment on strate #10; every value is a placeholder.
 set -eu
 cd "$(dirname "$0")/.."
@@ -681,3 +681,55 @@ csub "$CREPO" $P2 a8000000000000006 14:00 p2
 cat_ $P3 /work/chain-repo $P1
 { dname chain-repo-6; dname chain-repo-5; cwork 15:00 p3; } > "$CREPO/$P3.jsonl"
 csub "$CREPO" $P3 a8000000000000007 15:00 p3
+
+# ---- teams-home: teammates that went idle (#83); hand values in tests/teammates.rs ----
+# 2026-10-09Z. TL leads team-lorem: four teammates in its subagents/, each
+# turn end an idle_notification teammate-message in TL's own transcript,
+# stamped by the teammate (the `timestamp` in the message body) and
+# delivered when TL next reads (the record's timestamp). lorem-mate idles
+# at 10:05 and stays idle. ipsum-mate idles at 10:04, TL messages it again
+# at 10:07, and it works on. dolor-mate never idles (it sends TL a plain
+# message). amet-mate idles at 10:03 but works again at 10:08, before TL
+# reads its notice at 10:09.
+T=fixtures/teams-home
+TL=5e55d5d5-0000-4000-8000-0000000000a1
+TP="$T/projects/-work-team-repo"
+rm -rf "$T"
+mkdir -p "$TP/$TL/subagents" "$T/teams/team-lorem"
+echo "{\"name\":\"team-lorem\",\"createdAt\":1791000000000,\"leadAgentId\":\"team-lead@team-lorem\",\"leadSessionId\":\"$TL\",\"members\":[{\"name\":\"lorem-mate\"},{\"name\":\"ipsum-mate\"},{\"name\":\"dolor-mate\"},{\"name\":\"amet-mate\"}]}" > "$T/teams/team-lorem/config.json"
+TT=2026-10-09T10
+Q='\"'
+tmsg() { # from attributes body: a teammate-message, JSON-escaped for a string
+  printf '<teammate-message teammate_id=%s%s%s color=%sblue%s%s>\\n%s\\n</teammate-message>' "$Q" "$1" "$Q" "$Q" "$Q" "$2" "$3"
+}
+tidle() { # from MM:SS.mmm: an idle_notification body, JSON-escaped
+  printf '{%stype%s:%sidle_notification%s,%sfrom%s:%s%s%s,%stimestamp%s:%s%s:%sZ%s,%sidleReason%s:%savailable%s,%sresult%s:%sLorem ipsum.%s}' \
+    "$Q" "$Q" "$Q" "$Q" "$Q" "$Q" "$Q" "$1" "$Q" "$Q" "$Q" "$Q" "$TT" "$2" "$Q" "$Q" "$Q" "$Q" "$Q" "$Q" "$Q" "$Q" "$Q"
+}
+tnotice() { # time uuid content: a user record carrying teammate-messages
+  aenv "$1" "$2"; echo "{$AE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":$3}}"
+}
+aat $TL /work/team-repo '"isSidechain":false'
+{ atitle team-repo-1
+  aprompt $TT:00:00 tl-01
+  areply $TT:00:10 tl-02 req_tl-02 $OPUS "$UO" "$TEXT"
+  tnotice $TT:05:01 tl-03 "\"Lorem ipsum:\n$(tmsg ipsum-mate '' "$(tidle ipsum-mate 04:00.020)")\n$(tmsg lorem-mate '' "$(tidle lorem-mate 05:00.020)")\""
+  tnotice $TT:06:30 tl-04 "\"$(tmsg dolor-mate " summary=${Q}Lorem > ipsum${Q}" 'Lorem ipsum dolor.')\""
+  areply $TT:07:00 tl-05 req_tl-05 $OPUS "$UO" "$(ktool toolu_tl-05 SendMessage '{"to":"ipsum-mate","message":"Lorem ipsum.","summary":"Lorem"}')"
+  tnotice $TT:09:00 tl-06 "[{\"type\":\"text\",\"text\":\"$(tmsg amet-mate '' "$(tidle amet-mate 03:00.020)")\"}]"
+} > "$TP/$TL.jsonl"
+tmate() { # agentId name: a teammate's meta
+  echo "{\"agentType\":\"general-purpose\",\"description\":\"Lorem task\",\"name\":\"$2\",\"spawnDepth\":0,\"requestShape\":\"teammate\",\"requestNonInteractive\":false,\"model\":\"$SONNET\",\"teamName\":\"team-lorem\",\"color\":\"blue\"}" > "$TP/$TL/subagents/agent-$1.meta.json"
+}
+tturn() { # start end uuid-prefix: a teammate's prompt at `start`, its reply at `end`
+  atask "$TT:$1" "$3-1"; areply "$TT:$2" "$3-2" "req_$3-2" $SONNET "$US" "$TEXT"
+}
+for m in 1:lorem-mate 2:ipsum-mate 3:dolor-mate 4:amet-mate; do tmate "a700000000000000${m%%:*}" "${m#*:}"; done
+aat $TL /work/team-repo '"isSidechain":true,"agentId":"a7000000000000001"'
+tturn 01:00 05:00 t1 > "$TP/$TL/subagents/agent-a7000000000000001.jsonl"
+aat $TL /work/team-repo '"isSidechain":true,"agentId":"a7000000000000002"'
+{ tturn 01:00 04:00 t2a; tturn 07:02 07:30 t2b; } > "$TP/$TL/subagents/agent-a7000000000000002.jsonl"
+aat $TL /work/team-repo '"isSidechain":true,"agentId":"a7000000000000003"'
+tturn 01:00 06:00 t3 > "$TP/$TL/subagents/agent-a7000000000000003.jsonl"
+aat $TL /work/team-repo '"isSidechain":true,"agentId":"a7000000000000004"'
+{ tturn 01:00 03:00 t4a; tturn 08:00 08:30 t4b; } > "$TP/$TL/subagents/agent-a7000000000000004.jsonl"
