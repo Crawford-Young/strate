@@ -43,7 +43,7 @@ const B: [&str; 6] = [
 
 mod common;
 
-use common::{Temp, fixture_home, records, transcripts as transcripts_in};
+use common::{Temp, batch, fixture_home, records, transcripts as transcripts_in};
 
 fn root() -> PathBuf {
     fixture_home("perf-home")
@@ -52,11 +52,6 @@ fn root() -> PathBuf {
 /// Every transcript under `root/projects`, sorted: the orchestrator first.
 fn transcripts() -> Vec<PathBuf> {
     transcripts_in(&root())
-}
-
-/// The whole of `path` as one batch, each line a record at its byte offset.
-fn batch(path: &Path) -> Batch {
-    lines(path, 0..usize::MAX)
 }
 
 /// Lines `range` of `path` as one batch, each a record at its byte offset,

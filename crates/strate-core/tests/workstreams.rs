@@ -23,48 +23,17 @@ const E1: &str = "5e55e0e0-0000-4000-8000-0000000000e1";
 const E2: &str = "5e55e0e0-0000-4000-8000-0000000000e2";
 const FALLBACK: &str = "/work/demo-repo/packages/core @ feat/9-lorem";
 
-/// A temp dir removed on drop.
-struct Temp(PathBuf);
+mod common;
 
-impl Temp {
-    fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("strate-ws-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("temp dir");
-        Self(dir)
-    }
-
-    fn db(&self) -> PathBuf {
-        self.0.join("strate.db")
-    }
-}
-
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+use common::{Temp, fixture_home, records as records_in, transcripts as transcripts_in};
 
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workstreams-home")
+    fixture_home("workstreams-home")
 }
 
 /// Every transcript under `root/projects`, sorted.
 fn transcripts() -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in fs::read_dir(dir).expect("readable dir") {
-            let path = entry.expect("entry").path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|e| e == "jsonl") {
-                out.push(path);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(&root().join("projects"), &mut out);
-    out.sort();
-    out
+    transcripts_in(&root())
 }
 
 fn transcript(session: &str) -> PathBuf {
@@ -76,21 +45,15 @@ fn transcript(session: &str) -> PathBuf {
 
 /// One record event per line of `path`, with its byte offset.
 fn records(path: &Path) -> Vec<TailEvent> {
-    let text = fs::read_to_string(path).expect("read");
-    let path: Arc<Path> = path.into();
-    let mut offset = 0u64;
-    let mut out = Vec::new();
-    for line in text.split_inclusive('\n') {
-        out.push(TailEvent::Record {
-            path: path.clone(),
-            offset,
-            value: serde_json::from_str(line).expect("fixture line is json"),
-        });
-        offset += line.len() as u64;
-    }
-    out
+    records_in(path, 0..usize::MAX)
+        .into_iter()
+        .map(|(event, _)| event)
+        .collect()
 }
 
+/// `events` as one batch. Unlike `common::batch` it takes any run of
+/// records, down to one, and checkpoints one byte past the last one's
+/// offset rather than at the end of its line.
 fn batch(events: Vec<TailEvent>) -> Batch {
     let TailEvent::Record { path, offset, .. } = events.last().expect("non-empty") else {
         unreachable!("records only")
@@ -469,7 +432,7 @@ fn a_manual_merge_survives_regrouping_and_re_ingest_and_can_be_undone() {
 fn an_empty_title_neither_splits_nor_names_a_workstream() {
     let tmp = Temp::new("empty-title");
     let mut store = Store::open(tmp.db()).expect("open");
-    let path: Arc<Path> = tmp.0.join("projects/-work-x/s1.jsonl").into();
+    let path: Arc<Path> = tmp.path().join("projects/-work-x/s1.jsonl").into();
     let lines = [
         r#"{"type":"custom-title","customTitle":"demo-1"}"#,
         r#"{"type":"assistant","uuid":"a1","timestamp":"2026-01-01T00:00:00Z"}"#,

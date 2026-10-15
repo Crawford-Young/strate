@@ -333,6 +333,21 @@ impl Ingest<'_> {
     }
 }
 
+/// Each step of `sql`'s query plan, every parameter "".
+#[cfg(test)]
+pub(crate) fn query_plan(conn: &Connection, sql: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+        .expect("plan");
+    let params = vec![""; stmt.parameter_count()];
+    stmt.query_map(rusqlite::params_from_iter(params), |r| {
+        r.get::<_, String>(3)
+    })
+    .expect("steps")
+    .collect::<Result<_>>()
+    .expect("detail")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

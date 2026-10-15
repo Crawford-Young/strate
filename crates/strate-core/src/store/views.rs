@@ -886,13 +886,7 @@ mod tests {
         let db = dir.join("strate.db");
         drop(super::super::Store::open(&db).expect("open"));
         let conn = super::super::Store::open_reader(&db).expect("reader");
-        let plan = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {DIRECTORS_SQL}"))
-            .expect("plan")
-            .query_map(["", ""], |r| r.get::<_, String>(3))
-            .expect("steps")
-            .collect::<Result<Vec<_>>>()
-            .expect("detail");
+        let plan = super::super::query_plan(&conn, DIRECTORS_SQL);
         let on = |table: &[&str]| -> Vec<&str> {
             plan.iter()
                 .map(String::as_str)

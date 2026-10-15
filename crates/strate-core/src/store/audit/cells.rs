@@ -869,22 +869,8 @@ impl Agent {
 mod tests {
     use super::*;
     use crate::store::Store;
+    use crate::store::query_plan;
     use crate::tail::test_dir;
-
-    /// Each step of `sql`'s query plan, one per line, every parameter "".
-    fn plan(conn: &Connection, sql: &str) -> String {
-        let mut stmt = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-            .expect("plan");
-        let params = vec![""; stmt.parameter_count()];
-        stmt.query_map(rusqlite::params_from_iter(params), |r| {
-            r.get::<_, String>(3)
-        })
-        .expect("steps")
-        .collect::<Result<Vec<_>>>()
-        .expect("detail")
-        .join("\n")
-    }
 
     /// `events` rows carry their whole record, so a scan of a session's
     /// rows costs ~1 ms each: its last activity comes from the v10 index
@@ -895,7 +881,7 @@ mod tests {
         let db = dir.join("strate.db");
         drop(Store::open(&db).expect("open"));
         let conn = Store::open_reader(&db).expect("reader");
-        let session = plan(&conn, SESSION_SQL);
+        let session = query_plan(&conn, SESSION_SQL).join("\n");
         assert!(
             session.contains("COVERING INDEX events_session_time"),
             "{session}"
@@ -921,7 +907,7 @@ mod tests {
             ("unit_rows", UNIT_ROWS_SQL, "p"),
             ("row_links", ROW_LINKS_SQL, "s"),
         ] {
-            let found = plan(&conn, sql);
+            let found = query_plan(&conn, sql).join("\n");
             let by_root =
                 format!("SEARCH {chain} USING INDEX sessions_process_root (process_root=?)");
             assert!(found.contains(&by_root), "{name}: {found}");

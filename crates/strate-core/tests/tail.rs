@@ -13,26 +13,27 @@ use strate_core::tail::{Batch, Offsets, Receiver, ResetReason, TailEvent, TailOp
 
 const PATIENCE: Duration = Duration::from_secs(10);
 
+mod common;
+
+use common::Temp;
+
 /// A fresh config-dir root (plus a sibling dir for stores), removed on drop.
-struct Root {
-    base: PathBuf,
-}
+struct Root(Temp);
 
 impl Root {
     fn new(name: &str) -> Self {
-        let base = std::env::temp_dir().join(format!("strate-tail-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(base.join("claude")).expect("root");
-        fs::create_dir_all(base.join("state")).expect("state dir");
-        Self { base }
+        let base = Temp::new(name);
+        fs::create_dir_all(base.path().join("claude")).expect("root");
+        fs::create_dir_all(base.path().join("state")).expect("state dir");
+        Self(base)
     }
 
     fn path(&self) -> PathBuf {
-        self.base.join("claude")
+        self.0.path().join("claude")
     }
 
     fn store_file(&self) -> PathBuf {
-        self.base.join("state/strate.db")
+        self.0.path().join("state/strate.db")
     }
 
     /// Writes `text` to `rel` under the root, creating parent dirs.
@@ -41,12 +42,6 @@ impl Root {
         fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
         fs::write(&path, text).expect("write");
         path
-    }
-}
-
-impl Drop for Root {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.base);
     }
 }
 
