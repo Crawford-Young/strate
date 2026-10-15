@@ -1,40 +1,28 @@
-// Pure helpers for the Audit performance view: week labels, deltas, and the bottleneck's sums.
+// Pure helpers for the Audit performance view: range means, and the bottleneck's sums.
 import type { StackedBarDatum, StackedBarSeries, TrendChartDatum } from '@crawfordyoung/ui'
-import type { AgentRow, BottleneckDay, OutcomeWeek } from './api'
+import type { AgentRow, BottleneckDay, OutcomeDay } from './api'
 import { shortDay } from './audit'
 
 const HOUR = 3_600_000
 
-/** An ISO week by its Monday, `w/c Oct 12`, with its days in range when fewer than 7. */
-export function weekLabel({ week, days }: OutcomeWeek): string {
-  const label = `w/c ${shortDay(week)}`
-  return days < 7 ? `${label} (${days} ${days === 1 ? 'day' : 'days'})` : label
-}
-
-/** The signed fraction from `before` to `now`; undefined when either is missing or `before` is 0. */
-export function change(now: number | null, before: number | null | undefined): number | undefined {
-  if (now === null || before === null || before === undefined || before === 0) return undefined
-  return (now - before) / before
-}
-
 /**
- * A per-week mean over the whole range, each week weighted by its `count` (issues closed, PRs
- * merged): the weeks with a value and a count over 0 only. Null when no week has one.
+ * The mean over the whole range of a per-day value, each day weighted by its `count` (issues
+ * closed, PRs merged): the days with a value and a count over 0 only. Null when no day has one.
  */
 export function rangeMean(
-  weeks: OutcomeWeek[],
-  value: (w: OutcomeWeek) => number | null,
-  count: (w: OutcomeWeek) => number,
-): { mean: number; count: number } | null {
+  days: OutcomeDay[],
+  value: (d: OutcomeDay) => number | null,
+  count: (d: OutcomeDay) => number,
+): number | null {
   let sum = 0
   let n = 0
-  for (const w of weeks) {
-    const v = value(w)
-    if (v === null || count(w) === 0) continue
-    sum += v * count(w)
-    n += count(w)
+  for (const d of days) {
+    const v = value(d)
+    if (v === null || count(d) === 0) continue
+    sum += v * count(d)
+    n += count(d)
   }
-  return n === 0 ? null : { mean: sum / n, count: n }
+  return n === 0 ? null : sum / n
 }
 
 /** Ms as hours: `1.5 h`. */
@@ -44,13 +32,13 @@ export const hours = (ms: number, digits = 1) => `${(ms / HOUR).toFixed(digits)}
 export const share = (part: number, whole: number) =>
   whole === 0 ? null : Math.round((part / whole) * 100)
 
-/** The Outcome trend: a row per week, null where nothing closed or merged (a gap, not 0). */
-export function trendRows(weeks: OutcomeWeek[]): TrendChartDatum[] {
-  return weeks.map((w) => ({
-    week: weekLabel(w),
-    perIssue: w.usdPerClosedIssue,
-    perPr: w.usdPerMergedPr,
-    spend: w.spendUsd,
+/** The Outcome trend: a row per day, null where nothing closed or merged (a gap, not 0). */
+export function trendRows(days: OutcomeDay[]): TrendChartDatum[] {
+  return days.map((d) => ({
+    day: shortDay(d.day),
+    perIssue: d.usdPerClosedIssue,
+    perPr: d.usdPerMergedPr,
+    spend: d.spendUsd,
   }))
 }
 

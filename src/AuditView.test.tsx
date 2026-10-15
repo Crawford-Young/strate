@@ -344,12 +344,12 @@ describe('performance', () => {
     expect(region('Spend')).toContainElement(region('Breakdown'))
   })
 
-  it('takes only the median elapsed from the rollup, the other range figures from the weeks', async () => {
+  it('takes only the median elapsed from the rollup, the other range figures from the days', async () => {
     await show()
     await screen.findByRole('region', { name: 'Outcome' })
     expect(tile('Median elapsed')).toEqual(['1d 4h', 'range: first window to close'])
-    expect(tile('$ per closed issue')[1]).toBe('range: none')
-    expect(tile('Issues closed')[1]).toBe('range: 0, completed only')
+    expect(tile('$ per closed issue')).toEqual(['$—'])
+    expect(tile('Issues closed')).toEqual(['0', 'completed only'])
   })
 
   it('has no headline of its own any more: the outcome tiles carry it', async () => {

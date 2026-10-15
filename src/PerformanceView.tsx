@@ -8,7 +8,6 @@ import {
   StackedBarChart,
   StatTile,
   TrendChart,
-  type StatTileDelta,
 } from '@crawfordyoung/ui'
 import type { ColumnDef } from '@tanstack/react-table'
 import { memo, type ReactNode } from 'react'
@@ -17,7 +16,6 @@ import type {
   Bottleneck,
   Headline,
   Outcome,
-  OutcomeWeek,
   Performance,
   PermissionWaits,
   Waste,
@@ -27,7 +25,6 @@ import { duration, money } from './format'
 import {
   bottleneckChart,
   byRepo,
-  change,
   hours,
   rangeMean,
   share,
@@ -35,13 +32,12 @@ import {
   totals,
   trendRows,
   waited,
-  weekLabel,
   type BottleneckSums,
   type RepoSums,
 } from './performance'
 
 interface PerformanceViewProps {
-  /** The rollup's: its median elapsed and cloud note only, the rest coming from the weeks. */
+  /** The rollup's: its median elapsed and cloud note only, the rest coming from the days. */
   headline: Headline
   performance: Performance
 }
@@ -102,88 +98,42 @@ const named = (s: string) => s || 'unknown'
 const percent = (n: number | null) => (n === null ? '—' : `${n}%`)
 const perIssueHours = (ms: number | null) => (ms === null ? '—' : hours(ms, 2))
 
-/** A range-wide mean over the weeks, as the hint: `range: $8.22 over 28`. */
-function rangeHint(
-  weeks: OutcomeWeek[],
-  value: (w: OutcomeWeek) => number | null,
-  count: (w: OutcomeWeek) => number,
-  show: (n: number) => string,
-  unit = '',
-) {
-  const r = rangeMean(weeks, value, count)
-  return r === null ? 'range: none' : `range: ${show(r.mean)} over ${r.count}${unit}`
-}
-
-/** A delta from the week before, or none in a range of one week. */
-function versus(
-  now: number | null,
-  was: OutcomeWeek | undefined,
-  pick: (w: OutcomeWeek) => number | null,
-  show: (n: number | null) => string,
-  goodWhen: StatTileDelta['goodWhen'],
-): StatTileDelta | undefined {
-  if (was === undefined) return undefined
-  return { change: change(now, pick(was)), goodWhen, label: `vs ${show(pick(was))}` }
-}
-
 function OutcomeSection({ headline: h, outcome: o }: { headline: Headline; outcome: Outcome }) {
-  const now = o.weeks.at(-1)
-  const was = o.weeks.at(-2)
-  const perIssue = now?.usdPerClosedIssue ?? null
-  const perIssueMs = now?.activeMsPerClosedIssue ?? null
-  const perPr = now?.usdPerMergedPr ?? null
-  const closed = now?.issuesClosed ?? 0
+  const perIssue = rangeMean(
+    o.days,
+    (d) => d.usdPerClosedIssue,
+    (d) => d.issuesClosed,
+  )
+  const perIssueMs = rangeMean(
+    o.days,
+    (d) => d.activeMsPerClosedIssue,
+    (d) => d.issuesClosed,
+  )
+  const perPr = rangeMean(
+    o.days,
+    (d) => d.usdPerMergedPr,
+    (d) => d.prsMerged,
+  )
+  const closed = o.days.reduce((n, d) => n + d.issuesClosed, 0)
   return (
     <Section
       title="Outcome"
       sub={
         <>
           Is the harness getting better? Each closed issue costs all its{' '}
-          <code>&lt;repo&gt;-&lt;issue&gt;</code> work, counted in the week it closed.
+          <code>&lt;repo&gt;-&lt;issue&gt;</code> work, counted on the day it closed.
         </>
       }
     >
       <Tiles>
-        <StatTile
-          label="$ per closed issue"
-          value={money(perIssue)}
-          delta={versus(perIssue, was, (w) => w.usdPerClosedIssue, money, 'down')}
-          hint={rangeHint(
-            o.weeks,
-            (w) => w.usdPerClosedIssue,
-            (w) => w.issuesClosed,
-            money,
-          )}
-        />
+        <StatTile label="$ per closed issue" value={money(perIssue)} />
         <StatTile
           label="Hours per closed issue"
           value={perIssueHours(perIssueMs)}
-          delta={versus(perIssueMs, was, (w) => w.activeMsPerClosedIssue, perIssueHours, 'down')}
-          hint={rangeHint(
-            o.weeks,
-            (w) => w.activeMsPerClosedIssue,
-            (w) => w.issuesClosed,
-            perIssueHours,
-          )}
+          hint="active orchestrator time"
         />
-        <StatTile
-          label="$ per merged PR"
-          value={money(perPr)}
-          delta={versus(perPr, was, (w) => w.usdPerMergedPr, money, 'down')}
-          hint={rangeHint(
-            o.weeks,
-            (w) => w.usdPerMergedPr,
-            (w) => w.prsMerged,
-            money,
-            ' PRs',
-          )}
-        />
-        <StatTile
-          label="Issues closed"
-          value={closed}
-          delta={versus(closed, was, (w) => w.issuesClosed, String, 'up')}
-          hint={`range: ${o.weeks.reduce((n, w) => n + w.issuesClosed, 0)}, completed only`}
-        />
+        <StatTile label="$ per merged PR" value={money(perPr)} />
+        <StatTile label="Issues closed" value={closed} hint="completed only" />
         <StatTile
           label="No linked outcome"
           value={money(o.unlinkedUsd)}
@@ -202,28 +152,22 @@ function OutcomeSection({ headline: h, outcome: o }: { headline: Headline; outco
           hint="range: first window to close"
         />
       </Tiles>
-      {now && (
-        <p className="text-xs text-muted-foreground">
-          Tiles: {weekLabel(now)}
-          {was && ` vs ${weekLabel(was)}`}. Hints: the whole range. Hours: active orchestrator time.
-        </p>
-      )}
       {h.cloudUncounted && (
         <p className="text-xs text-muted-foreground">
           Cloud sessions are not counted: their spend is not in the store (#29).
         </p>
       )}
-      <Panel title="Per outcome, by week">
+      <Panel title="Per outcome, by day">
         <TrendChart
-          data={trendRows(o.weeks)}
-          xKey="week"
-          xLabel="Week"
+          data={trendRows(o.days)}
+          xKey="day"
+          xLabel="Day"
           series={[
             { key: 'perIssue', label: '$ per closed issue' },
             { key: 'perPr', label: '$ per merged PR' },
           ]}
           format={money}
-          background={{ key: 'spend', label: 'total spend that week', format: money }}
+          background={{ key: 'spend', label: 'total spend that day', format: money }}
           emptyMessage="No issue closed or PR merged in range"
         />
       </Panel>

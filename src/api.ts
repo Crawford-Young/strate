@@ -215,14 +215,12 @@ export interface TimelineDay {
 }
 
 /**
- * One ISO week of the range: the issues closed as completed and the PRs merged in it,
+ * One local day of the range: the issues closed as completed and the PRs merged on it,
  * each at its whole-life cost (all its `<repo>-<issue>` work, in the range or not).
  */
-export interface OutcomeWeek {
-  /** Its Monday, `YYYY-MM-DD`. */
-  week: string
-  /** Its days inside the range: fewer than 7 at either end. */
-  days: number
+export interface OutcomeDay {
+  /** `YYYY-MM-DD`. */
+  day: string
   issuesClosed: number
   usdPerClosedIssue: number | null
   /** Orchestrator active time, not subagent time. */
@@ -230,13 +228,13 @@ export interface OutcomeWeek {
   /** With linked work; a PR closing several issues counts once. */
   prsMerged: number
   usdPerMergedPr: number | null
-  /** Everything spent on its days in the range. */
+  /** Everything spent on it. */
   spendUsd: number
 }
 
 export interface Outcome {
-  /** Every ISO week the range touches, in order. */
-  weeks: OutcomeWeek[]
+  /** Every local day of the range, in order, the quiet ones too. */
+  days: OutcomeDay[]
   /** The range's $ in windows with no `<repo>-<issue>` name. */
   unlinkedUsd: number
   unlinkedWorkstreams: number

@@ -416,7 +416,7 @@ fn sessions(ids: &[&str]) -> String {
 }
 
 #[test]
-fn a_closed_issue_counts_in_its_close_week_at_its_whole_life_cost() {
+fn a_closed_issue_counts_on_its_close_day_at_its_whole_life_cost() {
     let t = Temp::new("outcome");
     let db = built(&t);
     let o = read(&db, &[]).outcome;
@@ -428,14 +428,26 @@ fn a_closed_issue_counts_in_its_close_week_at_its_whole_life_cost() {
         "G2's 10-05 work is outside the range but in the cost"
     );
 
-    let weeks: Vec<(&str, i64)> = o.weeks.iter().map(|w| (w.week.as_str(), w.days)).collect();
-    assert_eq!(weeks, [("2026-10-05", 6), ("2026-10-12", 2)]);
-    let w = &o.weeks[0];
-    assert_eq!((w.issues_closed, w.prs_merged), (1, 1));
-    assert!(w.usd_per_closed_issue.is_some_and(|u| close(u, life)));
-    assert!(w.usd_per_merged_pr.is_some_and(|u| close(u, life)));
+    let days: Vec<&str> = o.days.iter().map(|d| d.day.as_str()).collect();
     assert_eq!(
-        w.active_ms_per_closed_issue,
+        days,
+        [
+            "2026-10-06",
+            "2026-10-07",
+            "2026-10-08",
+            "2026-10-09",
+            "2026-10-10",
+            "2026-10-11",
+            "2026-10-12",
+            "2026-10-13"
+        ]
+    );
+    let d = &o.days[0];
+    assert_eq!((d.issues_closed, d.prs_merged), (1, 1));
+    assert!(d.usd_per_closed_issue.is_some_and(|u| close(u, life)));
+    assert!(d.usd_per_merged_pr.is_some_and(|u| close(u, life)));
+    assert_eq!(
+        d.active_ms_per_closed_issue,
         Some(ms(
             &db,
             "active_ms",
@@ -443,13 +455,16 @@ fn a_closed_issue_counts_in_its_close_week_at_its_whole_life_cost() {
         )),
         "orchestrator time only"
     );
-    assert!(close(w.spend_usd, oct6));
-    let w = &o.weeks[1];
-    assert_eq!((w.issues_closed, w.prs_merged), (0, 0));
-    assert_eq!(w.usd_per_closed_issue, None);
-    assert_eq!(w.active_ms_per_closed_issue, None);
-    assert_eq!(w.usd_per_merged_pr, None);
-    assert!(close(w.spend_usd, usd(&db, &sessions(&[G3, G4]))));
+    assert!(close(d.spend_usd, oct6));
+    let d = &o.days[7];
+    assert_eq!((d.issues_closed, d.prs_merged), (0, 0));
+    assert_eq!(d.usd_per_closed_issue, None);
+    assert_eq!(d.active_ms_per_closed_issue, None);
+    assert_eq!(d.usd_per_merged_pr, None);
+    assert!(close(d.spend_usd, usd(&db, &sessions(&[G3, G4]))));
+    let quiet = &o.days[3];
+    assert_eq!((quiet.issues_closed, quiet.prs_merged), (0, 0));
+    assert_eq!(quiet.spend_usd, 0.0, "a day with nothing is still a point");
 
     assert!(close(o.unlinked_usd, usd(&db, &sessions(&[G4]))));
     assert_eq!(o.unlinked_workstreams, 1);
@@ -458,7 +473,73 @@ fn a_closed_issue_counts_in_its_close_week_at_its_whole_life_cost() {
 
     // Closed on 10-06: a range that ends before it has no closed issue.
     let before = performance(&db, &filter("2026-10-01", "2026-10-05", &[])).expect("read");
-    assert!(before.outcome.weeks.iter().all(|w| w.issues_closed == 0));
+    assert!(before.outcome.days.iter().all(|d| d.issues_closed == 0));
+}
+
+#[test]
+fn outcome_has_one_point_per_calendar_day_of_any_range_across_dst() {
+    let t = Temp::new("outcome-days");
+    let db = built(&t);
+    drop(Store::open_in(t.db(), "America/Toronto").expect("reopen in Toronto"));
+    let days = |from: &str, to: &str| -> Vec<String> {
+        let o = performance(&db, &filter(from, to, &[]))
+            .expect("read")
+            .outcome;
+        o.days.into_iter().map(|d| d.day).collect()
+    };
+    // The store is in Toronto, whose clocks go back on 2026-11-01 (a 25 h
+    // day) and forward on 2026-03-08 (23 h): each is one day, in order,
+    // whatever its length.
+    assert_eq!(
+        days("2026-10-30", "2026-11-03"),
+        [
+            "2026-10-30",
+            "2026-10-31",
+            "2026-11-01",
+            "2026-11-02",
+            "2026-11-03"
+        ]
+    );
+    assert_eq!(
+        days("2026-03-07", "2026-03-09"),
+        ["2026-03-07", "2026-03-08", "2026-03-09"]
+    );
+    // Issue #1 closes, and its PR merges, at 23:30 local on the last
+    // hour-repeating day (04:30Z the next UTC day), then on the 23 h day.
+    let close_at = |iso: &str| {
+        db.execute(
+            "UPDATE gh_issues SET closed_at = ?1 WHERE repo = 'perf' AND number = 1",
+            [iso],
+        )
+        .expect("close");
+        db.execute(
+            "UPDATE gh_prs SET merged_at = ?1 WHERE repo = 'perf' AND issue = 1",
+            [iso],
+        )
+        .expect("merge");
+    };
+    let closed_on = |from: &str, to: &str| -> Vec<(String, i64, i64)> {
+        let o = performance(&db, &filter(from, to, &[]))
+            .expect("read")
+            .outcome;
+        let on = |d: &strate_core::store::views::OutcomeDay| {
+            (d.day.clone(), d.issues_closed, d.prs_merged)
+        };
+        o.days.iter().map(on).filter(|d| d.1 + d.2 > 0).collect()
+    };
+    close_at("2026-11-02T04:30:00.000Z");
+    assert_eq!(
+        closed_on("2026-10-30", "2026-11-03"),
+        [("2026-11-01".to_string(), 1, 1)]
+    );
+    close_at("2026-03-09T03:30:00.000Z");
+    assert_eq!(
+        closed_on("2026-03-07", "2026-03-09"),
+        [("2026-03-08".to_string(), 1, 1)]
+    );
+    assert_eq!(days("2026-10-13", "2026-10-13"), ["2026-10-13"]);
+    assert_eq!(days("2026-09-14", "2026-10-13").len(), 30);
+    assert!(days("2026-10-13", "2026-10-12").is_empty());
 }
 
 #[test]
@@ -626,7 +707,7 @@ fn the_repo_filter_applies_to_every_section() {
         (0.0, 0)
     );
     assert!(close(
-        p.outcome.weeks[1].spend_usd,
+        p.outcome.days[7].spend_usd,
         usd(&db, &sessions(&[G3]))
     ));
     assert!(
@@ -641,9 +722,9 @@ fn the_repo_filter_applies_to_every_section() {
     let none = read(&db, &["other"]);
     assert!(
         none.outcome
-            .weeks
+            .days
             .iter()
-            .all(|w| w.spend_usd == 0.0 && w.issues_closed == 0)
+            .all(|d| d.spend_usd == 0.0 && d.issues_closed == 0)
     );
     assert_eq!((none.outcome.open_issues, none.outcome.open_usd), (0, 0.0));
     assert!(none.agents.is_empty() && none.bottleneck.days.is_empty());
@@ -667,7 +748,7 @@ fn performance_serializes_in_camel_case_and_a_bad_day_is_an_error() {
     );
     assert_eq!(json["bottleneck"]["days"][0]["permissionMs"], 0);
     assert_eq!(json["bottleneck"]["days"][0]["permissionPrompts"], 0);
-    assert!(json["outcome"]["weeks"][0]["usdPerClosedIssue"].is_number());
+    assert!(json["outcome"]["days"][0]["usdPerClosedIssue"].is_number());
     assert_eq!(json["waste"]["noReportTop"]["agentType"], "implementer");
     assert!(json["agents"][1]["cacheHitPct"].is_number());
     assert_eq!(json["waste"]["contextPeaksOver80"], 1);

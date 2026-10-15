@@ -65,7 +65,7 @@ use super::Result;
 use cells::Cells;
 use gh::Gh;
 pub use performance::{
-    AgentRow, Bottleneck, BottleneckDay, LaneCount, Outcome, OutcomeWeek, Peak, Performance,
+    AgentRow, Bottleneck, BottleneckDay, LaneCount, Outcome, OutcomeDay, Peak, Performance,
     PermissionWaits, Waste, performance,
 };
 pub use timeline::{SpanKind, TimelineDay, TimelineMark, TimelineSpan, audit_timeline};

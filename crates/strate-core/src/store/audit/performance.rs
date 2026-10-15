@@ -2,8 +2,8 @@
 //! and GitHub cache [`super::audit`] reads, under the same filter (local
 //! days, repos).
 //!
-//! - Outcome: per local ISO week of the range, the issues closed as
-//!   completed and the PRs merged in it, each at its whole-life $ and
+//! - Outcome: per local day of the range, every day, the issues closed as
+//!   completed and the PRs merged on it, each at its whole-life $ and
 //!   orchestrator active time (all its `<repo>-<issue>` work, in the range
 //!   or not), plus the range's spend with no outcome yet.
 //! - Agents: per agent type and model, each dispatch with a cell in the
@@ -58,8 +58,8 @@ pub struct Performance {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Outcome {
-    /// Every ISO week the range touches, in order.
-    pub weeks: Vec<OutcomeWeek>,
+    /// Every local day of the range, in order, the quiet ones too.
+    pub days: Vec<OutcomeDay>,
     /// The range's $ in windows with no `<repo>-<issue>` name.
     pub unlinked_usd: f64,
     pub unlinked_workstreams: i64,
@@ -68,15 +68,13 @@ pub struct Outcome {
     pub open_issues: i64,
 }
 
-/// One ISO week: the issues closed as completed and the PRs merged in it,
-/// inside the range, each at its whole-life cost.
+/// One local day: the issues closed as completed and the PRs merged on it,
+/// each at its whole-life cost.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OutcomeWeek {
-    /// Its Monday, `YYYY-MM-DD`.
-    pub week: String,
-    /// Its days inside the range: fewer than 7 at either end.
-    pub days: i64,
+pub struct OutcomeDay {
+    /// `YYYY-MM-DD`.
+    pub day: String,
     pub issues_closed: i64,
     pub usd_per_closed_issue: Option<f64>,
     /// Orchestrator active time, not subagent time.
@@ -84,7 +82,7 @@ pub struct OutcomeWeek {
     /// With linked work; a PR closing several issues counts once.
     pub prs_merged: i64,
     pub usd_per_merged_pr: Option<f64>,
-    /// Everything spent on its days in the range.
+    /// Everything spent on it.
     pub spend_usd: f64,
 }
 
@@ -266,27 +264,12 @@ impl Range {
         (self.from.as_str()..=self.to.as_str()).contains(&day)
     }
 
-    /// Each ISO week the range touches: its Monday and its days in range.
-    fn weeks(&self) -> Vec<(Date, i64)> {
-        monday(self.first)
-            .series(1.week())
-            .take_while(|m| *m <= self.last)
-            .map(|m| {
-                let days = m
-                    .series(1.day())
-                    .take(7)
-                    .filter(|d| (self.first..=self.last).contains(d))
-                    .count();
-                (m, days as i64)
-            })
-            .collect()
+    /// Every calendar day of the range, in order: a civil date is a wall-clock
+    /// day, so a DST day of 23 or 25 hours is still one.
+    fn days(&self) -> impl Iterator<Item = Date> {
+        let last = self.last;
+        self.first.series(1.day()).take_while(move |d| *d <= last)
     }
-}
-
-/// The Monday of `day`'s ISO week.
-fn monday(day: Date) -> Date {
-    let back = i64::from(day.weekday().to_monday_zero_offset());
-    day.checked_sub(back.days()).unwrap_or(day)
 }
 
 /// The store's newest record time: the clock "running" is judged by.
@@ -490,28 +473,28 @@ impl Read<'_> {
                     .0 += usd;
             }
         }
-        let mut weeks: BTreeMap<Date, Week> = BTreeMap::new();
+        let mut days: BTreeMap<Date, Day> = BTreeMap::new();
         for (&(repo, number), &life) in &issues {
             let closed = self
                 .gh
                 .issue(repo, number)
                 .filter(|i| i.completed)
                 .and_then(|i| i.closed.flatten());
-            if let Some(w) = week(&mut weeks, closed.and_then(|at| self.day_in_range(at))) {
-                w.closed.push(life);
+            if let Some(d) = day(&mut days, closed.and_then(|at| self.day_in_range(at))) {
+                d.closed.push(life);
             }
         }
         for &(usd, merged_at) in prs.values() {
-            if let Some(w) = week(&mut weeks, merged_at.and_then(|at| self.day_in_range(at))) {
-                w.merged.push(usd);
+            if let Some(d) = day(&mut days, merged_at.and_then(|at| self.day_in_range(at))) {
+                d.merged.push(usd);
             }
         }
         let (mut unlinked_usd, mut unlinked) = (0.0, HashSet::new());
         let (mut open_usd, mut open) = (0.0, HashSet::new());
         for cell in in_range {
             let usd = cell.share.cost_usd.unwrap_or(0.0);
-            if let Some(w) = week(&mut weeks, Some(cell.day.clone())) {
-                w.spend += usd;
+            if let Some(d) = day(&mut days, Some(cell.day.clone())) {
+                d.spend += usd;
             }
             let window = cells.window(cell);
             match &window.place {
@@ -532,11 +515,10 @@ impl Read<'_> {
             }
         }
         Outcome {
-            weeks: self
+            days: self
                 .range
-                .weeks()
-                .into_iter()
-                .map(|(m, days)| weeks.remove(&m).unwrap_or_default().row(m, days))
+                .days()
+                .map(|d| days.remove(&d).unwrap_or_default().row(d))
                 .collect(),
             unlinked_usd,
             unlinked_workstreams: unlinked.len() as i64,
@@ -920,10 +902,9 @@ impl Read<'_> {
     }
 }
 
-/// The week of local day `day` (`YYYY-MM-DD`), by its Monday.
-fn week(weeks: &mut BTreeMap<Date, Week>, day: Option<String>) -> Option<&mut Week> {
-    let monday = monday(day?.parse::<Date>().ok()?);
-    Some(weeks.entry(monday).or_default())
+/// The entry of local day `day` (`YYYY-MM-DD`).
+fn day(days: &mut BTreeMap<Date, Day>, day: Option<String>) -> Option<&mut Day> {
+    Some(days.entry(day?.parse::<Date>().ok()?).or_default())
 }
 
 /// A bottleneck row's key: by day, then repo with Unlinked last.
@@ -948,24 +929,23 @@ fn day_row<'a>(
         })
 }
 
-/// One week's closed issues (whole-life $, active ms), merged PRs' $ and
-/// spend in the range.
+/// One day's closed issues (whole-life $, active ms), merged PRs' $ and
+/// spend.
 #[derive(Default)]
-struct Week {
+struct Day {
     closed: Vec<(f64, i64)>,
     merged: Vec<f64>,
     spend: f64,
 }
 
-impl Week {
-    fn row(self, monday: Date, days: i64) -> OutcomeWeek {
+impl Day {
+    fn row(self, date: Date) -> OutcomeDay {
         let mean = |xs: &[f64]| (!xs.is_empty()).then(|| xs.iter().sum::<f64>() / xs.len() as f64);
         let usd: Vec<f64> = self.closed.iter().map(|c| c.0).collect();
         let n = self.closed.len() as i64;
         let active: i64 = self.closed.iter().map(|c| c.1).sum();
-        OutcomeWeek {
-            week: monday.to_string(),
-            days,
+        OutcomeDay {
+            day: date.to_string(),
             issues_closed: n,
             usd_per_closed_issue: mean(&usd),
             active_ms_per_closed_issue: (n > 0).then(|| active / n),
