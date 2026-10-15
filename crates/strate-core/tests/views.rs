@@ -311,11 +311,12 @@ fn the_live_graph_is_the_live_session_only_with_states_and_context() {
     assert_eq!(graph.session_id, "s-alpha");
     assert!(graph.live);
     let ids: Vec<Option<&str>> = graph.agents.iter().map(|a| a.agent_id.as_deref()).collect();
-    // Never s-old's orchestrator or a0.
-    assert_eq!(ids, [None, Some("a1"), Some("a2")]);
+    // Never s-old's orchestrator or a0. a1's dispatch has its tool_result:
+    // a done worker is left to the Audit (#81).
+    assert_eq!(ids, [None, Some("a2")]);
 
-    let [orchestrator, a1, a2]: &[GraphAgent; 3] =
-        graph.agents.as_slice().try_into().expect("three agents");
+    let [orchestrator, a2]: &[GraphAgent; 2] =
+        graph.agents.as_slice().try_into().expect("two agents");
     assert_eq!(orchestrator.kind, "orchestrator");
     assert_eq!(orchestrator.name.as_deref(), Some("alpha-1"));
     assert_eq!(orchestrator.state, AgentState::Working);
@@ -334,28 +335,20 @@ fn the_live_graph_is_the_live_session_only_with_states_and_context() {
     );
     assert_eq!(graph.run_ms, Some(40_000));
 
-    // a1's dispatch has its tool_result; a2 asked for permission.
-    assert_eq!(a1.state, AgentState::Done);
+    // a2 asked for permission.
     assert_eq!(a2.state, AgentState::NeedsYou);
-    assert_eq!(a1.agent_type.as_deref(), Some("implementer"));
-    assert_eq!(a1.description.as_deref(), Some("Lorem a1"));
-    assert_eq!(a1.parent, Some(orchestrator.id));
+    assert_eq!(a2.agent_type.as_deref(), Some("implementer"));
+    assert_eq!(a2.description.as_deref(), Some("Lorem a2"));
+    assert_eq!(a2.parent, Some(orchestrator.id));
     assert!(close(a2.context_pct, 1.0));
 
     assert_eq!(
         graph.edges,
-        [
-            GraphEdge {
-                kind: "dispatch".into(),
-                parent: orchestrator.id,
-                child: a1.id,
-            },
-            GraphEdge {
-                kind: "dispatch".into(),
-                parent: orchestrator.id,
-                child: a2.id,
-            },
-        ]
+        [GraphEdge {
+            kind: "dispatch".into(),
+            parent: orchestrator.id,
+            child: a2.id,
+        }]
     );
 }
 
@@ -364,6 +357,13 @@ fn the_live_graph_carries_each_agents_resolved_context_thresholds() {
     let temp = Temp::new("live-graph-gear");
     let (mut store, reader) = temp.open();
     fill(&mut store);
+    // a3, a running sibling of a2.
+    store
+        .ingest_graph(&Graph {
+            subagents: vec![dispatched("s-alpha", "a3", "toolu_3")],
+            ..Graph::default()
+        })
+        .expect("a3");
     let rows = views::workstreams(&reader).expect("workstreams");
     let alpha = by_name(&rows, "alpha-1").id;
     let thresholds = |reader: &Connection| -> Vec<(u8, u8)> {
@@ -376,7 +376,8 @@ fn the_live_graph_carries_each_agents_resolved_context_thresholds() {
             .collect()
     };
 
-    // Orchestrator, a1, a2: the built-in 80 / 95.
+    // The orchestrator, a2 and a3 (a1 is done, so not drawn): the built-in
+    // 80 / 95.
     assert_eq!(thresholds(&reader), [(80, 95); 3]);
 
     // The orchestrator's row is the session default every agent inherits.
@@ -390,13 +391,13 @@ fn the_live_graph_carries_each_agents_resolved_context_thresholds() {
         .expect("defaults");
     assert_eq!(thresholds(&reader), [(70, 90); 3]);
 
-    // a1's own row wins per field; a2 keeps inheriting.
+    // a2's own row wins per field; a3 keeps inheriting.
     let over = Gear {
         hard_stop_pct: Some(85),
         ..Gear::default()
     };
     store
-        .set_gear("s-alpha", Some("a1"), &over)
+        .set_gear("s-alpha", Some("a2"), &over)
         .expect("override");
     assert_eq!(thresholds(&reader), [(70, 90), (70, 85), (70, 90)]);
 
@@ -446,11 +447,14 @@ fn a_workstream_with_no_live_session_draws_its_latest_session_as_done() {
         .expect("query")
         .expect("a graph");
     assert!(!graph.live);
-    assert!(
-        graph.agents.iter().all(|a| a.state == AgentState::Done),
-        "{:?}",
-        graph.agents
-    );
+    // Its workers read done, so only the orchestrator is drawn.
+    let drawn: Vec<(Option<&str>, AgentState)> = graph
+        .agents
+        .iter()
+        .map(|a| (a.agent_id.as_deref(), a.state))
+        .collect();
+    assert_eq!(drawn, [(None, AgentState::Done)]);
+    assert!(graph.edges.is_empty());
 }
 
 #[test]

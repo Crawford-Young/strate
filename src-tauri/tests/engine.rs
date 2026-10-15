@@ -181,7 +181,9 @@ fn a_subagent_dispatched_after_catch_up_gets_its_edge() {
     let temp = Temp::new("late-subagent");
     temp.write("s-alpha.jsonl", &session_lines());
     let (_changes, on_change) = counter();
-    let engine = Engine::start(temp.config(None, None), on_change).expect("start");
+    // s-alpha is live, so a2 (never answered) works and is drawn (#81).
+    let runs = Arc::new(AtomicUsize::new(0));
+    let engine = Engine::start(temp.config(Some(registry(runs)), None), on_change).expect("start");
     let progress = engine.progress();
     wait_for("live", || progress.status() == Status::Live);
 

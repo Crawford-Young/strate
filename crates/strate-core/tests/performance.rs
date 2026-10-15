@@ -279,8 +279,9 @@ fn opening_a_store_from_an_older_rollup_version_backfills_every_column() {
     );
 }
 
-/// Each dispatch's state on perf-1's canvas, in `B` order.
-fn states(reader: &Connection) -> Vec<AgentState> {
+/// Each dispatch's state on perf-1's canvas, in `B` order: `None` once
+/// done, as the canvas leaves a finished worker to the Audit (#81).
+fn states(reader: &Connection) -> Vec<Option<AgentState>> {
     let rows = views::workstreams(reader).expect("workstreams");
     let perf1 = rows.iter().find(|w| w.name == "perf-1").expect("perf-1");
     let graph = views::live_graph(reader, perf1.id)
@@ -292,15 +293,16 @@ fn states(reader: &Connection) -> Vec<AgentState> {
             let agent = graph
                 .agents
                 .iter()
-                .find(|a| a.agent_id.as_deref() == Some(b));
-            agent.unwrap_or_else(|| panic!("{b} not drawn")).state
+                .find(|a| a.agent_id.as_deref() == Some(b))?;
+            assert_ne!(agent.state, AgentState::Done, "{b} drawn done");
+            Some(agent.state)
         })
         .collect()
 }
 
 #[test]
 fn a_background_dispatch_works_from_its_launch_until_its_notification() {
-    use AgentState::{Done, Working};
+    const WORKING: Option<AgentState> = Some(AgentState::Working);
     let t = Temp::new("background");
     let mut store = Store::open_in(t.db(), "UTC").expect("open");
     store
@@ -325,11 +327,11 @@ fn a_background_dispatch_works_from_its_launch_until_its_notification() {
 
     // The title, the prompt, b1's dispatch and its immediate launch result.
     store.ingest(&lines(&main, 0..4)).expect("launch");
-    assert_eq!(states(&reader)[0], Working, "a launch result is no answer");
+    assert_eq!(states(&reader)[0], WORKING, "a launch result is no answer");
     // b1's transcript grows: its task, then two requests.
     for n in 0..3 {
         store.ingest(&lines(&b1, n..n + 1)).expect("b1 grows");
-        assert_eq!(states(&reader)[0], Working, "b1 record {n}");
+        assert_eq!(states(&reader)[0], WORKING, "b1 record {n}");
     }
     // The other launches, then every notification: b6 is never notified.
     store
@@ -337,7 +339,7 @@ fn a_background_dispatch_works_from_its_launch_until_its_notification() {
         .expect("notifications");
     assert_eq!(
         states(&reader),
-        [Done, Done, Done, Done, Done, Working],
+        [None, None, None, None, None, WORKING],
         "a notification of any status ends a dispatch"
     );
     // b6's SubagentStop hook ends it too.
@@ -351,7 +353,7 @@ fn a_background_dispatch_works_from_its_launch_until_its_notification() {
             },
         })
         .expect("stop");
-    assert_eq!(states(&reader), [Done; 6]);
+    assert_eq!(states(&reader), [None; 6]);
 }
 
 /// The store built from every transcript, with `perf`'s GitHub cache

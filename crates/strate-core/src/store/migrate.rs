@@ -18,6 +18,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
     include_str!("0013_latest_links.sql"),
     include_str!("0014_drop_registry_copies.sql"),
     include_str!("0015_workstream_costs.sql"),
+    include_str!("0016_teammate_parents.sql"),
 ];
 
 /// Applies every migration past the db's `user_version`, each in its own
@@ -101,6 +102,35 @@ mod tests {
         let err = migrate(&mut conn, &[M1]).expect_err("v2 db, v1 build");
         assert!(err.to_string().contains("newer"), "{err}");
         assert_eq!(version(&conn), 2);
+    }
+
+    #[test]
+    fn v16_hangs_a_leadless_teammate_under_its_sessions_orchestrator() {
+        let mut conn = Connection::open_in_memory().expect("db");
+        migrate(&mut conn, &MIGRATIONS[..15]).expect("v15");
+        // Teammates 3 and 4 have no stored lead; 5's lead is s1's
+        // orchestrator; 6 is a subagent with no edge.
+        conn.execute_batch(
+            "INSERT INTO sessions (session_id) VALUES ('s1'), ('s2');
+             INSERT INTO agents (id, session_id, agent_id, kind) VALUES
+                 (1, 's1', NULL, 'orchestrator'), (2, 's2', NULL, 'orchestrator'),
+                 (3, 's2', 'm1', 'teammate'), (4, 's1', 'm2', 'teammate'),
+                 (5, 's2', 'm3', 'teammate'), (6, 's2', 'w1', 'subagent');
+             INSERT INTO edges (kind, parent, child, team_name, team_dir) VALUES
+                 ('teammate', NULL, 3, 'session-x', 'session-x'),
+                 ('teammate', NULL, 4, 'session-y', NULL),
+                 ('teammate', 1, 5, 'session-z', 'session-z');",
+        )
+        .expect("v15 rows");
+        migrate(&mut conn, MIGRATIONS).expect("v16");
+        let parents: Vec<(i64, Option<i64>)> = conn
+            .prepare("SELECT child, parent FROM edges ORDER BY child")
+            .expect("edges")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("rows")
+            .collect::<rusqlite::Result<_>>()
+            .expect("parents");
+        assert_eq!(parents, [(3, Some(2)), (4, Some(1)), (5, Some(1))]);
     }
 
     #[test]

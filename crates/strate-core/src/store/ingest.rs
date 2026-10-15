@@ -444,19 +444,32 @@ pub(super) fn graph(conn: &Connection, g: &Graph) -> Result<()> {
                     .iter()
                     .find(|t| Some(&t.dir_name) == team_dir.as_ref())
                     .and_then(|t| t.lead_session_id.as_deref());
-                let parent = match lead {
+                let lead = match lead {
                     Some(session_id) => agent_row(conn, session_id, None)?,
                     None => None,
                 };
                 edge(
                     conn,
                     "teammate",
-                    parent,
+                    lead,
                     child,
                     None,
                     Some(team_name),
                     team_dir.as_deref(),
                 )?;
+                // A lead that doesn't resolve (a team config gone, or naming
+                // a session with no transcript, #81), and none stored: the
+                // orchestrator of the session whose subagents/ the
+                // teammate's transcript is in. A lead resolved later
+                // replaces it.
+                if lead.is_none() {
+                    let fallback = agent_row(conn, &sub.session_id, None)?;
+                    conn.prepare_cached(
+                        "UPDATE edges SET parent = ?2
+                         WHERE kind = 'teammate' AND child = ?1 AND parent IS NULL",
+                    )?
+                    .execute(params![child, fallback])?;
+                }
             }
             Link::Unresolved(why) => {
                 let why = match why {
