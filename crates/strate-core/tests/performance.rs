@@ -41,48 +41,17 @@ const B: [&str; 6] = [
     "a6000000000000006",
 ];
 
-/// A temp dir removed on drop.
-struct Temp(PathBuf);
+mod common;
 
-impl Temp {
-    fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("strate-perf-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("temp dir");
-        Self(dir)
-    }
-
-    fn db(&self) -> PathBuf {
-        self.0.join("strate.db")
-    }
-}
-
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+use common::{Temp, fixture_home, records, transcripts as transcripts_in};
 
 fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/perf-home")
+    fixture_home("perf-home")
 }
 
 /// Every transcript under `root/projects`, sorted: the orchestrator first.
 fn transcripts() -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in fs::read_dir(dir).expect("readable dir") {
-            let path = entry.expect("entry").path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|e| e == "jsonl") {
-                out.push(path);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(&root().join("projects"), &mut out);
-    out.sort();
-    out
+    transcripts_in(&root())
 }
 
 /// The whole of `path` as one batch, each line a record at its byte offset.
@@ -93,26 +62,12 @@ fn batch(path: &Path) -> Batch {
 /// Lines `range` of `path` as one batch, each a record at its byte offset,
 /// checkpointed at the end of the last: a transcript as it grows.
 fn lines(path: &Path, range: Range<usize>) -> Batch {
-    let text = fs::read_to_string(path).expect("read");
-    let path: Arc<Path> = path.into();
-    let (mut offset, mut end) = (0u64, 0u64);
-    let mut events = Vec::new();
-    for (n, line) in text.split_inclusive('\n').enumerate() {
-        if range.contains(&n) {
-            events.push(TailEvent::Record {
-                path: path.clone(),
-                offset,
-                value: serde_json::from_str(line).expect("fixture line is json"),
-            });
-            end = offset + line.len() as u64;
-        }
-        offset += line.len() as u64;
-    }
+    let (events, ends): (Vec<_>, Vec<_>) = records(path, range).into_iter().unzip();
     Batch {
-        path,
+        path: path.into(),
         events,
         checkpoint: Some(Checkpoint {
-            offset: end,
+            offset: ends.last().copied().unwrap_or(0),
             identity: FileIdentity {
                 volume: 0,
                 index: 0,
