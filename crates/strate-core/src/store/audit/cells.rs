@@ -208,7 +208,8 @@ pub(crate) fn day(s: &str) -> Result<&str> {
     }
 }
 
-/// Where a window's work belongs.
+/// Where a window's work belongs: its Session row's place.
+#[derive(Clone)]
 pub(crate) enum Place {
     Unlinked,
     Linked {
@@ -248,6 +249,8 @@ struct Windows {
     /// Per Session row, the director's window it nests under (see
     /// [`launched_from`]); `None` while it resolves.
     directors: HashMap<String, Option<usize>>,
+    /// Per Session row, its place (see [`Windows::row_place`]).
+    places: HashMap<String, Place>,
 }
 
 impl Windows {
@@ -290,12 +293,18 @@ impl Windows {
         let end = named.next.or(session.last);
         let unit = segment.and(named.workstream);
         let chain = session.chain.clone();
+        let (row, place) = match unit {
+            Some(workstream) => {
+                let row = format!("{chain}/{workstream}");
+                let place = self.row_place(conn, gh, &row, parsed.as_ref(), &chain, workstream)?;
+                (row, place)
+            }
+            // No window: a fallback name, so Unlinked.
+            None => (format!("session:{session_id}"), Place::Unlinked),
+        };
         self.list.push(Window {
-            row: match unit {
-                Some(workstream) => format!("{chain}/{workstream}"),
-                None => format!("session:{session_id}"),
-            },
-            place: place(gh, parsed.as_ref(), &session.links),
+            row: row.clone(),
+            place,
             repo: parsed.as_ref().map(|p| p.repo.clone()),
             rotation: parsed.is_some_and(|p| p.rotation.is_some()),
             label: named.name,
@@ -303,20 +312,59 @@ impl Windows {
         });
         let at = self.list.len() - 1;
         self.index.insert(key, at);
-        let row = self.list[at].row.clone();
-        if let Some(workstream) = unit
-            && !self.directors.contains_key(&row)
-        {
-            self.directors.insert(row.clone(), None);
-            let director = match launched_from(conn, &chain, workstream)? {
-                Some((parent, segment)) => Some(self.get(conn, gh, &parent, segment)?),
-                None => None,
-            };
-            // Rows that direct each other: the one resolved first stays on top.
-            let director = director.filter(|&d| self.up(d).all(|w| w.row != row));
-            self.directors.insert(row, director);
+        if let Some(workstream) = unit {
+            self.resolve_director(conn, gh, &row, &chain, workstream)?;
         }
         Ok(at)
+    }
+
+    /// The place of Session row `row` (`chain`'s windows in `workstream`,
+    /// all named `parsed`), read once per row: every window of a row sits
+    /// in one place, so a row never splits into two nodes with one key. Its
+    /// PR is the one the newest `github_links` entry of any of those
+    /// sessions names (see [`row_links`]), whichever window's transcript
+    /// holds the link.
+    fn row_place(
+        &mut self,
+        conn: &Connection,
+        gh: &Gh,
+        row: &str,
+        parsed: Option<&ParsedName>,
+        chain: &str,
+        workstream: i64,
+    ) -> Result<Place> {
+        if let Some(found) = self.places.get(row) {
+            return Ok(found.clone());
+        }
+        let found = place(gh, parsed, &row_links(conn, chain, workstream)?);
+        self.places.insert(row.to_string(), found.clone());
+        Ok(found)
+    }
+
+    /// Records the director's window Session row `row` (`chain`'s windows
+    /// in `workstream`) nests under (see [`launched_from`]), once per row.
+    /// The row is marked `None` while its director resolves, so a director
+    /// chain that leads back to it ends there.
+    fn resolve_director(
+        &mut self,
+        conn: &Connection,
+        gh: &Gh,
+        row: &str,
+        chain: &str,
+        workstream: i64,
+    ) -> Result<()> {
+        if self.directors.contains_key(row) {
+            return Ok(());
+        }
+        self.directors.insert(row.to_string(), None);
+        let director = match launched_from(conn, chain, workstream)? {
+            Some((parent, segment)) => Some(self.get(conn, gh, &parent, segment)?),
+            None => None,
+        };
+        // Rows that direct each other: the one resolved first stays on top.
+        let director = director.filter(|&d| self.up(d).all(|w| w.row != row));
+        self.directors.insert(row.to_string(), director);
+        Ok(())
     }
 
     /// Window `at`, then the director's window its row nests under, and up.
@@ -373,8 +421,6 @@ fn launched_from(
 struct Session {
     /// Its process root, else its id: what its `/clear` chain shares.
     chain: String,
-    /// Its `github_links`, newest first.
-    links: Vec<PrLink>,
     /// Its first record.
     start: Option<i64>,
     /// Its last activity: the latest record its timeline counts.
@@ -399,27 +445,36 @@ const SESSION_SQL: &str = "SELECT
           WHERE session_id = ?1 AND timestamp IS NOT NULL
             AND ifnull(type, '') NOT IN ('custom-title', 'ai-title', 'cost-state'))";
 
+/// The `github_links` of every session of `chain` with a window in
+/// `workstream` (a Session row's sessions), newest first: the latest
+/// session's first, each session's in link order, newest first.
+fn row_links(conn: &Connection, chain: &str, workstream: i64) -> Result<Vec<PrLink>> {
+    conn.prepare_cached(
+        "SELECT l.pr_url, l.pr_number, l.pr_repository
+         FROM github_links AS l JOIN sessions AS s ON s.session_id = l.session_id
+         WHERE ifnull(s.process_root, s.session_id) = ?1
+           AND EXISTS (SELECT 1 FROM segments AS g
+               JOIN workstream_roots AS r ON r.id = g.workstream_id
+               WHERE g.session_id = s.session_id AND r.root = ?2)
+         ORDER BY s.started_at IS NULL, s.started_at DESC, s.session_id DESC, l.id DESC",
+    )?
+    .query_map(rusqlite::params![chain, workstream], |r| {
+        Ok(PrLink {
+            url: r.get(0)?,
+            number: r.get(1)?,
+            repository: r.get(2)?,
+        })
+    })?
+    .collect()
+}
+
 impl Session {
     fn load(conn: &Connection, session_id: &str) -> Result<Self> {
-        let links = conn
-            .prepare_cached(
-                "SELECT pr_url, pr_number, pr_repository FROM github_links
-                 WHERE session_id = ?1 ORDER BY id DESC",
-            )?
-            .query_map([session_id], |r| {
-                Ok(PrLink {
-                    url: r.get(0)?,
-                    number: r.get(1)?,
-                    repository: r.get(2)?,
-                })
-            })?
-            .collect::<Result<_>>()?;
         let (chain, start, last): (Option<String>, Option<String>, Option<String>) = conn
             .prepare_cached(SESSION_SQL)?
             .query_row([session_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok(Self {
             chain: chain.unwrap_or_else(|| session_id.to_string()),
-            links,
             start: start.as_deref().and_then(parse_timestamp),
             last: last.as_deref().and_then(parse_timestamp),
         })
@@ -491,8 +546,8 @@ impl Named {
 }
 
 /// Where a window named `parsed` belongs: under its repo and issue, and
-/// under the PR the session links (else the issue's only PR) when the
-/// GitHub cache holds the issue. Only a name that doesn't parse is Unlinked.
+/// under the PR its row links (else the issue's only PR) when the GitHub
+/// cache holds the issue. Only a name that doesn't parse is Unlinked.
 fn place(gh: &Gh, parsed: Option<&ParsedName>, links: &[PrLink]) -> Place {
     let Some(p) = parsed else {
         return Place::Unlinked;
@@ -510,7 +565,7 @@ fn place(gh: &Gh, parsed: Option<&ParsedName>, links: &[PrLink]) -> Place {
     }
 }
 
-/// The newest of the session's links that names one of `prs`, by URL or by
+/// The newest of the row's links that names one of `prs`, by URL or by
 /// number in a repository named `repo`.
 fn linked_pr(prs: &[GhPr], links: &[PrLink], repo: &str) -> Option<i64> {
     links.iter().find_map(|link| {

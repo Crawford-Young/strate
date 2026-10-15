@@ -15,27 +15,32 @@
 //! session, per workstream (#63): the graph also draws the subagents and
 //! teammates of the drawn session's earlier links that have a segment in
 //! the workstream, those that joined one of its segments, marked
-//! [`GraphAgent::earlier`]. One that hung under its link's orchestrator
-//! hangs under the drawn one. A link renamed into another workstream reads
-//! there, never here: 35 of 62 continuation edges in a real store crossed
-//! workstreams, a process reused for the next ticket.
+//! [`GraphAgent::earlier`] (one with no segment reads in its link's current
+//! workstream, so in one graph only). One that hung under its link's
+//! orchestrator hangs under the drawn one. A link renamed into another
+//! workstream reads there, never here: 35 of 62 continuation edges in a
+//! real store crossed workstreams, a process reused for the next ticket.
 //!
 //! Director-launched units (#53, the `directs` table): a director's graph
 //! also draws every unit any of the workstream's sessions directed,
 //! finished ones too: per unit chain, its latest link in the unit's
-//! workstream with its earlier links' agents, as above. Each unit's
-//! orchestrator hangs under the drawn orchestrator by a `directs` edge, its
-//! states by its own session's liveness. A workstream nests under a
-//! director's tab ([`Workstream::director`]) when a link of its drawn
-//! session's chain with a segment in it was directed, and only while the
-//! director's workstream is live: one that has since drawn a session of
-//! another chain, one nobody directed, keeps its own tab, while the
-//! director's graph still draws the directed one. A director is always a
-//! top-level tab: a unit of a nested unit keeps its own tab, so no live
-//! session is hidden twice over. A nested tab's needs-you and state count
-//! toward its director's tab.
+//! workstream with its earlier links' agents in that workstream, as above.
+//! Each unit's orchestrator hangs under the drawn orchestrator by a
+//! `directs` edge, its states by its own session's liveness. An agent is
+//! drawn once: a link the graph draws as itself (the drawn session or a
+//! unit's latest link) is no other unit's earlier link, so its agents hang
+//! under its own orchestrator; past that, the first reading wins (the drawn
+//! chain, then the units in order). A workstream nests under a director's
+//! tab ([`Workstream::director`]) when any link of its drawn session's
+//! chain with a segment in it was directed by a session of a live
+//! workstream (the earliest such link's, if several): one that has since
+//! drawn a session of another chain, one nobody directed, keeps its own
+//! tab, while the director's graph still draws the directed one. A
+//! director is always a top-level tab: a unit of a nested unit keeps its
+//! own tab, so no live session is hidden twice over. A nested tab's
+//! needs-you and state count toward its director's tab.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
@@ -265,10 +270,12 @@ fn nest(candidates: impl IntoIterator<Item = (i64, i64)>) -> HashMap<i64, i64> {
         .collect()
 }
 
-/// Each workstream that nests under another: a link of its drawn session's
-/// chain with a segment in it (the earliest, if several) was directed
-/// (`directs`) by a session whose workstream is another, live one, itself
-/// nested under nothing ([`nest`]).
+/// Each workstream that nests under another: any link of its drawn
+/// session's chain with a segment in it was directed (`directs`) by a
+/// session whose workstream is another, live one, itself nested under
+/// nothing ([`nest`]). With several live directors, the earliest such
+/// link's (by start, then session id) is the one, as the Audit nests a row
+/// under its earliest directed link's director.
 fn directors(conn: &Connection, drawn: &HashMap<i64, Drawn>) -> Result<HashMap<i64, i64>> {
     let mut stmt = conn.prepare_cached(
         "SELECT r.root FROM sessions AS me
@@ -280,16 +287,14 @@ fn directors(conn: &Connection, drawn: &HashMap<i64, Drawn>) -> Result<HashMap<i
            AND EXISTS (SELECT 1 FROM segments AS g
                JOIN workstream_roots AS gr ON gr.id = g.workstream_id
                WHERE g.session_id = c.session_id AND gr.root = ?2)
-         ORDER BY c.started_at IS NULL, c.started_at, c.session_id
-         LIMIT 1",
+         ORDER BY c.started_at IS NULL, c.started_at, c.session_id",
     )?;
     let mut candidates = Vec::new();
     for (&root, shown) in drawn {
-        let director: Option<i64> = stmt
-            .query_row(rusqlite::params![shown.session_id, root], |r| r.get(0))
-            .optional()?;
-        if let Some(d) = director.filter(|d| *d != root && drawn.get(d).is_some_and(|x| x.live)) {
-            candidates.push((root, d));
+        let live_director = |d: &i64| *d != root && drawn.get(d).is_some_and(|x| x.live);
+        let mut found = stmt.query_map(rusqlite::params![shown.session_id, root], |r| r.get(0))?;
+        if let Some(d) = found.find(|d| d.as_ref().map_or(true, live_director)) {
+            candidates.push((root, d?));
         }
     }
     Ok(nest(candidates))
@@ -409,8 +414,13 @@ pub fn needs_you(conn: &Connection) -> Result<Vec<NeedsYou>> {
 type Row = (GraphAgent, Option<(i64, String)>);
 
 /// The agents of `session_id`, orchestrator first: with `root`, only the
-/// subagents and teammates that joined one of that workstream's segments
-/// (or none yet). Workers' states read `live` as their session's liveness.
+/// subagents and teammates that joined one of that workstream's segments.
+/// One with no segment is a drawn session's worker starting now, so it
+/// passes; an `earlier` link's has no window as evidence (its session was
+/// grouped before it started, or its window was dropped), so it reads in
+/// its session's current workstream, the one group.rs gives a worker with
+/// no record yet, and so in one graph only. Workers' states read `live` as
+/// their session's liveness; an `earlier` link's are marked so.
 ///
 /// A worker has finished once its dispatch is answered or its task
 /// notification arrives. A background dispatch's tool_result is the
@@ -420,6 +430,7 @@ fn session_agents(
     conn: &Connection,
     session_id: &str,
     root: Option<i64>,
+    earlier: bool,
     live: bool,
 ) -> Result<Vec<Row>> {
     let mut stmt = conn.prepare_cached(
@@ -442,12 +453,16 @@ fn session_agents(
          FROM agents AS a
          JOIN gear_effective AS ge ON ge.agent = a.id
          LEFT JOIN segments AS g ON g.id = a.segment_id
-         LEFT JOIN workstream_roots AS r ON r.id = g.workstream_id
+         LEFT JOIN sessions AS s ON s.session_id = a.session_id
+         LEFT JOIN workstream_roots AS r ON r.id = CASE
+             WHEN a.segment_id IS NOT NULL THEN g.workstream_id
+             WHEN ?3 THEN s.workstream_id END
          WHERE a.session_id = ?1
-           AND (?2 IS NULL OR a.agent_id IS NULL OR a.segment_id IS NULL OR r.root = ?2)
+           AND (?2 IS NULL OR a.agent_id IS NULL OR r.root = ?2
+               OR (NOT ?3 AND a.segment_id IS NULL))
          ORDER BY a.agent_id IS NOT NULL, a.id",
     )?;
-    let rows = stmt.query_map(rusqlite::params![session_id, root], |r| {
+    let rows = stmt.query_map(rusqlite::params![session_id, root, earlier], |r| {
         let agent_id: Option<String> = r.get(1)?;
         let needs: bool = r.get(12)?;
         let state = match agent_id {
@@ -478,7 +493,7 @@ fn session_agents(
                 nudge_pct: r.get(16)?,
                 hard_stop_pct: r.get(17)?,
                 parent: None,
-                earlier: false,
+                earlier,
             },
             edge,
         ))
@@ -562,27 +577,29 @@ fn earlier_links(conn: &Connection, session_id: &str, root: Option<i64>) -> Resu
 
 /// `session_id`'s agents as [`session_agents`] reads them with `root`,
 /// then the subagents and teammates of its earlier links in workstream
-/// `links` (see [`earlier_links`]), marked `earlier`. One that hangs under
-/// any link's orchestrator (a teammate's lead can be another link's)
-/// hangs under `session_id`'s.
+/// `links` (see [`earlier_links`]) that joined it, marked `earlier`. A link
+/// in `drawn_sessions` (the graph draws it as itself: the drawn session or
+/// a unit) is skipped, so its agents hang under their own orchestrator,
+/// once. One that hangs under any link's orchestrator (a teammate's lead
+/// can be another link's) hangs under `session_id`'s.
 fn chain_agents(
     conn: &Connection,
     session_id: &str,
     links: Option<i64>,
     root: Option<i64>,
     live: bool,
+    drawn_sessions: &[&str],
 ) -> Result<Vec<Row>> {
-    let mut rows = session_agents(conn, session_id, root, live)?;
+    let mut rows = session_agents(conn, session_id, root, false, live)?;
     let Some(head) = orchestrator(&rows) else {
         return Ok(rows);
     };
     for link in earlier_links(conn, session_id, links)? {
-        for (mut agent, edge) in session_agents(conn, &link, root, false)? {
-            if agent.agent_id.is_some() {
-                agent.earlier = true;
-                rows.push((agent, edge));
-            }
+        if drawn_sessions.contains(&link.as_str()) {
+            continue;
         }
+        let workers = session_agents(conn, &link, links, true, false)?;
+        rows.extend(workers.into_iter().filter(|(a, _)| a.agent_id.is_some()));
     }
     let leads: Vec<i64> = conn
         .prepare_cached(
@@ -644,11 +661,29 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
     };
     let live = shown.live;
     let (session_cost_usd, run_ms) = session_totals(conn, &shown.session_id, root)?;
-    let mut rows = chain_agents(conn, &shown.session_id, Some(root), Some(root), live)?;
+    let units = units(conn, root, &shown.session_id)?;
+    let drawn_sessions: Vec<&str> = std::iter::once(shown.session_id.as_str())
+        .chain(units.iter().map(|u| u.session_id.as_str()))
+        .collect();
+    let mut rows = chain_agents(
+        conn,
+        &shown.session_id,
+        Some(root),
+        Some(root),
+        live,
+        &drawn_sessions,
+    )?;
     let director = orchestrator(&rows);
-    for unit in units(conn, root, &shown.session_id)? {
-        for (agent, edge) in chain_agents(conn, &unit.session_id, unit.workstream, None, unit.live)?
-        {
+    for unit in &units {
+        let unit_rows = chain_agents(
+            conn,
+            &unit.session_id,
+            unit.workstream,
+            None,
+            unit.live,
+            &drawn_sessions,
+        )?;
+        for (agent, edge) in unit_rows {
             let edge = match (&agent.agent_id, director) {
                 (None, Some(d)) => Some((d, "directs".to_string())),
                 _ => edge,
@@ -656,6 +691,13 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
             rows.push((agent, edge));
         }
     }
+    // An agent is drawn once, where it is first read: the drawn chain, then
+    // each unit in order. Only an earlier link two units share can repeat
+    // past the workstream filters: a unit with no workstream (a directed
+    // session with no window yet, so ordered last) reads its chain's
+    // earlier links in every workstream.
+    let mut seen = HashSet::new();
+    rows.retain(|(a, _)| seen.insert(a.id));
     let drawn_ids: Vec<i64> = rows.iter().map(|(a, _)| a.id).collect();
     let mut agents = Vec::with_capacity(rows.len());
     let mut edges = Vec::new();
