@@ -528,17 +528,20 @@ struct Lines {
     started_in: BTreeMap<String, Option<i64>>,
 }
 
+/// A session's timed records, each agent's in transcript order, read from
+/// the `events_timeline` index alone (v12, #61). Title, cost-state and
+/// ai-title records are bookkeeping, not activity.
+const LINES_SQL: &str =
+    "SELECT agent_id, timestamp, type, request_key, tool_uses, tool_results, prompt
+     FROM events
+     WHERE session_id = ?1 AND timestamp IS NOT NULL
+       AND ifnull(type, '') NOT IN ('custom-title', 'ai-title', 'cost-state')
+     ORDER BY agent_id, byte_offset";
+
 impl Lines {
     fn load(conn: &Connection, session_id: &str) -> Result<Self> {
-        // Title, cost-state and ai-title records are bookkeeping, not activity.
         let mut timelines: BTreeMap<Option<String>, Vec<Timed>> = BTreeMap::new();
-        let mut stmt = conn.prepare_cached(
-            "SELECT agent_id, timestamp, type, request_key, tool_uses, tool_results, prompt
-             FROM events
-             WHERE session_id = ?1 AND timestamp IS NOT NULL
-               AND ifnull(type, '') NOT IN ('custom-title', 'ai-title', 'cost-state')
-             ORDER BY agent_id, byte_offset",
-        )?;
+        let mut stmt = conn.prepare_cached(LINES_SQL)?;
         let mut rows = stmt.query([session_id])?;
         while let Some(r) = rows.next()? {
             let at: String = r.get(1)?;
@@ -916,6 +919,34 @@ fn followups(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::Store;
+    use crate::tail::test_dir;
+
+    /// `events` rows carry their whole record inline and the timing columns
+    /// sit past it, so reading them from the rows reads every record: the
+    /// timeline's replay of a session reads the v12 index alone instead, in
+    /// its order (#61).
+    #[test]
+    fn a_sessions_replay_reads_its_index_alone() {
+        let dir = test_dir("replay-plan");
+        let db = dir.join("strate.db");
+        drop(Store::open(&db).expect("open"));
+        let conn = Store::open_reader(&db).expect("reader");
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {LINES_SQL}"))
+            .expect("plan")
+            .query_map([""], |r| r.get::<_, String>(3))
+            .expect("steps")
+            .collect::<Result<Vec<_>>>()
+            .expect("detail")
+            .join("\n");
+        assert_eq!(
+            plan,
+            "SEARCH events USING COVERING INDEX events_timeline (session_id=?)"
+        );
+        drop(conn);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
 
     #[test]
     fn a_request_record_carries_its_key_model_usage_cost_and_tools() {

@@ -14,6 +14,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
     include_str!("0009_directs.sql"),
     include_str!("0010_audit_indexes.sql"),
     include_str!("0011_permission_waits.sql"),
+    include_str!("0012_timeline_index.sql"),
 ];
 
 /// Applies every migration past the db's `user_version`, each in its own
