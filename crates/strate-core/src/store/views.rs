@@ -22,7 +22,10 @@
 //! session's orchestrator plus the session's subagents and teammates that
 //! joined one of the workstream's segments (or none yet) and still run,
 //! with dispatch and teammate edges among them. A worker that reads done is
-//! not drawn (#81): finished workers are the Audit's.
+//! not drawn (#81): finished workers are the Audit's. A teammate reads done
+//! while it rests (#83): its newest turn end, an idle notice in its lead's
+//! transcript or a TeammateIdle hook, is at or after its own last user or
+//! assistant record.
 //!
 //! A `/clear` chain (the sessions of one process root) reads as one
 //! session, per workstream (#63). An earlier link is never live, so its
@@ -63,6 +66,7 @@ pub use super::audit::{
     PermissionWaits, Progress, SpanKind, TimelineDay, TimelineMark, TimelineSpan, Tokens, Waste,
     audit, audit_timeline, performance,
 };
+use crate::time::parse_timestamp;
 
 /// An agent's state, as the canvas and tabs show it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -301,15 +305,117 @@ fn orchestrator_state(needs_you: bool, registry_state: Option<&str>) -> AgentSta
 }
 
 /// A subagent's or teammate's state: hooks first, then whether it finished
-/// (see [`session_agents`]) and whether its session is still live.
+/// or rests (see [`session_agents`]) and whether its session is still live.
+/// An idle hook is a turn end, which `finished` covers while no newer
+/// record woke the teammate.
 fn worker_state(needs_you: bool, hook: Option<&str>, finished: bool, live: bool) -> AgentState {
     match (needs_you, hook) {
         (true, _) => AgentState::NeedsYou,
         (_, Some("done")) => AgentState::Done,
         _ if finished || !live => AgentState::Done,
-        (_, Some("idle")) => AgentState::Idle,
         _ => AgentState::Working,
     }
+}
+
+/// Whether a teammate rests, which reads done (#83, user: "Idle = Done,
+/// hidden"): its newest turn end, an idle notice to its lead or a
+/// TeammateIdle hook, is at or after its own last user or assistant
+/// record. The record the lead's next message brings wakes it. A notice
+/// is matched by name alone, so it may be an earlier teammate's of that
+/// name: one before the teammate's first record (and so before its last)
+/// never counts, and with no record yet nothing does.
+fn rests(idle_ms: Option<i64>, last_record_ms: Option<i64>) -> bool {
+    matches!((idle_ms, last_record_ms), (Some(idle), Some(last)) if idle >= last)
+}
+
+/// The newest idle notice per teammate name in `session_id`'s own
+/// transcript, read from its stored records ([`IDLE_NOTICES_SQL`]).
+fn idle_notices(conn: &Connection, session_id: &str) -> Result<HashMap<String, i64>> {
+    let mut newest: HashMap<String, i64> = HashMap::new();
+    let mut stmt = conn.prepare_cached(IDLE_NOTICES_SQL)?;
+    for raw in stmt.query_map([session_id], |r| r.get::<_, String>(0))? {
+        let Ok(record) = serde_json::from_str(&raw?) else {
+            continue;
+        };
+        for (name, at) in notices_in(&record) {
+            let at_ms = newest.entry(name).or_insert(at);
+            *at_ms = (*at_ms).max(at);
+        }
+    }
+    Ok(newest)
+}
+
+/// [`idle_notices`]' query: the user records an orchestrator wrote that
+/// can hold one, by the `events_idle_notices` partial index. Named, since
+/// the planner would take `events_agent` and read every record's text.
+const IDLE_NOTICES_SQL: &str = "SELECT raw FROM events INDEXED BY events_idle_notices
+     WHERE session_id = ?1 AND type = 'user' AND agent_id IS NULL
+       AND instr(raw, 'idle_notification') > 0";
+
+const TEAMMATE_MESSAGE: &str = "<teammate-message";
+const TEAMMATE_MESSAGE_END: &str = "</teammate-message>";
+
+/// The sender and time of each idle notice in a lead's user record: a
+/// teammate-message in its text whose body, the JSON after the opening
+/// tag, is an `idle_notification`. The time is the body's own, stamped at
+/// the teammate's turn end; the record's is when the lead read it, which
+/// can be after the teammate was woken again.
+fn notices_in(record: &serde_json::Value) -> Vec<(String, i64)> {
+    let content = &record["message"]["content"];
+    let texts: Vec<&str> = match content.as_array() {
+        Some(blocks) => blocks
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .filter_map(|b| b["text"].as_str())
+            .collect(),
+        None => content.as_str().into_iter().collect(),
+    };
+    let mut out = Vec::new();
+    for text in texts {
+        let mut rest = text;
+        while let Some(at) = rest.find(TEAMMATE_MESSAGE) {
+            let Some(body) = after_tag(&rest[at + TEAMMATE_MESSAGE.len()..]) else {
+                break;
+            };
+            // A JSON body's text can hold anything, a closing tag included,
+            // so it ends where its JSON does. A plain message ends at its
+            // closing tag, and a notice quoted in it is not one.
+            let body = body.trim_start();
+            let mut values =
+                serde_json::Deserializer::from_str(body).into_iter::<serde_json::Value>();
+            let Some(Ok(message @ serde_json::Value::Object(_))) = values.next() else {
+                match body.find(TEAMMATE_MESSAGE_END) {
+                    Some(end) => rest = &body[end + TEAMMATE_MESSAGE_END.len()..],
+                    None => break,
+                }
+                continue;
+            };
+            rest = &body[values.byte_offset()..];
+            if message["type"] == "idle_notification"
+                && let (Some(from), Some(at_ms)) = (
+                    message["from"].as_str(),
+                    message["timestamp"].as_str().and_then(parse_timestamp),
+                )
+            {
+                out.push((from.to_string(), at_ms));
+            }
+        }
+    }
+    out
+}
+
+/// What follows the `>` that ends an opening tag, past any `>` inside a
+/// quoted attribute value.
+fn after_tag(tag: &str) -> Option<&str> {
+    let mut quoted = false;
+    for (i, c) in tag.char_indices() {
+        match c {
+            '"' => quoted = !quoted,
+            '>' if !quoted => return Some(&tag[i + 1..]),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Of two states, the one a tab should show: needs-you, then working, then
@@ -490,7 +596,9 @@ type Row = (GraphAgent, Option<(i64, String)>);
 /// A worker has finished once its dispatch is answered or its task
 /// notification arrives. A background dispatch's tool_result is the
 /// immediate launch result (`toolUseResult.status` `async_launched`), not
-/// an answer: its end is the notification (#42).
+/// an answer: its end is the notification (#42). A teammate rests
+/// ([`rests`]) from its newest idle notice in this session's own
+/// transcript, the lead's, matched by its meta name, or idle hook.
 fn session_agents(
     conn: &Connection,
     session_id: &str,
@@ -498,6 +606,7 @@ fn session_agents(
     listings: &HashMap<String, Listing>,
 ) -> Result<Vec<Row>> {
     let listing = listings.get(session_id).unwrap_or(&NOT_LISTED);
+    let notices = idle_notices(conn, session_id)?;
     let mut stmt = conn.prepare_cached(
         "SELECT a.id, a.agent_id, a.kind, a.name, a.agent_type,
              a.description, a.model, a.cost_usd, a.context_tokens, a.context_pct,
@@ -514,7 +623,14 @@ fn session_agents(
                  WHERE p.child = a.id AND p.kind IN ('dispatch', 'teammate')),
              (SELECT p.kind FROM edges AS p
                  WHERE p.child = a.id AND p.kind IN ('dispatch', 'teammate')),
-             ge.nudge_pct, ge.hard_stop_pct
+             ge.nudge_pct, ge.hard_stop_pct,
+             CASE WHEN a.hook_state = 'idle' THEN a.hook_at_ms END,
+             CASE WHEN a.kind = 'teammate' OR a.hook_state = 'idle' THEN
+                 (SELECT CAST(round(max(unixepoch(e.timestamp, 'subsec')) * 1000) AS INTEGER)
+                  FROM events AS e
+                  WHERE e.session_id = a.session_id AND e.agent_id = a.agent_id
+                    AND e.type IN ('user', 'assistant'))
+             END
          FROM agents AS a
          JOIN gear_effective AS ge ON ge.agent = a.id
          LEFT JOIN segments AS g ON g.id = a.segment_id
@@ -531,15 +647,20 @@ fn session_agents(
                 listing.name.clone().or(r.get(3)?),
                 orchestrator_state(needs || listing.waiting, listing.state.as_deref()),
             ),
-            Some(_) => (
-                r.get(3)?,
-                worker_state(
-                    needs,
-                    r.get::<_, Option<String>>(10)?.as_deref(),
-                    r.get(12)?,
-                    listing.live,
-                ),
-            ),
+            Some(_) => {
+                let name: Option<String> = r.get(3)?;
+                let notice = match r.get_ref(2)?.as_str()? {
+                    "teammate" => name.as_ref().and_then(|n| notices.get(n)).copied(),
+                    _ => None,
+                };
+                let idle = notice.max(r.get(17)?);
+                let finished = r.get::<_, bool>(12)? || rests(idle, r.get(18)?);
+                let hook: Option<String> = r.get(10)?;
+                (
+                    name,
+                    worker_state(needs, hook.as_deref(), finished, listing.live),
+                )
+            }
         };
         let edge: Option<(i64, String)> = r
             .get::<_, Option<i64>>(13)?
@@ -822,9 +943,99 @@ mod tests {
         assert_eq!(worker_state(false, Some("done"), false, true), Done);
         assert_eq!(worker_state(false, Some("running"), true, true), Done);
         assert_eq!(worker_state(false, Some("idle"), false, false), Done);
-        assert_eq!(worker_state(false, Some("idle"), false, true), Idle);
+        // An idle hook is a turn end the caller folds into `finished`
+        // (#83): one it does not is behind a newer record.
+        assert_eq!(worker_state(false, Some("idle"), false, true), Working);
         assert_eq!(worker_state(false, Some("running"), false, true), Working);
         assert_eq!(worker_state(false, None, false, true), Working);
+    }
+
+    #[test]
+    fn a_teammate_rests_from_its_turn_end_until_its_next_record() {
+        assert!(rests(Some(5), Some(4)));
+        assert!(rests(Some(5), Some(5)), "at its last record");
+        // A notice matched by name alone can be an earlier teammate's of
+        // that name.
+        assert!(!rests(Some(5), None), "no record of its own yet");
+        assert!(
+            !rests(Some(5), Some(6)),
+            "woken after it, or named before it"
+        );
+        assert!(!rests(None, Some(6)));
+        assert!(!rests(None, None));
+    }
+
+    /// A lead's user record as Claude Code writes it: each teammate-message
+    /// in its text, the body after the opening tag.
+    fn notice(from: &str, at: &str) -> String {
+        let body = serde_json::json!({
+            "type": "idle_notification", "from": from, "timestamp": at,
+            "idleReason": "available", "result": "Lorem </teammate-message> ipsum."
+        });
+        format!(
+            "<teammate-message teammate_id=\"{from}\" color=\"blue\">\n{body}\n</teammate-message>"
+        )
+    }
+
+    #[test]
+    fn idle_notices_are_read_from_a_leads_record_text() {
+        use serde_json::json;
+        let ms = |s| crate::time::parse_timestamp(s).expect("stamp");
+        let (a, b) = ("2026-10-09T10:04:00.020Z", "2026-10-09T10:05:00.020Z");
+        let text = format!(
+            "Lorem:\n{}\n{}\n<teammate-message teammate_id=\"m3\" summary=\"a > b\">\n\
+             {{\"type\":\"idle_notification\",\"from\":\"m3\",\"timestamp\":\"{b}\"}}\n\
+             </teammate-message><teammate-message teammate_id=\"m4\">Lorem.</teammate-message>\
+             <teammate-message teammate_id=\"m5\">\n{{\"type\":\"idle_notification\",\
+             \"from\":\"m5\"}}\n</teammate-message><teammate-message teammate_id=\"m6\">Lorem:\n\
+             {}\n</teammate-message><teammate-message",
+            notice("m1", a),
+            notice("m2", b),
+            notice("m7", b)
+        );
+        let record = json!({"type": "user", "message": {"role": "user", "content": text}});
+        assert_eq!(
+            notices_in(&record),
+            [
+                ("m1".to_string(), ms(a)),
+                ("m2".to_string(), ms(b)),
+                ("m3".to_string(), ms(b))
+            ],
+            "a quoted > in a tag, a plain message, no timestamp, a notice quoted in a \
+             plain message, an open tag"
+        );
+        let blocks = json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": notice("m9", a)},
+            {"type": "text", "text": notice("m1", a)},
+        ]}});
+        assert_eq!(notices_in(&blocks), [("m1".to_string(), ms(a))]);
+        let numbered = format!("<teammate-message teammate_id=\"m8\">1 {}", notice("m9", a));
+        let numbered = json!({"type": "user", "message": {"content": numbered}});
+        assert_eq!(
+            notices_in(&numbered),
+            [],
+            "a plain message that opens with a number"
+        );
+        let open =
+            json!({"type": "user", "message": {"content": "<teammate-message id=\"x\">Lorem"}});
+        assert_eq!(notices_in(&open), [], "a plain message never closed");
+        assert_eq!(notices_in(&json!({"type": "user"})), []);
+    }
+
+    /// [`live_graph`] reads each drawn session's notices: only the lead's
+    /// own user records that can hold one, by `events_idle_notices`.
+    #[test]
+    fn idle_notices_are_read_by_their_partial_index() {
+        let dir = crate::tail::test_dir("idle-notices-plan");
+        let db = dir.join("strate.db");
+        drop(super::super::Store::open(&db).expect("open"));
+        let conn = super::super::Store::open_reader(&db).expect("reader");
+        assert_eq!(
+            super::super::query_plan(&conn, IDLE_NOTICES_SQL),
+            ["SEARCH events USING INDEX events_idle_notices (session_id=?)"]
+        );
+        drop(conn);
+        std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[test]
