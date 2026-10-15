@@ -236,36 +236,6 @@ fn a_registry_entry_shows_before_its_transcript_and_waiting_is_needs_you() {
     assert_eq!(gone, (1, 3000));
 }
 
-#[test]
-fn the_registry_name_and_state_stay_on_the_registry_row() {
-    let temp = Temp::new("registry-fields");
-    let (mut store, reader) = temp.open();
-    let alpha = waiting_alpha();
-    store
-        .apply_registry(&[
-            RegistryEvent::Appeared {
-                entry: alpha.clone(),
-                at_ms: 1000,
-            },
-            RegistryEvent::Gone {
-                entry: alpha,
-                last_seen_ms: 2000,
-            },
-        ])
-        .expect("apply");
-    // The views read them from the row, as its process's latest link's
-    // (#68): a copy on the orchestrator the row names would go stale.
-    let copied: i64 = reader
-        .query_row(
-            "SELECT count(*) FROM agents
-             WHERE registry_name IS NOT NULL OR registry_state IS NOT NULL",
-            [],
-            |r| r.get(0),
-        )
-        .expect("count");
-    assert_eq!(copied, 0);
-}
-
 fn registry_row(reader: &Connection, key: &str) -> (i64, i64) {
     reader
         .query_row(

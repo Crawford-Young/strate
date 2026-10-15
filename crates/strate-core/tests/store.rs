@@ -263,8 +263,6 @@ fn open_creates_every_table_with_the_required_columns() {
                 "git_branch",
                 "version",
                 "name",
-                "registry_name",
-                "registry_state",
                 "cost_usd",
                 "run_ms",
             ],

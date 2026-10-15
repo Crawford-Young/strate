@@ -823,7 +823,7 @@ impl Agent {
     ) -> Result<HashMap<(String, String), Self>> {
         conn.prepare_cached(
             "SELECT session_id, agent_id,
-                 coalesce(registry_name, name, description, agent_type), agent_type, run_ms
+                 coalesce(name, description, agent_type), agent_type, run_ms
              FROM agents
              WHERE agent_id IS NOT NULL AND session_id IN (
                  SELECT session_id FROM audit_cells

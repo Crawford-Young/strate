@@ -198,12 +198,13 @@ impl Store {
 
     /// Applies registry poll events in one transaction: each entry's row in
     /// `registry` (a session it names gets a stub session and orchestrator
-    /// until its transcript arrives), and the orchestrator's
-    /// `registry_name` and `registry_state`. An entry no longer waiting, in
-    /// a poll stamped at or after the request, answers its orchestrator's
-    /// permission prompt, ending the wait at the poll; a session no live
-    /// row lists any more exited, so its prompt ends when it was last seen.
-    /// Error events change nothing.
+    /// until its transcript arrives). The row is the only copy of the
+    /// `claude agents` listing's name and state: no agent stores them, and
+    /// the views read the row as its process's latest /clear link's. An
+    /// entry no longer waiting, in a poll stamped at or after the request,
+    /// answers its orchestrator's permission prompt, ending the wait at the
+    /// poll; a session no live row lists any more exited, so its prompt
+    /// ends when it was last seen. Error events change nothing.
     pub fn apply_registry(&mut self, events: &[RegistryEvent]) -> Result<()> {
         let tx = self.transaction()?;
         for event in events {
@@ -495,6 +496,42 @@ mod tests {
             )
             .expect("s2");
         assert_eq!(gone, None, "a gone session needs nothing");
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_v13_store_drops_the_unwritten_registry_columns_and_keeps_its_agents() {
+        let dir = test_dir("store-v13-upgrade");
+        let db = dir.join("strate.db");
+        let mut v13 = Connection::open(&db).expect("v13 db");
+        migrate::migrate(&mut v13, &migrate::MIGRATIONS[..13]).expect("v13");
+        // A copy a build before #68 left on the first /clear link.
+        v13.execute_batch(
+            "INSERT INTO sessions (session_id, path) VALUES ('s1', '/p/s1.jsonl');
+             INSERT INTO agents (session_id, kind, name, registry_name, registry_state)
+             VALUES ('s1', 'orchestrator', 'lorem', 'ipsum', 'busy');",
+        )
+        .expect("v13 rows");
+        drop(v13);
+
+        let store = Store::open_in(&db, "UTC").expect("upgrade");
+        let columns: Vec<String> = store
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('agents') WHERE name LIKE 'registry%'")
+            .expect("columns")
+            .query_map([], |r| r.get(0))
+            .expect("rows")
+            .collect::<Result<_>>()
+            .expect("names");
+        assert_eq!(columns, Vec::<String>::new());
+        let name: String = store
+            .conn
+            .query_row("SELECT name FROM agents WHERE session_id = 's1'", [], |r| {
+                r.get(0)
+            })
+            .expect("s1");
+        assert_eq!(name, "lorem");
         drop(store);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
