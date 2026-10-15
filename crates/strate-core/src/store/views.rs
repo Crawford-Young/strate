@@ -31,6 +31,7 @@
 //! orchestrator hangs under the drawn one. A link renamed into another
 //! workstream reads there, never here: 35 of 62 continuation edges in a
 //! real store crossed workstreams, a process reused for the next ticket.
+//! The header's $ and run time sum the same links (#65).
 //!
 //! Director-launched units (#53, the `directs` table): a director's graph
 //! also draws the units any of the workstream's sessions directed that are
@@ -132,10 +133,12 @@ pub struct NeedsYou {
 pub struct LiveGraph {
     pub session_id: String,
     pub live: bool,
-    /// The drawn session's priced requests that count toward this
-    /// workstream (`event_workstreams`); `None` with none.
+    /// The priced requests of the drawn session and its chain's earlier
+    /// links the graph draws that count toward this workstream
+    /// (`event_workstreams`); `None` with none.
     pub session_cost_usd: Option<f64>,
-    /// The drawn session's wall time, first record to last (`sessions.run_ms`).
+    /// Those links' wall times summed, each first record to last
+    /// (`sessions.run_ms`).
     pub run_ms: Option<i64>,
     pub agents: Vec<GraphAgent>,
     pub edges: Vec<GraphEdge>,
@@ -668,11 +671,19 @@ fn units(
 }
 
 /// The earlier links of `session_id`'s `/clear` chain (its process root's
-/// sessions that started before it), in start order; with `root`, only
-/// those with a segment in that workstream.
-fn earlier_links(conn: &Connection, session_id: &str, root: Option<i64>) -> Result<Vec<String>> {
-    conn.prepare_cached(
-        "SELECT s.session_id FROM sessions AS me
+/// sessions that started before it) that the graph reads as such, in start
+/// order: with `root`, only those with a segment in that workstream, and
+/// never one in `drawn_sessions` (the graph draws it as itself: the drawn
+/// session or a unit).
+fn earlier_links(
+    conn: &Connection,
+    session_id: &str,
+    root: Option<i64>,
+    drawn_sessions: &[&str],
+) -> Result<Vec<String>> {
+    let links: Vec<String> = conn
+        .prepare_cached(
+            "SELECT s.session_id FROM sessions AS me
          JOIN sessions AS s ON s.process_root = me.process_root
          WHERE me.session_id = ?1
            AND (s.started_at, s.session_id) < (me.started_at, me.session_id)
@@ -680,18 +691,22 @@ fn earlier_links(conn: &Connection, session_id: &str, root: Option<i64>) -> Resu
                JOIN workstream_roots AS r ON r.id = g.workstream_id
                WHERE g.session_id = s.session_id AND r.root = ?2))
          ORDER BY s.started_at, s.session_id",
-    )?
-    .query_map(rusqlite::params![session_id, root], |r| r.get(0))?
-    .collect()
+        )?
+        .query_map(rusqlite::params![session_id, root], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    Ok(links
+        .into_iter()
+        .filter(|l| !drawn_sessions.contains(&l.as_str()))
+        .collect())
 }
 
 /// `session_id`'s agents as [`session_agents`] reads them with `root`,
 /// then the subagents and teammates of its earlier links in workstream
-/// `links` (see [`earlier_links`]) that joined it, marked `earlier`. A link
-/// in `drawn_sessions` (the graph draws it as itself: the drawn session or
-/// a unit) is skipped, so its agents hang under their own orchestrator,
-/// once. One that hangs under any link's orchestrator (a teammate's lead
-/// can be another link's) hangs under `session_id`'s.
+/// `links` (see [`earlier_links`]: one the graph draws as itself is
+/// skipped, so its agents hang under their own orchestrator, once) that
+/// joined it, marked `earlier`. One that hangs under any link's
+/// orchestrator (a teammate's lead can be another link's) hangs under
+/// `session_id`'s.
 fn chain_agents(
     conn: &Connection,
     session_id: &str,
@@ -704,10 +719,7 @@ fn chain_agents(
     let Some(head) = orchestrator(&rows) else {
         return Ok(rows);
     };
-    for link in earlier_links(conn, session_id, links)? {
-        if drawn_sessions.contains(&link.as_str()) {
-            continue;
-        }
+    for link in earlier_links(conn, session_id, links, drawn_sessions)? {
         let workers = session_agents(conn, &link, links, true, listings)?;
         rows.extend(workers.into_iter().filter(|(a, _)| a.agent_id.is_some()));
     }
@@ -735,22 +747,35 @@ fn orchestrator(rows: &[Row]) -> Option<i64> {
         .map(|(a, _)| a.id)
 }
 
-/// The $ of `session_id` that counts toward workstream `root`, never more
-/// than the workstream's total, and the session's run time.
+/// The $ of the chain links `links` that counts toward workstream `root`,
+/// never more than the workstream's total, and the sum of their run times
+/// (#65: the header covers the links the canvas draws).
 fn session_totals(
     conn: &Connection,
-    session_id: &str,
+    links: &[String],
     root: i64,
 ) -> Result<(Option<f64>, Option<i64>)> {
-    conn.prepare_cached(
+    fn add<T: std::ops::Add<Output = T>>(a: Option<T>, b: Option<T>) -> Option<T> {
+        match (a, b) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        }
+    }
+    let mut stmt = conn.prepare_cached(
         "SELECT (SELECT sum(r.cost_usd) FROM requests AS r
                  JOIN event_workstreams AS w ON w.event = r.id
                  WHERE r.session_id = ?1 AND w.workstream = ?2),
              (SELECT run_ms FROM sessions WHERE session_id = ?1)",
-    )?
-    .query_row(rusqlite::params![session_id, root], |r| {
-        Ok((r.get(0)?, r.get(1)?))
-    })
+    )?;
+    let mut totals = (None, None);
+    for link in links {
+        let (usd, run): (Option<f64>, Option<i64>) = stmt
+            .query_row(rusqlite::params![link, root], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+        totals = (add(totals.0, usd), add(totals.1, run));
+    }
+    Ok(totals)
 }
 
 /// The graph of the session `workstream` draws (any id of a merge chain
@@ -770,11 +795,18 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
     let Some(shown) = drawn(conn, Some(root), &listings)?.remove(&root) else {
         return Ok(None);
     };
-    let (session_cost_usd, run_ms) = session_totals(conn, &shown.session_id, root)?;
     let units = units(conn, root, &shown.session_id, &listings)?;
     let drawn_sessions: Vec<&str> = std::iter::once(shown.session_id.as_str())
         .chain(units.iter().map(|u| u.session_id.as_str()))
         .collect();
+    let mut links = vec![shown.session_id.clone()];
+    links.extend(earlier_links(
+        conn,
+        &shown.session_id,
+        Some(root),
+        &drawn_sessions,
+    )?);
+    let (session_cost_usd, run_ms) = session_totals(conn, &links, root)?;
     let mut rows = chain_agents(
         conn,
         &shown.session_id,

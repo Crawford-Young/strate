@@ -516,6 +516,28 @@ fn a_chain_draws_only_its_links_in_the_drawn_workstream() {
 }
 
 #[test]
+fn the_header_sums_every_link_the_canvas_draws() {
+    let t = Temp::new("header");
+    let (_store, db) = build(&t);
+    let header = |name| {
+        let g = graph(&db, name);
+        (g.session_cost_usd.expect("priced"), g.run_ms)
+    };
+    // L1, L2 (plus its SendMessage) and L3, each with its subagent; each
+    // link's run: L1 and L3 :00:00 to :00:55, L2 11:00:00 to 11:02:01.
+    let (usd, run) = header("director-chain");
+    assert!(close(7.0 * OPUS + 3.0 * SONNET, usd), "{usd}");
+    assert_eq!(run, Some((55 + 121 + 55) * S));
+    // P1 and P3; P2, renamed to chain-repo-6, reads only there.
+    let (usd, run) = header("chain-repo-5");
+    assert!(close(4.0 * OPUS + 2.0 * SONNET, usd), "{usd}");
+    assert_eq!(run, Some(2 * 55 * S));
+    let (usd, run) = header("chain-repo-6");
+    assert!(close(2.0 * OPUS + SONNET, usd), "{usd}");
+    assert_eq!(run, Some(55 * S));
+}
+
+#[test]
 fn a_unit_tab_nests_whichever_link_of_its_chain_was_directed() {
     let t = Temp::new("nest");
     let (mut store, db) = build(&t);

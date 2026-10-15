@@ -82,9 +82,9 @@ export interface GraphEdge {
 export interface LiveGraph {
   sessionId: string
   live: boolean
-  /** The session's priced requests that count toward this workstream; null with none. */
+  /** The priced requests of the drawn chain's links in this workstream that count toward it; null with none. */
   sessionCostUsd: number | null
-  /** The session's wall time, first record to last, as of this read. */
+  /** Those links' wall times summed, each first record to last, as of this read. */
   runMs: number | null
   agents: GraphAgent[]
   edges: GraphEdge[]
