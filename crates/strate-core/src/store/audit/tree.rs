@@ -110,15 +110,15 @@ impl Step {
 
 /// `cell`'s path from the root: its Group node under `group_by` (none under
 /// Hierarchy), then the place of its outermost Session row (Repo > Epic >
-/// Issue > PR, or Unlinked), its Session rows (a unit's under its
-/// director's; see [`Cells::rows`]) and its Agent node. The tree adds the
+/// Issue > PR, a director's Repo alone, or Unlinked), its Session rows (a
+/// unit's under its director's; see [`Cells::rows`]) and its Agent node. The tree adds the
 /// cell to every node on it; the cells under a node are those whose path
 /// passes through that node's `(kind, key)` steps.
 pub(crate) fn path(group_by: GroupBy, cell: &Cell, cells: &Cells, gh: &Gh) -> Vec<Step> {
     let rows = cells.rows(cell);
     let mut steps = Vec::with_capacity(7 + rows.len());
     steps.extend(group_step(group_by, cell, cells, gh));
-    steps.extend(place_steps(&rows[0].place, gh));
+    steps.extend(place_steps(rows[0], gh));
     steps.extend(rows.into_iter().map(window_step));
     steps.push(agent_step(cell, cells));
     steps
@@ -162,12 +162,17 @@ fn group_step(group_by: GroupBy, cell: &Cell, cells: &Cells, gh: &Gh) -> Option<
     Some(Step::new(NodeKind::Group, key.clone(), label, key))
 }
 
-/// The steps a window's place makes: Repo > Epic > Issue > PR, or Unlinked.
-/// An issue sits under each of its epics, outermost first; an epic's own
-/// window goes under its "Direct work" Issue node, beside its sub-issues.
-fn place_steps(place: &Place, gh: &Gh) -> Vec<Step> {
-    let (repo, issue, pr) = match place {
-        Place::Unlinked => {
+/// The steps a window's row is placed by: Repo > Epic > Issue > PR; a
+/// director's Repo alone, its Session row beside the repo's issues; or
+/// Unlinked. An issue sits under each of its epics, outermost first; an
+/// epic's own window goes under its "Direct work" Issue node, beside its
+/// sub-issues.
+fn place_steps(window: &Window, gh: &Gh) -> Vec<Step> {
+    let repo_step =
+        |repo: &String| Step::new(NodeKind::Repo, repo.clone(), repo.clone(), repo.clone());
+    let (repo, issue, pr) = match (&window.place, &window.director_repo) {
+        (Place::Unlinked, Some(repo)) => return vec![repo_step(repo)],
+        (Place::Unlinked, None) => {
             return vec![Step::new(
                 NodeKind::Unlinked,
                 String::new(),
@@ -175,15 +180,10 @@ fn place_steps(place: &Place, gh: &Gh) -> Vec<Step> {
                 String::new(),
             )];
         }
-        Place::Linked { repo, issue, pr } => (repo, *issue, *pr),
+        (Place::Linked { repo, issue, pr }, _) => (repo, *issue, *pr),
     };
     let mut steps = Vec::with_capacity(4);
-    steps.push(Step::new(
-        NodeKind::Repo,
-        repo.clone(),
-        repo.clone(),
-        repo.clone(),
-    ));
+    steps.push(repo_step(repo));
     for epic in epics_over(gh, repo, issue) {
         steps.push(Step::issue(NodeKind::Epic, gh, repo, epic));
     }

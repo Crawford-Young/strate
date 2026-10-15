@@ -1,7 +1,9 @@
 //! A `/clear` chain read as one session (#63), over the synthetic
 //! `tests/fixtures/chain-home`: the Audit's one Session row per chain and
-//! workstream, a director's `--bg` unit nested under the director's row,
-//! and the live graph drawing every link's subagents, earlier links' marked.
+//! workstream, a director's `--bg` unit nested under the director's row
+//! (which sits under its units' repo), and the live view: a registry row
+//! read as its process's latest link, the graph drawing every link's
+//! subagents (earlier links' marked) and a director's live units only.
 //! Every db lives in a temp dir.
 
 use std::fs;
@@ -13,13 +15,15 @@ use strate_core::discovery::discover;
 use strate_core::registry::{RegistryEvent, parse_snapshot};
 use strate_core::store::Store;
 use strate_core::store::views::{
-    self, AuditFilter, AuditNode, GraphAgent, GraphEdge, GroupBy, LiveGraph, Metrics, NodeKind,
-    SpanKind, Workstream, audit, audit_timeline,
+    self, AgentState, AuditFilter, AuditNode, GraphAgent, GraphEdge, GroupBy, LiveGraph, Metrics,
+    NodeKind, SpanKind, Workstream, audit, audit_timeline,
 };
 use strate_core::tail::{Batch, Checkpoint, FileIdentity, TailEvent};
 
 /// director-chain's third and last link.
 const L3: &str = "5e55c4c4-0000-4000-8000-0000000000a3";
+/// ticket-chain-repo-7's first link, the one director-chain messaged.
+const U1: &str = "5e55c4c4-0000-4000-8000-0000000000b1";
 /// ticket-chain-repo-7's second link, after /clear: never messaged itself.
 const U2: &str = "5e55c4c4-0000-4000-8000-0000000000b2";
 /// chain-repo-6, between two chain-repo-5 links of one process.
@@ -181,13 +185,11 @@ fn a_clear_chain_is_one_session_row_holding_every_links_subagents() {
     let t = Temp::new("one-row");
     let (_store, db) = build(&t);
     let root = tree(&db);
-    let unlinked = root
-        .children
-        .iter()
-        .find(|c| c.kind == NodeKind::Unlinked)
-        .expect("unlinked");
-    assert_eq!(labels(unlinked, NodeKind::Session), ["director-chain"]);
-    let row = labelled(unlinked, NodeKind::Session, "director-chain");
+    let row = labelled(
+        repo(&root, "chain-repo"),
+        NodeKind::Session,
+        "director-chain",
+    );
     // One orchestrator node for the three links, and each link's subagent.
     assert_eq!(agents(row), ["", J[0], J[1], J[2]]);
     let orchestrator = row.children.iter().find(|c| c.key.is_empty()).unwrap();
@@ -201,12 +203,14 @@ fn a_directed_unit_and_its_clear_successor_nest_under_the_directors_row() {
     let t = Temp::new("unit");
     let (_store, db) = build(&t);
     let root = tree(&db);
-    let unlinked = root
-        .children
-        .iter()
-        .find(|c| c.kind == NodeKind::Unlinked)
-        .expect("unlinked");
-    let director = labelled(unlinked, NodeKind::Session, "director-chain");
+    // Its one unit works in chain-repo: the director's row sits there, at
+    // repo level, so nothing is left Unlinked.
+    assert!(root.children.iter().all(|c| c.kind != NodeKind::Unlinked));
+    let director = labelled(
+        repo(&root, "chain-repo"),
+        NodeKind::Session,
+        "director-chain",
+    );
     assert_eq!(labels(director, NodeKind::Session), ["ticket-chain-repo-7"]);
     let unit = labelled(director, NodeKind::Session, "ticket-chain-repo-7");
     // U1 (messaged) and U2 (its /clear successor): one row, both subagents.
@@ -229,16 +233,29 @@ fn a_directed_unit_and_its_clear_successor_nest_under_the_directors_row() {
         "{}",
         m.cost_usd
     );
-    // The unit's work left its own repo and issue: only the chain-repo-5
-    // and -6 rows sit under the repo.
-    let repo = root
+    // The unit's work left its own issue: only the chain-repo-5 and -6
+    // issues and the director's row sit under the repo.
+    let under: Vec<(NodeKind, &str)> = repo(&root, "chain-repo")
         .children
         .iter()
-        .find(|c| c.kind == NodeKind::Repo && c.key == "chain-repo")
-        .expect("repo");
-    let mut issues: Vec<&str> = repo.children.iter().map(|c| c.key.as_str()).collect();
-    issues.sort();
-    assert_eq!(issues, ["5", "6"]);
+        .map(|c| (c.kind, c.label.as_str()))
+        .collect();
+    assert_eq!(
+        under,
+        [
+            (NodeKind::Issue, "chain-repo #5"),
+            (NodeKind::Issue, "chain-repo #6"),
+            (NodeKind::Session, "director-chain"),
+        ]
+    );
+}
+
+/// The Repo child of `node` keyed `slug`.
+fn repo<'a>(node: &'a AuditNode, slug: &str) -> &'a AuditNode {
+    node.children
+        .iter()
+        .find(|c| c.kind == NodeKind::Repo && c.key == slug)
+        .unwrap_or_else(|| panic!("no repo {slug} under {:?}", node.label))
 }
 
 #[test]
@@ -331,15 +348,14 @@ fn a_nested_rows_timeline_is_its_own_cells() {
     let t = Temp::new("timeline");
     let (_store, db) = build(&t);
     let root = tree(&db);
-    let unlinked = root
-        .children
-        .iter()
-        .find(|c| c.kind == NodeKind::Unlinked)
-        .expect("unlinked");
-    let director = labelled(unlinked, NodeKind::Session, "director-chain");
+    let director = labelled(
+        repo(&root, "chain-repo"),
+        NodeKind::Session,
+        "director-chain",
+    );
     let unit = labelled(director, NodeKind::Session, "ticket-chain-repo-7");
     let path = vec![
-        (NodeKind::Unlinked, String::new()),
+        (NodeKind::Repo, "chain-repo".to_string()),
         (NodeKind::Session, director.key.clone()),
         (NodeKind::Session, unit.key.clone()),
     ];
@@ -416,11 +432,27 @@ fn edge(kind: &str, parent: i64, child: i64) -> GraphEdge {
 }
 
 #[test]
-fn the_director_draws_every_links_subagents_and_its_units_chain() {
+fn the_director_draws_every_links_subagents_and_its_live_units_chain() {
     let t = Temp::new("graph");
-    let (_store, db) = build(&t);
+    let (mut store, db) = build(&t);
+    // The unit's process is not running: the canvas leaves it out.
     let g = graph(&db, "director-chain");
     assert_eq!(g.session_id, L3);
+    assert_eq!(
+        drawn(&g),
+        [
+            ("-", "director-chain", false),
+            (J[2], "-", false),
+            (J[0], "-", true),
+            (J[1], "-", true),
+        ]
+    );
+    // The registry keys a background process by its first session, U1:
+    // the unit drawn is its process's latest link, U2.
+    store
+        .apply_registry(&[listed(4202, U1, "ticket-chain-repo-7")])
+        .expect("unit live");
+    let g = graph(&db, "director-chain");
     assert_eq!(
         drawn(&g),
         [
@@ -563,19 +595,17 @@ fn a_unit_of_a_unit_nests_two_deep_under_a_director_outside_the_range() {
     let db = synthetic(&t, NESTED);
     let root = oct2(&db);
     check_sums(&root);
-    let unlinked = root
-        .children
-        .iter()
-        .find(|c| c.kind == NodeKind::Unlinked)
-        .expect("unlinked");
-    // d1 has no cell on Oct 2, but its row still reads by its name.
-    assert_eq!(labels(unlinked, NodeKind::Session), ["director-top"]);
-    let top = labelled(unlinked, NodeKind::Session, "director-top");
+    // d1 has no cell on Oct 2, but its row still reads by its name. The
+    // outermost director places the nest: its unit director-mid works
+    // where director-mid's own unit does, repo x.
+    assert!(root.children.iter().all(|c| c.kind != NodeKind::Unlinked));
+    let top = labelled(repo(&root, "x"), NodeKind::Session, "director-top");
     let mid = labelled(top, NodeKind::Session, "director-mid");
     let unit = labelled(mid, NodeKind::Session, "ticket-x-3");
     assert_eq!((top.metrics.sessions, mid.metrics.sessions), (2, 2));
     assert!(close(1.0, unit.metrics.cost_usd));
-    assert!(!root.children.iter().any(|c| c.key == "ticket-x"));
+    // Only the director's row is under x: the unit's work left its issue.
+    assert_eq!(repo(&root, "x").children.len(), 1);
 }
 
 #[test]
@@ -585,19 +615,14 @@ fn rows_that_direct_each_other_nest_one_way_only() {
     let root = oct2(&db);
     check_sums(&root);
     assert!(close(6.0, root.metrics.cost_usd));
-    let repos: Vec<&str> = root
+    // alpha and beta, besides the directors' x: one of the two holds both.
+    let repos: Vec<&AuditNode> = root
         .children
         .iter()
-        .filter(|c| c.kind == NodeKind::Repo)
-        .map(|c| c.key.as_str())
+        .filter(|c| c.kind == NodeKind::Repo && c.key != "x")
         .collect();
-    assert_eq!(repos.len(), 1, "{repos:?}");
-    let issue = &root
-        .children
-        .iter()
-        .find(|c| c.kind == NodeKind::Repo)
-        .expect("repo")
-        .children[0];
+    assert_eq!(repos.len(), 1, "{:?}", root.children);
+    let issue = &repos[0].children[0];
     let rows = labels(issue, NodeKind::Session);
     assert_eq!(rows.len(), 1, "{rows:?}");
     let outer = &issue.children[0];
@@ -669,8 +694,7 @@ fn a_chains_row_reads_under_the_pr_any_of_its_links_names() {
 /// in ticket-x-1; u1 was renamed from ticket-x-1 (where it dispatched k1)
 /// into ticket-x-2, and u2 is back in ticket-x-1. So the unit chain reads
 /// in both workstreams, and u1 is both ticket-x-2's latest link and an
-/// earlier link in ticket-x-1. y, directed first, puts ticket-x-1's unit
-/// (u2) first.
+/// earlier link in ticket-x-1.
 const TWO_WORKSTREAM_UNIT: &str = "
     INSERT INTO workstreams (id, name, fallback) VALUES (1, 'director-d', 0),
         (2, 'ticket-x-1', 0), (3, 'ticket-x-2', 0);
@@ -699,29 +723,41 @@ fn placed(g: &LiveGraph) -> Vec<(i64, Option<i64>, bool)> {
         .collect()
 }
 
+/// Lists `session` in the registry as a live background process.
+fn run(t: &Temp, session: &str) {
+    Connection::open(t.db())
+        .expect("raw")
+        .execute(
+            "INSERT INTO registry (key, kind, session_id, cwd, started_at_ms, state,
+                 first_seen_ms, last_seen_ms)
+             VALUES ('bg:' || ?1, 'background', ?1, '/work/x', 1, 'running', 1, 1)",
+            [session],
+        )
+        .expect("listed");
+}
+
 #[test]
-fn a_unit_chain_directed_in_two_workstreams_draws_each_agent_once() {
+fn a_unit_chain_directed_in_two_workstreams_draws_only_its_live_link() {
     let t = Temp::new("unit-two-workstreams");
     let db = synthetic(&t, TWO_WORKSTREAM_UNIT);
+    // No unit process runs: the director is drawn alone.
     let g = views::live_graph(&db, 1).expect("query").expect("graph");
-    // u1 is drawn as itself (ticket-x-2's unit), so k1 hangs under u1's
-    // orchestrator, though u2 (ticket-x-1's unit, read first) has u1 as an
-    // earlier link.
+    assert_eq!(placed(&g), [(1, None, false)]);
+    // The registry lists the process by its first link, y: u2, its latest,
+    // runs. ticket-x-2's link u1 has finished, so it is not drawn, and its
+    // k1 (in ticket-x-1) hangs under u2 as an earlier link's.
+    run(&t, "y");
+    let g = views::live_graph(&db, 1).expect("query").expect("graph");
     assert_eq!(
         placed(&g),
-        [
-            (1, None, false),
-            (3, Some(1), false),
-            (2, Some(1), false),
-            (4, Some(2), false),
-        ]
+        [(1, None, false), (3, Some(1), false), (4, Some(3), true)]
     );
 }
 
 /// The chain pu is l (ticket-x-1, which dispatched k1), a (ticket-x-1) and
 /// b (ticket-x-2). Director d directed a, and n: a link of pu with no
-/// window yet, so no workstream and no start. n's unit draws the chain's
-/// latest link b, whose earlier links in any workstream include l.
+/// window yet, so no workstream and no start. n's unit is the chain's
+/// latest link b, whose earlier links in any workstream include l and a.
 const WINDOWLESS_UNIT: &str = "
     INSERT INTO workstreams (id, name, fallback) VALUES (1, 'director-d', 0),
         (2, 'ticket-x-1', 0), (3, 'ticket-x-2', 0);
@@ -741,19 +777,15 @@ const WINDOWLESS_UNIT: &str = "
 ";
 
 #[test]
-fn an_earlier_link_two_units_share_is_drawn_once() {
+fn a_windowless_directed_link_draws_its_chains_live_latest_link() {
     let t = Temp::new("unit-windowless");
     let db = synthetic(&t, WINDOWLESS_UNIT);
+    run(&t, "l");
     let g = views::live_graph(&db, 1).expect("query").expect("graph");
-    // a's unit (ticket-x-1) draws l's k1 first, and b's does not again.
+    // a (ticket-x-1's unit) has finished; b runs, with l's k1 once.
     assert_eq!(
         placed(&g),
-        [
-            (1, None, false),
-            (2, Some(1), false),
-            (4, None, true),
-            (3, Some(1), false),
-        ]
+        [(1, None, false), (3, Some(1), false), (4, None, true)]
     );
 }
 
@@ -826,4 +858,254 @@ fn a_unit_tab_nests_under_a_live_director_of_any_of_its_links() {
         .expect("live");
     let rows = views::workstreams(&db).expect("workstreams");
     assert_eq!(tab(&rows, "ticket-x-3").director, Some(1));
+}
+
+/// One background process (root f): f in ticket-x-17, then /clear and
+/// /rename into g, ticket-x-18. The registry keys the process by its first
+/// session, f, and has named it ticket-x-18; it waits on a permission.
+const RENAMED_PROCESS: &str = "
+    INSERT INTO workstreams (id, name, fallback) VALUES (1, 'ticket-x-17', 0),
+        (2, 'ticket-x-18', 0);
+    INSERT INTO sessions (session_id, path, started_at, process_root, workstream_id) VALUES
+        ('f', '/p/f.jsonl', '2026-10-02T10:00:00.000Z', 'f', 1),
+        ('g', '/p/g.jsonl', '2026-10-02T11:00:00.000Z', 'f', 2);
+    INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id) VALUES
+        (1, 'f', 0, '2026-10-02T10:00:00.000Z', 1), (2, 'g', 0, '2026-10-02T11:00:00.000Z', 2);
+    INSERT INTO agents (id, session_id, agent_id, kind, name, registry_name, registry_state)
+    VALUES (1, 'f', NULL, 'orchestrator', 'ticket-x-17', 'ticket-x-18', 'waiting'),
+        (2, 'g', NULL, 'orchestrator', 'ticket-x-18', NULL, NULL);
+    INSERT INTO registry (key, kind, session_id, name, cwd, started_at_ms, status,
+        waiting_for, first_seen_ms, last_seen_ms)
+    VALUES ('bg:f', 'background', 'f', 'ticket-x-18', '/work/x', 1, 'waiting', 'Bash', 1, 7);
+";
+
+/// The drawn orchestrator's name and state.
+fn head(g: &LiveGraph) -> (Option<&str>, AgentState) {
+    let a = g
+        .agents
+        .iter()
+        .find(|a| a.agent_id.is_none())
+        .expect("head");
+    (a.name.as_deref(), a.state)
+}
+
+#[test]
+fn a_registry_row_is_its_processs_latest_link() {
+    let t = Temp::new("registry-latest");
+    let db = synthetic(&t, RENAMED_PROCESS);
+    let rows = views::workstreams(&db).expect("workstreams");
+    let shown = |name: &str| {
+        let w = tab(&rows, name);
+        (w.session_id.as_deref(), w.live, w.needs_you, w.state)
+    };
+    // The tab is the running link's workstream; the finished ticket's is not.
+    assert_eq!(
+        shown("ticket-x-18"),
+        (Some("g"), true, 1, AgentState::NeedsYou)
+    );
+    assert_eq!(
+        shown("ticket-x-17"),
+        (Some("f"), false, 0, AgentState::Done)
+    );
+    // The wait names the latest link and counts toward its workstream.
+    let needs: Vec<(Option<String>, Option<i64>)> = views::needs_you(&db)
+        .expect("needs you")
+        .into_iter()
+        .map(|n| (n.session_id, n.workstream))
+        .collect();
+    assert_eq!(needs, [(Some("g".to_string()), Some(2))]);
+    let g = views::live_graph(&db, 2).expect("query").expect("graph");
+    assert!(g.live);
+    assert_eq!(head(&g), (Some("ticket-x-18"), AgentState::NeedsYou));
+    let f = views::live_graph(&db, 1).expect("query").expect("graph");
+    assert!(!f.live);
+    assert_eq!(head(&f), (Some("ticket-x-17"), AgentState::Done));
+
+    Connection::open(t.db())
+        .expect("raw")
+        .execute_batch(
+            "UPDATE registry SET status = 'busy', waiting_for = NULL;
+             UPDATE agents SET registry_state = 'busy' WHERE id = 1;",
+        )
+        .expect("busy");
+    let rows = views::workstreams(&db).expect("workstreams");
+    assert_eq!(tab(&rows, "ticket-x-18").state, AgentState::Working);
+    let g = views::live_graph(&db, 2).expect("query").expect("graph");
+    assert_eq!(head(&g), (Some("ticket-x-18"), AgentState::Working));
+}
+
+/// Six directors on Oct 2, each session one $1 orchestrator cell, each
+/// unit messaged from its director's one window:
+/// - director-xrepo (d1): ticket-xrepo-1 (u1), ticket-yrepo-2 (u2);
+/// - director-wrepo (d2): ticket-xrepo-3 (u3), ticket-yrepo-4 (u4), where
+///   wrepo is a repo only the GitHub cache knows;
+/// - director-zz (d3): ticket-xrepo-5 (u5), ticket-yrepo-6 (u6);
+/// - director-solo (d4): ticket-yrepo-7 (u7), and u8, whose name (a pasted
+///   launch line) names no repo;
+/// - director-yrepo (d5) and director-qq (d6), with no units.
+const PLACED: &str = "
+    INSERT INTO workstreams (id, name, fallback) VALUES
+        (1, 'director-xrepo', 0), (2, 'director-wrepo', 0), (3, 'director-zz', 0),
+        (4, 'director-solo', 0), (11, 'ticket-xrepo-1', 0), (12, 'ticket-yrepo-2', 0),
+        (13, 'ticket-xrepo-3', 0), (14, 'ticket-yrepo-4', 0), (15, 'ticket-xrepo-5', 0),
+        (16, 'ticket-yrepo-6', 0), (17, 'ticket-yrepo-7', 0), (18, 'claude -n ticket-yrepo-8', 0),
+        (5, 'director-yrepo', 0), (6, 'director-qq', 0);
+    INSERT INTO sessions (session_id, path, started_at, process_root, workstream_id)
+    SELECT s, '/p/' || s || '.jsonl', '2026-10-02T1' || (w % 10) || ':00:00.000Z', s, w
+    FROM (SELECT 'd1' AS s, 1 AS w UNION ALL SELECT 'd2', 2 UNION ALL SELECT 'd3', 3
+        UNION ALL SELECT 'd4', 4 UNION ALL SELECT 'u1', 11 UNION ALL SELECT 'u2', 12
+        UNION ALL SELECT 'u3', 13 UNION ALL SELECT 'u4', 14 UNION ALL SELECT 'u5', 15
+        UNION ALL SELECT 'u6', 16 UNION ALL SELECT 'u7', 17 UNION ALL SELECT 'u8', 18
+        UNION ALL SELECT 'd5', 5 UNION ALL SELECT 'd6', 6);
+    INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id)
+    SELECT workstream_id, session_id, 0, started_at, workstream_id FROM sessions;
+    INSERT INTO events (session_id, file, byte_offset, raw, sent_msg_id)
+    SELECT p, '/p/' || p || '.jsonl', o, '{}', 'm-' || c
+    FROM (SELECT 'd1' AS p, 'u1' AS c, 10 AS o UNION ALL SELECT 'd1', 'u2', 20
+        UNION ALL SELECT 'd2', 'u3', 10 UNION ALL SELECT 'd2', 'u4', 20
+        UNION ALL SELECT 'd3', 'u5', 10 UNION ALL SELECT 'd3', 'u6', 20
+        UNION ALL SELECT 'd4', 'u7', 10 UNION ALL SELECT 'd4', 'u8', 20);
+    INSERT INTO directs (child, parent, msg_id)
+    SELECT substr(sent_msg_id, 3), session_id, sent_msg_id FROM events;
+    INSERT INTO gh_repos (slug, owner, name, fetched_at) VALUES ('wrepo', 'o', 'wrepo', 1);
+    INSERT INTO audit_cells (session_id, agent_id, segment_id, day, model, wall_ms,
+        active_ms, wait_ms, cost_usd, unpriced, input_tokens, output_tokens,
+        cache_read_tokens, cache_write_tokens)
+    SELECT session_id, NULL, workstream_id, '2026-10-02', 'm', 1000, 1000, 0, 1.0, 0, 10, 1,
+        0, 0
+    FROM sessions;
+";
+
+/// The tree on Oct 2 with only `repos`' windows.
+fn oct2_in(db: &Connection, repos: &[&str]) -> AuditNode {
+    let f = AuditFilter {
+        from: "2026-10-02".into(),
+        to: "2026-10-02".into(),
+        repos: repos.iter().map(|r| r.to_string()).collect(),
+        group_by: GroupBy::Hierarchy,
+    };
+    audit(db, &f).expect("audit").root
+}
+
+/// A top-level node's kind and key, and each Session row under it: its
+/// label, $ and the labels of the rows nested in it.
+type Placement<'a> = (NodeKind, &'a str, Vec<(&'a str, f64, Vec<&'a str>)>);
+
+fn placements(root: &AuditNode) -> Vec<Placement<'_>> {
+    root.children
+        .iter()
+        .map(|place| {
+            let rows = place
+                .children
+                .iter()
+                .map(|row| {
+                    assert_eq!(row.kind, NodeKind::Session, "{:?}", row.label);
+                    (
+                        row.label.as_str(),
+                        row.metrics.cost_usd,
+                        labels(row, NodeKind::Session),
+                    )
+                })
+                .collect();
+            (place.kind, place.key.as_str(), rows)
+        })
+        .collect()
+}
+
+#[test]
+fn a_directors_row_sits_under_its_units_repo_else_the_repo_its_name_names() {
+    let t = Temp::new("placed");
+    let db = synthetic(&t, PLACED);
+    let root = oct2_in(&db, &[]);
+    check_sums(&root);
+    assert!(close(14.0, root.metrics.cost_usd));
+    assert_eq!(root.metrics.sessions, 14);
+    assert_eq!(
+        placements(&root),
+        [
+            // Units in two repos: the repo the name names, known from the
+            // GitHub cache (wrepo) or from window names (xrepo).
+            (
+                NodeKind::Repo,
+                "wrepo",
+                vec![(
+                    "director-wrepo",
+                    3.0,
+                    vec!["ticket-xrepo-3", "ticket-yrepo-4"]
+                )]
+            ),
+            (
+                NodeKind::Repo,
+                "xrepo",
+                vec![(
+                    "director-xrepo",
+                    3.0,
+                    vec!["ticket-xrepo-1", "ticket-yrepo-2"]
+                )]
+            ),
+            // All its units that name a repo name one: that repo, whatever
+            // the name. No units: the repo the name names.
+            (
+                NodeKind::Repo,
+                "yrepo",
+                vec![
+                    (
+                        "director-solo",
+                        3.0,
+                        vec!["ticket-yrepo-7", "claude -n ticket-yrepo-8"]
+                    ),
+                    ("director-yrepo", 1.0, vec![]),
+                ]
+            ),
+            // Units in two repos, or none, and a name naming no known repo.
+            (
+                NodeKind::Unlinked,
+                "",
+                vec![
+                    ("director-zz", 3.0, vec!["ticket-xrepo-5", "ticket-yrepo-6"]),
+                    ("director-qq", 1.0, vec![]),
+                ]
+            ),
+        ]
+    );
+}
+
+#[test]
+fn the_repo_filter_keeps_a_directors_own_work_under_its_placement() {
+    let t = Temp::new("placed-filter");
+    let db = synthetic(&t, PLACED);
+    // A window's work is kept when its own repo is filtered: a director's
+    // where its row is placed, a unit's by its own name. A unit's work
+    // still nests under its director, wherever that director sits.
+    let root = oct2_in(&db, &["xrepo"]);
+    check_sums(&root);
+    assert_eq!(
+        placements(&root),
+        [
+            (
+                NodeKind::Repo,
+                "wrepo",
+                vec![("director-wrepo", 1.0, vec!["ticket-xrepo-3"])]
+            ),
+            (
+                NodeKind::Repo,
+                "xrepo",
+                vec![("director-xrepo", 2.0, vec!["ticket-xrepo-1"])]
+            ),
+            (
+                NodeKind::Unlinked,
+                "",
+                vec![("director-zz", 1.0, vec!["ticket-xrepo-5"])]
+            ),
+        ]
+    );
+    let root = oct2_in(&db, &["yrepo"]);
+    check_sums(&root);
+    let yrepo = repo(&root, "yrepo");
+    assert_eq!(
+        labels(yrepo, NodeKind::Session),
+        ["director-solo", "director-yrepo"]
+    );
+    assert!(close(3.0, yrepo.metrics.cost_usd));
+    assert!(close(6.0, root.metrics.cost_usd));
 }

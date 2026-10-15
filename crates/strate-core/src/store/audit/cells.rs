@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, Row};
 
 use super::gh::{Gh, GhPr};
 use super::{AuditFilter, Tokens};
-use crate::names::{ParsedName, parse_name};
+use crate::names::{ParsedName, is_director, parse_name};
 use crate::store::Result;
 use crate::time::parse_timestamp;
 
@@ -137,7 +137,7 @@ impl Cells {
             let window = out.windows.get(conn, gh, &row.session_id, row.segment_id)?;
             let w = &out.windows.list[window];
             let wanted = |repo: &String| filter.repos.contains(repo);
-            if !filter.repos.is_empty() && !w.repo.as_ref().is_some_and(wanted) {
+            if !filter.repos.is_empty() && !w.filed_under().is_some_and(wanted) {
                 continue;
             }
             let first_in_window = seen_windows.insert(window);
@@ -231,10 +231,23 @@ pub(crate) struct Window {
     pub(crate) repo: Option<String>,
     /// Named `-sN`, any N: a rotation is a `-sN` window, not "windows - 1".
     rotation: bool,
+    /// Where its name puts it.
     pub(crate) place: Place,
+    /// A row whose name gives no place but whose units or `director-<repo>`
+    /// name do (#63): the repo the tree puts it under, at repo level with
+    /// no issue (see [`Windows::director_repo`]).
+    pub(crate) director_repo: Option<String>,
     /// Its start to the next window's start, or to the session's last
     /// activity.
     pub(crate) span: Option<(i64, i64)>,
+}
+
+impl Window {
+    /// The repo the repo filter reads it by: its name's, else the one its
+    /// row is placed under.
+    fn filed_under(&self) -> Option<&String> {
+        self.repo.as_ref().or(self.director_repo.as_ref())
+    }
 }
 
 /// Every window the filter's cells touch, and their directors', resolved
@@ -251,6 +264,11 @@ struct Windows {
     directors: HashMap<String, Option<usize>>,
     /// Per Session row, its place (see [`Windows::row_place`]).
     places: HashMap<String, Place>,
+    /// Per Session row whose name gives no place, its director repo (see
+    /// [`Windows::director_repo`]).
+    director_repos: HashMap<String, Option<String>>,
+    /// The repos a `director-<repo>` name can name, read once when needed.
+    known_repos: Option<HashSet<String>>,
 }
 
 impl Windows {
@@ -293,18 +311,25 @@ impl Windows {
         let end = named.next.or(session.last);
         let unit = segment.and(named.workstream);
         let chain = session.chain.clone();
-        let (row, place) = match unit {
+        let (row, place, director_repo) = match unit {
             Some(workstream) => {
                 let row = format!("{chain}/{workstream}");
                 let place = self.row_place(conn, gh, &row, parsed.as_ref(), &chain, workstream)?;
-                (row, place)
+                let director_repo = match parsed {
+                    Some(_) => None,
+                    None => {
+                        self.director_repo(conn, &chain, workstream, &named.name, &mut vec![])?
+                    }
+                };
+                (row, place, director_repo)
             }
             // No window: a fallback name, so Unlinked.
-            None => (format!("session:{session_id}"), Place::Unlinked),
+            None => (format!("session:{session_id}"), Place::Unlinked, None),
         };
         self.list.push(Window {
             row: row.clone(),
             place,
+            director_repo,
             repo: parsed.as_ref().map(|p| p.repo.clone()),
             rotation: parsed.is_some_and(|p| p.rotation.is_some()),
             label: named.name,
@@ -339,6 +364,67 @@ impl Windows {
         let found = place(gh, parsed, &row_links(conn, chain, workstream)?);
         self.places.insert(row.to_string(), found.clone());
         Ok(found)
+    }
+
+    /// Where Session row `chain`'s windows in `workstream`, named `name`
+    /// (which gives no place), sits (#63), read once per row: under the one
+    /// repo all its units' rows (see [`unit_rows`]) that name one work in,
+    /// each by its name, or for a unit whose name gives no place, where it
+    /// sits in turn (a unit placed nowhere, such as one named by a pasted
+    /// launch line, is skipped); with those in several repos, or none (a
+    /// row with no units too), under the known repo a `director-<repo>`
+    /// name names ([`Windows::named_repo`]). `None` when neither places it.
+    /// `open` holds the rows being resolved, so rows that direct each other
+    /// end the walk.
+    fn director_repo(
+        &mut self,
+        conn: &Connection,
+        chain: &str,
+        workstream: i64,
+        name: &str,
+        open: &mut Vec<String>,
+    ) -> Result<Option<String>> {
+        let row = format!("{chain}/{workstream}");
+        if let Some(found) = self.director_repos.get(&row) {
+            return Ok(found.clone());
+        }
+        if open.contains(&row) {
+            return Ok(None);
+        }
+        let units = unit_rows(conn, chain, workstream)?;
+        open.push(row.clone());
+        let mut repos = Vec::with_capacity(units.len());
+        for unit in units {
+            let repo = match unit.parsed {
+                Some(p) => Some(p.repo),
+                None => self.director_repo(conn, &unit.chain, unit.workstream, &unit.name, open)?,
+            };
+            repos.extend(repo);
+        }
+        open.pop();
+        let found = match repos.split_first() {
+            Some((first, rest)) if rest.iter().all(|r| r == first) => Some(first.clone()),
+            _ => self.named_repo(conn, name)?,
+        };
+        self.director_repos.insert(row, found.clone());
+        Ok(found)
+    }
+
+    /// The repo a `director-<repo>` name names, when the store knows it:
+    /// a repo the GitHub cache holds or a window name parses to (in any
+    /// case, as the cache or name spells it).
+    fn named_repo(&mut self, conn: &Connection, name: &str) -> Result<Option<String>> {
+        let Some((_, scope)) = name.split_once('-').filter(|_| is_director(name)) else {
+            return Ok(None);
+        };
+        let known = match &mut self.known_repos {
+            Some(known) => known,
+            empty => empty.insert(known_repos(conn)?),
+        };
+        Ok(known
+            .iter()
+            .find(|r| r.eq_ignore_ascii_case(scope))
+            .cloned())
     }
 
     /// Records the director's window Session row `row` (`chain`'s windows
@@ -415,6 +501,82 @@ fn launched_from(
         Ok((r.get(0)?, r.get(1)?))
     })
     .optional()
+}
+
+/// A unit's Session row, as [`unit_rows`] reads it.
+struct UnitRow {
+    chain: String,
+    workstream: i64,
+    /// Its merge-resolved name.
+    name: String,
+    /// What that name says, unless it is a cwd/branch fallback.
+    parsed: Option<ParsedName>,
+}
+
+/// The unit rows that nest under Session row `chain`'s windows in
+/// `workstream`: each row (unit chain and workstream) of a session one of
+/// `chain`'s sessions directed whose [`launched_from`] is a window of
+/// that row, in chain and workstream order.
+fn unit_rows(conn: &Connection, chain: &str, workstream: i64) -> Result<Vec<UnitRow>> {
+    let candidates: Vec<(String, i64, String, bool)> = conn
+        .prepare_cached(
+            "SELECT DISTINCT ifnull(c.process_root, c.session_id), r.root, w.name, w.fallback
+             FROM directs AS x
+             JOIN sessions AS p ON p.session_id = x.parent
+             JOIN sessions AS c ON c.session_id = x.child
+             JOIN segments AS g ON g.session_id = x.child
+             JOIN workstream_roots AS r ON r.id = g.workstream_id
+             JOIN workstreams AS w ON w.id = r.root
+             WHERE ifnull(p.process_root, p.session_id) = ?1
+             ORDER BY 1, 2",
+        )?
+        .query_map([chain], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
+        .collect::<Result<_>>()?;
+    let mut window_row = conn.prepare_cached(
+        "SELECT (SELECT ifnull(process_root, session_id) FROM sessions WHERE session_id = ?1),
+             (SELECT r.root FROM segments AS g JOIN workstream_roots AS r ON r.id = g.workstream_id
+              WHERE g.id = ?2)",
+    )?;
+    let mut out = Vec::new();
+    for (unit_chain, unit_workstream, name, fallback) in candidates {
+        if (unit_chain.as_str(), unit_workstream) == (chain, workstream) {
+            continue;
+        }
+        let Some((parent, Some(segment))) = launched_from(conn, &unit_chain, unit_workstream)?
+        else {
+            continue;
+        };
+        let (parent_chain, parent_workstream): (Option<String>, Option<i64>) = window_row
+            .query_row(rusqlite::params![parent, segment], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+        if parent_chain.as_deref() == Some(chain) && parent_workstream == Some(workstream) {
+            out.push(UnitRow {
+                chain: unit_chain,
+                workstream: unit_workstream,
+                parsed: (!fallback).then(|| parse_name(&name)).flatten(),
+                name,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Every repo a `director-<repo>` name can name: the GitHub cache's, and
+/// those window names parse to.
+fn known_repos(conn: &Connection) -> Result<HashSet<String>> {
+    let mut known: HashSet<String> = conn
+        .prepare_cached("SELECT slug FROM gh_repos")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    let names: Vec<String> = conn
+        .prepare_cached("SELECT name FROM workstreams WHERE fallback = 0")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    known.extend(names.iter().filter_map(|n| parse_name(n)).map(|p| p.repo));
+    Ok(known)
 }
 
 /// What every window of one session shares.

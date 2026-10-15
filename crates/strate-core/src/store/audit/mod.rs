@@ -18,13 +18,20 @@
 //! windows under its "Direct work"), and under a PR: the issue's PR that
 //! the newest `github_links` entry of any of the row's sessions names, else
 //! the issue's only PR, else none. A row has one place, whichever of its
-//! windows a link came from, so it is one node. An issue the cache doesn't hold (no `gh`, a failed fetch) has
-//! `github: false`, no epic, PR or progress, and is open. Only a window that
-//! is unnamed, has a fallback name or has a name that doesn't parse sits
-//! under "Unlinked", and with it a director's row. Any other group-by puts
-//! one Group node per value (local day, PR, agent type, model) above that
-//! hierarchy; the PR group, the repo filter and the headline read a unit's
-//! own window, wherever its row nests.
+//! windows a link came from, so it is one node. An issue the cache doesn't
+//! hold (no `gh`, a failed fetch) has `github: false`, no epic, PR or
+//! progress, and is open. A row whose name gives no place (a director's)
+//! can still sit under a repo, as a Session node beside its issues (#63):
+//! the one repo all its unit rows that name one work in (a unit whose name
+//! gives no place counting where it sits in turn, one placed nowhere
+//! skipped), else (units in several repos, or none) the repo a
+//! `director-<repo>` name names when the GitHub cache or a window name
+//! knows it. The outermost row places a nest. Any other window that is
+//! unnamed, has a fallback name or has a name that doesn't parse sits
+//! under "Unlinked". Any other group-by puts one Group
+//! node per value (local day, PR, agent type, model) above that hierarchy;
+//! the PR group and the headline read a unit's own window, wherever its
+//! row nests, and so does the repo filter (see [`AuditFilter`]).
 //!
 //! Every node sums the cells under it. $, tokens, agent-hours (subagent
 //! wall) and the counts are additive at every level. Sessions, agents and
@@ -75,7 +82,12 @@ pub enum GroupBy {
 
 /// What [`audit`] rolls up: the cells on local days `from..=to`
 /// (`YYYY-MM-DD`) of windows in `repos` (repo slugs; empty: every window,
-/// Unlinked included).
+/// Unlinked included). A window is in the repo its name parses to, or a
+/// director's in the repo its row is placed under. A unit's cells still
+/// nest under its director's row wherever that is placed, so a director
+/// with units in two repos shows, under its own placement, when either is
+/// filtered: holding only the filtered repo's units, and its own cells only
+/// when its placement is filtered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditFilter {

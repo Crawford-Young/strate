@@ -522,13 +522,14 @@ fn a_director_tab_counts_what_its_nested_units_need() {
 }
 
 #[test]
-fn the_director_canvas_draws_every_unit_any_of_its_sessions_directed() {
+fn the_director_canvas_draws_every_live_unit_any_of_its_sessions_directed() {
     let t = Temp::new("canvas");
     let (mut store, reader) = viewed(&t);
     store
         .apply_registry(&[
             listed(4101, R2, "director-demo", "busy"),
             listed(4104, N1, "ticket-demo-repo-1", "busy"),
+            listed(4103, X2, "director-beta", "busy"),
         ])
         .expect("live");
     let rows = views::workstreams(&reader).expect("workstreams");
@@ -570,27 +571,15 @@ fn the_director_canvas_draws_every_unit_any_of_its_sessions_directed() {
                 false
             ),
             ("subagent", Some(S2), "-", AgentState::Done, false),
-            // N2 is not live: a done unit.
-            (
-                "orchestrator",
-                None,
-                "ticket-demo-repo-2",
-                AgentState::Done,
-                false
-            ),
+            // N2, also directed by R1, is not live: a finished unit is not
+            // drawn.
         ]
     );
     let id = |i: usize| graph.agents[i].id;
-    let (director, s1, n1, s2, n2) = (id(0), id(1), id(2), id(3), id(4));
+    let (director, s1, n1, s2) = (id(0), id(1), id(2), id(3));
     assert_eq!(
         graph.agents.iter().map(|a| a.parent).collect::<Vec<_>>(),
-        [
-            None,
-            Some(director),
-            Some(director),
-            Some(n1),
-            Some(director)
-        ]
+        [None, Some(director), Some(director), Some(n1)]
     );
     let edge = |kind: &str, parent, child| GraphEdge {
         kind: kind.into(),
@@ -603,11 +592,10 @@ fn the_director_canvas_draws_every_unit_any_of_its_sessions_directed() {
             edge("dispatch", director, s1),
             edge("directs", director, n1),
             edge("dispatch", n1, s2),
-            edge("directs", director, n2),
         ]
     );
 
-    // A unit that is itself a director: alpha's canvas draws beta.
+    // A live unit that is itself a director: alpha's canvas draws beta.
     let graph = views::live_graph(&reader, tab(&rows, "director-alpha").id)
         .expect("query")
         .expect("a graph");
