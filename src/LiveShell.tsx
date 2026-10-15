@@ -11,7 +11,7 @@ import {
 } from '@crawfordyoung/ui'
 import { X } from 'lucide-react'
 import { useRef, useState, type RefObject } from 'react'
-import { liveGraph, status, workstreams, type Workstream } from './api'
+import { liveGraph, needsYou, status, workstreams, type Workstream } from './api'
 import { Canvas, agentName } from './Canvas'
 import { Header } from './Header'
 import { useLoad, useStoreVersion } from './hooks'
@@ -41,19 +41,22 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
   const version = useStoreVersion(hidden)
   const [selection, setSelection] = useState<Selection>(NONE)
   const overview = useLoad('overview', version, async () => {
-    const loaded = await Promise.all([status(), workstreams()])
+    const loaded = await Promise.all([status(), workstreams(), needsYou()])
     // A pick whose session is gone is forgotten, with its node, so neither returns if the tab
     // reappears. Done as the data lands, in the same batch as the data, since that is the only time the live set changes.
     setSelection((s) => (s.tab === null || isLive(loaded[1], s.tab) ? s : NONE))
     return loaded
   })
+  // A new tab shows with no node selected.
+  const pickTab = (tab: number) => setSelection({ tab, agent: null })
   // Returns the same object when nothing changes, so a repeated layout event rerenders nothing.
   const setAgent = (agent: number | null) =>
     setSelection((s) => (s.agent === agent ? s : { ...s, agent }))
   const panels = usePanels()
   const canvasRef = useRef<HTMLElement>(null)
 
-  const [storeStatus, sessions] = overview && 'value' in overview ? overview.value : [null, []]
+  const [storeStatus, sessions, waits] =
+    overview && 'value' in overview ? overview.value : [null, [], []]
   // Only live, top-level sessions get a tab: past ones belong to the audit view, and units
   // show on their director's canvas.
   const liveSessions = sessions.filter(hasTab)
@@ -89,14 +92,15 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
   return (
     <Tabs
       value={activeKey ?? ''}
-      onValueChange={(value) => {
-        setSelection({ tab: Number(value), agent: null })
-      }}
+      onValueChange={(value) => pickTab(Number(value))}
       hidden={hidden}
       className="flex h-screen flex-col bg-background text-foreground"
     >
       <Header
+        sessions={sessions}
         liveSessions={liveSessions}
+        waits={waits}
+        onGoToTab={pickTab}
         activeKey={activeKey}
         prefs={panels.prefs}
         onTogglePanel={panels.toggle}

@@ -1,17 +1,23 @@
-// The top bar: the app name, one tab per live orchestrator, then the panel toggles and the Audit
-// button on the right.
+// The top bar: the app name, one tab per live orchestrator, then the needs-you chip (while anything
+// waits), the panel toggles and the Audit button on the right.
 // Must render inside a `Tabs` (the strip is a TabsList).
 import { Button, TabsList, Toggle } from '@crawfordyoung/ui'
 import { ChartColumnStacked, SlidersVertical, Terminal } from 'lucide-react'
 import { useEffect, useRef, type ReactNode, type RefObject } from 'react'
-import type { Workstream } from './api'
+import type { NeedsYou, Workstream } from './api'
+import { NeedsYouChip } from './NeedsYouChip'
 import { OrchestratorTab } from './OrchestratorTab'
 import type { LayoutPrefs } from './layout'
 
 type TogglePanel = 'harness' | 'terminal'
 
 interface HeaderProps {
+  /** Every workstream, live or not. */
+  sessions: Workstream[]
+  /** The ones with a tab. */
   liveSessions: Workstream[]
+  waits: NeedsYou[]
+  onGoToTab: (id: number) => void
   /** The selected tab's value, as the `Tabs` sees it. */
   activeKey: string | null
   prefs: LayoutPrefs
@@ -22,7 +28,10 @@ interface HeaderProps {
 }
 
 export function Header({
+  sessions,
   liveSessions,
+  waits,
+  onGoToTab,
   activeKey,
   prefs,
   onTogglePanel,
@@ -70,6 +79,15 @@ export function Header({
       )}
       <div className="flex-1" />
       <div className="flex items-center gap-1.5">
+        {/* Unmounted with nothing waiting, so a wait that returns finds the list closed. */}
+        {waits.length > 0 && (
+          <NeedsYouChip
+            waits={waits}
+            sessions={sessions}
+            tabs={liveSessions}
+            onGoToTab={onGoToTab}
+          />
+        )}
         {panelToggle('harness', 'Harness', <SlidersVertical aria-hidden className="size-3.5" />)}
         {panelToggle('terminal', 'Terminal', <Terminal aria-hidden className="size-3.5" />)}
         <Button
