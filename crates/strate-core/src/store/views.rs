@@ -404,11 +404,7 @@ pub fn workstreams(conn: &Connection) -> Result<Vec<Workstream>> {
             *needs.entry(w).or_default() += 1;
         }
     }
-    let mut stmt = conn.prepare_cached(
-        "SELECT w.id, w.name, w.fallback, c.cost_usd, ifnull(c.unpriced, 0)
-         FROM workstreams AS w LEFT JOIN workstream_costs AS c ON c.workstream = w.id
-         WHERE w.merged_into IS NULL",
-    )?;
+    let mut stmt = conn.prepare_cached(WORKSTREAMS_SQL)?;
     let mut out = Vec::new();
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -444,6 +440,11 @@ pub fn workstreams(conn: &Connection) -> Result<Vec<Workstream>> {
     out.sort_by(|a, b| (b.live, &b.started_at, a.id).cmp(&(a.live, &a.started_at, b.id)));
     Ok(out)
 }
+
+/// [`workstreams`]' query: each merge root and its $.
+const WORKSTREAMS_SQL: &str = "SELECT w.id, w.name, w.fallback, c.cost_usd, ifnull(c.unpriced, 0)
+     FROM workstreams AS w LEFT JOIN workstream_costs AS c ON c.workstream = w.id
+     WHERE w.merged_into IS NULL";
 
 /// $ per merge-resolved workstream (the `workstream_costs` view).
 pub fn workstream_costs(conn: &Connection) -> Result<Vec<WorkstreamCost>> {
@@ -911,6 +912,112 @@ mod tests {
             "{plan:?}"
         );
         drop(conn);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    /// `workstreams()` sums every request on each call, so its cost lookup
+    /// reads events from `events_requests` alone: one pass over the index,
+    /// one search per request for a fuller copy, and no row read (#79).
+    #[test]
+    fn a_tabs_cost_is_read_from_the_request_index() {
+        let dir = crate::tail::test_dir("workstreams-plan");
+        let db = dir.join("strate.db");
+        drop(super::super::Store::open(&db).expect("open"));
+        let conn = super::super::Store::open_reader(&db).expect("reader");
+        let plan = super::super::query_plan(&conn, WORKSTREAMS_SQL);
+        let events: Vec<&str> = plan
+            .iter()
+            .map(String::as_str)
+            .filter(|step| matches!(step.split(' ').nth(1), Some("e" | "o")))
+            .collect();
+        assert_eq!(
+            events,
+            [
+                "SCAN e USING COVERING INDEX events_requests",
+                "SEARCH o USING COVERING INDEX events_requests (request_key=?)",
+            ],
+            "{plan:?}"
+        );
+        drop(conn);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    /// Session `p`'s orchestrator records split at offset 500 between
+    /// workstreams 1 and 2; its subagent `sub` joined 2's segment and `lost`
+    /// none. `q`'s one segment is in 3, merged into 1. Each request record
+    /// is (offset, output tokens, $), of model `m` (an upgrade's rollup
+    /// reads one): `k3` streamed twice, `k4` is
+    /// unpriced, and offset 50 precedes p's first segment.
+    const SPLIT_COSTS: &str = "
+        INSERT INTO workstreams (id, name, merged_into) VALUES
+            (1, 'a', NULL), (2, 'b', NULL), (3, 'c', 1);
+        INSERT INTO sessions (session_id, workstream_id) VALUES ('p', 2), ('q', 3);
+        INSERT INTO segments (id, session_id, start_offset, workstream_id) VALUES
+            (10, 'p', 100, 1), (11, 'p', 500, 2), (12, 'q', 0, 3);
+        INSERT INTO agents (session_id, agent_id, kind, segment_id) VALUES
+            ('p', NULL, 'orchestrator', NULL), ('p', 'sub', 'subagent', 11),
+            ('p', 'lost', 'subagent', NULL), ('q', NULL, 'orchestrator', NULL);
+        INSERT INTO events (session_id, agent_id, file, byte_offset, raw, request_key, model,
+            usage, output_tokens, cost_usd) VALUES
+            ('p', NULL, 'p', 50, '{}', 'k1', 'm', '{}', 1, 1.0),
+            ('p', NULL, 'p', 100, '{}', 'k2', 'm', '{}', 1, 2.0),
+            ('p', NULL, 'p', 150, '{}', NULL, NULL, NULL, NULL, NULL),
+            ('p', NULL, 'p', 200, '{}', 'k3', 'm', '{}', 5, 4.0),
+            ('p', NULL, 'p', 250, '{}', 'k3', 'm', '{}', 9, 8.0),
+            ('p', NULL, 'p', 600, '{}', 'k4', 'm', '{}', 1, NULL),
+            ('p', 'sub', 'p-sub', 0, '{}', 'k5', 'm', '{}', 1, 16.0),
+            ('p', 'lost', 'p-lost', 0, '{}', 'k6', 'm', '{}', 1, 32.0),
+            ('q', NULL, 'q', 10, '{}', 'k7', 'm', '{}', 1, 64.0);";
+
+    #[test]
+    fn a_request_costs_where_its_record_falls() {
+        let (dir, store) = seeded("views-split-costs", SPLIT_COSTS);
+        let costs: Vec<(i64, Option<f64>, i64)> = workstream_costs(&store.conn)
+            .expect("costs")
+            .into_iter()
+            .map(|c| (c.workstream, c.cost_usd, c.unpriced))
+            .collect();
+        // 1: p before 500 (k2, k3's fuller record) and merged-in q; 2: p
+        // after 500 and sub. k1 and lost have no segment.
+        assert_eq!(costs, [(1, Some(74.0), 0), (2, Some(16.0), 1)]);
+        let tabs: Vec<(i64, Option<f64>, i64)> = workstreams(&store.conn)
+            .expect("workstreams")
+            .into_iter()
+            .map(|w| (w.id, w.cost_usd, w.unpriced))
+            .collect();
+        assert_eq!(tabs.len(), 2, "{tabs:?}");
+        assert!(tabs.contains(&(1, Some(74.0), 0)), "{tabs:?}");
+        assert!(tabs.contains(&(2, Some(16.0), 1)), "{tabs:?}");
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_v14_store_keeps_its_workstream_costs() {
+        let dir = crate::tail::test_dir("views-v14-costs");
+        let db = dir.join("strate.db");
+        let mut v14 = Connection::open(&db).expect("v14 db");
+        super::super::migrate::migrate(&mut v14, &super::super::migrate::MIGRATIONS[..14])
+            .expect("v14");
+        v14.execute_batch(SPLIT_COSTS).expect("v14 rows");
+        let before: Vec<(i64, Option<f64>, i64)> = v14
+            .prepare("SELECT workstream, cost_usd, unpriced FROM workstream_costs ORDER BY 1")
+            .expect("v14 costs")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("rows")
+            .collect::<Result<_>>()
+            .expect("costs");
+        drop(v14);
+
+        let store = super::super::Store::open_in(&db, "UTC").expect("upgrade");
+        let after: Vec<(i64, Option<f64>, i64)> = workstream_costs(&store.conn)
+            .expect("costs")
+            .into_iter()
+            .map(|c| (c.workstream, c.cost_usd, c.unpriced))
+            .collect();
+        assert_eq!(before, [(1, Some(74.0), 0), (2, Some(16.0), 1)]);
+        assert_eq!(after, before);
+        drop(store);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
