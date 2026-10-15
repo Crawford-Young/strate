@@ -262,6 +262,9 @@ struct Windows {
     /// Per Session row, the director's window it nests under (see
     /// [`launched_from`]); `None` while it resolves.
     directors: HashMap<String, Option<usize>>,
+    /// Per Session row with a director, whether it tops a cycle of rows
+    /// that direct each other (see [`Windows::tops_cycle`]).
+    tops: HashMap<String, bool>,
     /// Per Session row, its place (see [`Windows::row_place`]).
     places: HashMap<String, Place>,
     /// Per Session row whose name gives no place, its director repo (see
@@ -317,9 +320,7 @@ impl Windows {
                 let place = self.row_place(conn, gh, &row, parsed.as_ref(), &chain, workstream)?;
                 let director_repo = match parsed {
                     Some(_) => None,
-                    None => {
-                        self.director_repo(conn, &chain, workstream, &named.name, &mut vec![])?
-                    }
+                    None => self.director_repo(conn, &chain, workstream, &named.name)?,
                 };
                 (row, place, director_repo)
             }
@@ -374,34 +375,31 @@ impl Windows {
     /// launch line, is skipped); with those in several repos, or none (a
     /// row with no units too), under the known repo a `director-<repo>`
     /// name names ([`Windows::named_repo`]). `None` when neither places it.
-    /// `open` holds the rows being resolved, so rows that direct each other
-    /// end the walk.
+    /// A unit row that tops its cycle ([`Windows::tops_cycle`]) doesn't nest
+    /// here, so the walk down never meets a row twice.
     fn director_repo(
         &mut self,
         conn: &Connection,
         chain: &str,
         workstream: i64,
         name: &str,
-        open: &mut Vec<String>,
     ) -> Result<Option<String>> {
         let row = format!("{chain}/{workstream}");
         if let Some(found) = self.director_repos.get(&row) {
             return Ok(found.clone());
         }
-        if open.contains(&row) {
-            return Ok(None);
-        }
         let units = unit_rows(conn, chain, workstream)?;
-        open.push(row.clone());
         let mut repos = Vec::with_capacity(units.len());
         for unit in units {
+            if self.tops_cycle(conn, &unit.chain, unit.workstream)? {
+                continue;
+            }
             let repo = match unit.parsed {
                 Some(p) => Some(p.repo),
-                None => self.director_repo(conn, &unit.chain, unit.workstream, &unit.name, open)?,
+                None => self.director_repo(conn, &unit.chain, unit.workstream, &unit.name)?,
             };
             repos.extend(repo);
         }
-        open.pop();
         let found = match repos.split_first() {
             Some((first, rest)) if rest.iter().all(|r| r == first) => Some(first.clone()),
             _ => self.named_repo(conn, name)?,
@@ -428,9 +426,10 @@ impl Windows {
     }
 
     /// Records the director's window Session row `row` (`chain`'s windows
-    /// in `workstream`) nests under (see [`launched_from`]), once per row.
-    /// The row is marked `None` while its director resolves, so a director
-    /// chain that leads back to it ends there.
+    /// in `workstream`) nests under (see [`launched_from`]), once per row:
+    /// none for a row that tops its cycle ([`Windows::tops_cycle`]). The
+    /// row is marked `None` while its director resolves, so resolving its
+    /// director's row, and up, reads it once.
     fn resolve_director(
         &mut self,
         conn: &Connection,
@@ -444,17 +443,57 @@ impl Windows {
         }
         self.directors.insert(row.to_string(), None);
         let director = match launched_from(conn, chain, workstream)? {
+            Some(_) if self.tops_cycle(conn, chain, workstream)? => None,
             Some((parent, segment)) => Some(self.get(conn, gh, &parent, segment)?),
             None => None,
         };
-        // Rows that direct each other: the one resolved first stays on top.
-        let director = director.filter(|&d| self.up(d).all(|w| w.row != row));
         self.directors.insert(row.to_string(), director);
         Ok(())
     }
 
+    /// Whether Session row `chain`'s windows in `workstream` tops a cycle
+    /// of rows that direct each other, read once per row. `directs` refuses
+    /// only a cycle of sessions, so rows, each a chain's sessions, can still
+    /// form one (one row's link directing another row, whose session
+    /// directed the first row's next link), and a row can direct itself.
+    /// The rule, a function of the data whatever order the rows resolve in:
+    /// the cycle's earliest-started row is the director, and the rest keep
+    /// their links, so all nest under it. Earliest is by the row's first
+    /// window's start ([`row_start`]; no start sorts last), then its row
+    /// key. That row nests under none of the cycle, so the nest has no loop.
+    fn tops_cycle(&mut self, conn: &Connection, chain: &str, workstream: i64) -> Result<bool> {
+        let row = format!("{chain}/{workstream}");
+        if let Some(&found) = self.tops.get(&row) {
+            return Ok(found);
+        }
+        let start = (chain.to_string(), workstream);
+        let mut cycle = vec![start.clone()];
+        let mut at = director_row(conn, chain, workstream)?;
+        // Up to a row with no director, or a cycle above this row (which
+        // isn't on it), or back to this row.
+        while let Some(next) = at.take_if(|next| !cycle.contains(next)) {
+            at = director_row(conn, &next.0, next.1)?;
+            cycle.push(next);
+        }
+        if at != Some(start) {
+            self.tops.insert(row, false);
+            return Ok(false);
+        }
+        let mut earliest = Vec::with_capacity(cycle.len());
+        for (chain, workstream) in &cycle {
+            let start = row_start(conn, chain, *workstream)?;
+            earliest.push((start.is_none(), start, format!("{chain}/{workstream}")));
+        }
+        let top = earliest.iter().min().map(|e| e.2.clone());
+        for (_, _, key) in earliest {
+            let tops = Some(&key) == top.as_ref();
+            self.tops.insert(key, tops);
+        }
+        Ok(self.tops[&row])
+    }
+
     /// Window `at`, then the director's window its row nests under, and up.
-    /// A row nests only under a director whose walk up never meets it, so
+    /// Every cycle of rows has one row on top ([`Windows::tops_cycle`]), so
     /// the walk ends.
     fn up(&self, at: usize) -> impl Iterator<Item = &Window> {
         std::iter::successors(Some(&self.list[at]), |w| {
@@ -503,6 +542,43 @@ fn launched_from(
     .optional()
 }
 
+/// The Session row (chain and workstream) of the window a unit's Session
+/// row (`chain`'s windows in `workstream`) was [`launched_from`]; `None`
+/// when no director messaged it, or messaged it from no window.
+fn director_row(conn: &Connection, chain: &str, workstream: i64) -> Result<Option<(String, i64)>> {
+    let Some((parent, Some(segment))) = launched_from(conn, chain, workstream)? else {
+        return Ok(None);
+    };
+    let (chain, workstream): (Option<String>, Option<i64>) = conn
+        .prepare_cached(
+            "SELECT (SELECT ifnull(process_root, session_id) FROM sessions WHERE session_id = ?1),
+                 (SELECT r.root FROM segments AS g
+                  JOIN workstream_roots AS r ON r.id = g.workstream_id WHERE g.id = ?2)",
+        )?
+        .query_row(rusqlite::params![parent, segment], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+    Ok(chain.zip(workstream))
+}
+
+/// When Session row `chain`'s windows in `workstream` starts: its first
+/// window's start, `None` when no window has one.
+fn row_start(conn: &Connection, chain: &str, workstream: i64) -> Result<Option<i64>> {
+    let starts: Vec<Option<String>> = conn
+        .prepare_cached(
+            "SELECT g.started_at FROM segments AS g
+             JOIN sessions AS s ON s.session_id = g.session_id
+             JOIN workstream_roots AS r ON r.id = g.workstream_id
+             WHERE ifnull(s.process_root, s.session_id) = ?1 AND r.root = ?2",
+        )?
+        .query_map(rusqlite::params![chain, workstream], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    Ok(starts
+        .iter()
+        .filter_map(|s| s.as_deref().and_then(parse_timestamp))
+        .min())
+}
+
 /// A unit's Session row, as [`unit_rows`] reads it.
 struct UnitRow {
     chain: String,
@@ -534,25 +610,13 @@ fn unit_rows(conn: &Connection, chain: &str, workstream: i64) -> Result<Vec<Unit
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })?
         .collect::<Result<_>>()?;
-    let mut window_row = conn.prepare_cached(
-        "SELECT (SELECT ifnull(process_root, session_id) FROM sessions WHERE session_id = ?1),
-             (SELECT r.root FROM segments AS g JOIN workstream_roots AS r ON r.id = g.workstream_id
-              WHERE g.id = ?2)",
-    )?;
     let mut out = Vec::new();
     for (unit_chain, unit_workstream, name, fallback) in candidates {
         if (unit_chain.as_str(), unit_workstream) == (chain, workstream) {
             continue;
         }
-        let Some((parent, Some(segment))) = launched_from(conn, &unit_chain, unit_workstream)?
-        else {
-            continue;
-        };
-        let (parent_chain, parent_workstream): (Option<String>, Option<i64>) = window_row
-            .query_row(rusqlite::params![parent, segment], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })?;
-        if parent_chain.as_deref() == Some(chain) && parent_workstream == Some(workstream) {
+        let director = director_row(conn, &unit_chain, unit_workstream)?;
+        if director.is_some_and(|(c, w)| c == chain && w == workstream) {
             out.push(UnitRow {
                 chain: unit_chain,
                 workstream: unit_workstream,
@@ -826,6 +890,97 @@ mod tests {
             "{session}"
         );
         drop(conn);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    /// Rows A (`director-alpha`: `z1` at 10:00, then `z2` after a
+    /// `/clear`) and B (`director-beta`: `b1` at 11:00) direct each other:
+    /// `z1` messaged `b1` first, and `b1` messaged `z2`, which `directs`
+    /// allows (it refuses only a cycle of sessions). B also directs C
+    /// (`demo-7`). Session ids sort B's row before A's.
+    const MUTUAL: &str = "
+        INSERT INTO workstreams (id, name) VALUES
+            (1, 'director-alpha'), (2, 'director-beta'), (3, 'demo-7');
+        INSERT INTO sessions (session_id, process_root, started_at) VALUES
+            ('z1', 'z1', '2026-10-07T10:00:00.000Z'), ('z2', 'z1', '2026-10-07T12:00:00.000Z'),
+            ('b1', 'b1', '2026-10-07T11:00:00.000Z'), ('c1', 'c1', '2026-10-07T11:30:00.000Z');
+        INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id) VALUES
+            (1, 'z1', 0, '2026-10-07T10:00:00.000Z', 1),
+            (2, 'z2', 0, '2026-10-07T12:00:00.000Z', 1),
+            (3, 'b1', 0, '2026-10-07T11:00:00.000Z', 2),
+            (4, 'c1', 0, '2026-10-07T11:30:00.000Z', 3);
+        INSERT INTO events (session_id, file, byte_offset, raw, sent_msg_id) VALUES
+            ('z1', 'z1.jsonl', 10, '{}', 'm1'),
+            ('b1', 'b1.jsonl', 10, '{}', 'm2'),
+            ('b1', 'b1.jsonl', 20, '{}', 'm3');
+        INSERT INTO directs (child, parent, msg_id) VALUES
+            ('b1', 'z1', 'm1'), ('z2', 'b1', 'm2'), ('c1', 'b1', 'm3');";
+
+    /// Rows that direct each other nest by the earlier-started row, the
+    /// same way whichever window resolves first.
+    #[test]
+    fn rows_that_direct_each_other_nest_under_the_earlier_started_whatever_the_order() {
+        let dir = test_dir("audit-mutual");
+        let store = Store::open_in(dir.join("strate.db"), "UTC").expect("open");
+        store.conn.execute_batch(MUTUAL).expect("seed");
+        let gh = Gh::load(&store.conn).expect("gh");
+        let windows = [("z1", 1), ("b1", 3), ("c1", 4)];
+        // Each window's rows, innermost first, and its director repo.
+        let nesting = |order: &[(&str, i64)]| {
+            let mut w = Windows::default();
+            for &(session, segment) in order {
+                w.get(&store.conn, &gh, session, Some(segment))
+                    .expect("window");
+            }
+            windows.map(|(session, segment)| {
+                let at = w.index[&(session.to_string(), Some(segment))];
+                let rows: Vec<String> = w.up(at).map(|x| x.row.clone()).collect();
+                (rows, w.list[at].director_repo.clone())
+            })
+        };
+        let alpha = || "z1/1".to_string();
+        let beta = || "b1/2".to_string();
+        let demo = || Some("demo".to_string());
+        let expected = [
+            (vec![alpha()], demo()),
+            (vec![beta(), alpha()], demo()),
+            (vec!["c1/3".to_string(), beta(), alpha()], None),
+        ];
+        let mut reversed = windows;
+        reversed.reverse();
+        assert_eq!(nesting(&windows), expected, "A's window first");
+        assert_eq!(nesting(&reversed), expected, "C's window first");
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    /// A row whose first link directed its next is a cycle of one: it
+    /// tops it, under nothing.
+    #[test]
+    fn a_row_that_directs_itself_nests_under_nothing() {
+        let dir = test_dir("audit-self-directed");
+        let store = Store::open_in(dir.join("strate.db"), "UTC").expect("open");
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO workstreams (id, name) VALUES (1, 'director-alpha');
+                 INSERT INTO sessions (session_id, process_root, started_at) VALUES
+                     ('z1', 'z1', '2026-10-07T10:00:00.000Z'),
+                     ('z2', 'z1', '2026-10-07T12:00:00.000Z');
+                 INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id)
+                 VALUES (1, 'z1', 0, '2026-10-07T10:00:00.000Z', 1),
+                     (2, 'z2', 0, '2026-10-07T12:00:00.000Z', 1);
+                 INSERT INTO events (session_id, file, byte_offset, raw, sent_msg_id)
+                 VALUES ('z1', 'z1.jsonl', 10, '{}', 'm1');
+                 INSERT INTO directs (child, parent, msg_id) VALUES ('z2', 'z1', 'm1');",
+            )
+            .expect("seed");
+        let gh = Gh::load(&store.conn).expect("gh");
+        let mut w = Windows::default();
+        let at = w.get(&store.conn, &gh, "z2", Some(2)).expect("window");
+        let rows: Vec<&str> = w.up(at).map(|x| x.row.as_str()).collect();
+        assert_eq!(rows, ["z1/1"]);
+        drop(store);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 }

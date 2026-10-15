@@ -10,8 +10,9 @@
 //! next ticket. A director's `--bg` unit (a row with a session in
 //! `directs`) nests under the director's row, the one holding the window
 //! that messaged it, and its work counts there, not under its own issue;
-//! a unit of a unit nests a level deeper. Rows that direct each other nest
-//! one way only. Its name (`<repo>-<issue>[-sN]`, bare or behind
+//! a unit of a unit nests a level deeper. Rows that direct each other (a
+//! cycle) nest under the earliest-started of them, by its first window's
+//! start, whatever order they resolve in (#66). Its name (`<repo>-<issue>[-sN]`, bare or behind
 //! `ticket-` or `epic-`; see [`crate::names`]) places it under its repo and
 //! issue. When the GitHub cache holds that issue, it also goes under each
 //! epic above the issue, outermost first (an epic is one node, its own
