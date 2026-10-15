@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ for #26, nest-home/ and github/nest-home.json for #47, perf-home/ for #51, directs-home/ for #53, chain-home/ for #63). Field names come from
+# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ and github/audit-home.json for #26, nest-home/ and github/nest-home.json for #47, perf-home/ and github/perf-home.json for #51, directs-home/ for #53, chain-home/ for #63). Field names come from
 # the "~/.claude format, as observed" comment on strate #10; every value is a placeholder.
 set -eu
 cd "$(dirname "$0")/.."
@@ -310,6 +310,20 @@ aat $A5 /work/scratch '"isSidechain":false'
 # A6, window demo-8 (the epic itself), 2026-10-05 10:00:00..10:00:20Z: direct work.
 aat $A6 /work/demo '"isSidechain":false'
 { atitle demo-8; aprompt 2026-10-05T10:00:00 a6-01; areply 2026-10-05T10:00:20 a6-02 req_h1 $OPUS "$UO" "$TEXT"; } > "$AD/$A6.jsonl"
+cat > fixtures/github/audit-home.json <<'JSON'
+{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"CURSOR-A"},"nodes":[
+{"number":8,"title":"Epic: lorem audit","state":"OPEN","stateReason":null,"createdAt":"2026-10-01T09:00:00Z","closedAt":null,"parent":null,
+ "subIssuesSummary":{"total":2,"completed":1},"closedByPullRequestsReferences":{"nodes":[]}},
+{"number":9,"title":"Ipsum rollup","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-10-02T09:00:00Z","closedAt":"2026-10-05T12:00:00Z","parent":{"number":8,"repository":{"nameWithOwner":"example/demo"}},
+ "subIssuesSummary":{"total":0,"completed":0},
+ "closedByPullRequestsReferences":{"nodes":[
+   {"number":12,"state":"MERGED","createdAt":"2026-10-05T04:30:00Z","mergedAt":"2026-10-05T11:00:00Z","url":"https://github.com/example/demo/pull/12"}]}},
+{"number":10,"title":"Dolor view","state":"OPEN","stateReason":null,"createdAt":"2026-10-02T10:00:00Z","closedAt":null,"parent":{"number":8,"repository":{"nameWithOwner":"example/demo"}},
+ "subIssuesSummary":{"total":0,"completed":0},"closedByPullRequestsReferences":{"nodes":[]}},
+{"number":11,"title":"Sit tracking","state":"CLOSED","stateReason":"NOT_PLANNED","createdAt":"2026-10-02T11:00:00Z","closedAt":"2026-10-03T11:00:00Z","parent":{"number":8,"repository":{"nameWithOwner":"example/elsewhere"}},
+ "subIssuesSummary":{"total":0,"completed":0},"closedByPullRequestsReferences":{"nodes":[]}}
+]}}}}
+JSON
 
 # ---- nest-home: a nested epic (#47); hand values in tests/audit_rollup.rs ----
 # Repo nest (owner from github/user.json): epic #1 over the nested epic #2
@@ -498,6 +512,19 @@ ameta implementer toolu_r7 > "$GD/$G3/subagents/agent-$B7.meta.json"
 ameta implementer toolu_r8 > "$GD/$G3/subagents/agent-$B8.meta.json"
 aat $G4 /work/perf "\"isSidechain\":false,\"session_id\":\"$G3\""
 { aprompt 2026-10-13T10:30:00 i-01; areply 2026-10-13T10:31:00 i-02 req_s1 $OPUS "$UO" "$TEXT"; } > "$GD/$G4.jsonl"
+cat > fixtures/github/perf-home.json <<'JSON'
+{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"CURSOR-P"},"nodes":[
+{"number":1,"title":"Lorem performance","state":"CLOSED","stateReason":"COMPLETED","createdAt":"2026-10-05T09:00:00Z","closedAt":"2026-10-06T12:00:00Z","parent":null,
+ "subIssuesSummary":{"total":0,"completed":0},"timelineItems":{"totalCount":1},
+ "closedByPullRequestsReferences":{"nodes":[
+   {"number":2,"state":"MERGED","createdAt":"2026-10-06T10:30:00Z","mergedAt":"2026-10-06T11:00:00Z","url":"https://github.com/example/perf/pull/2"}]}},
+{"number":3,"title":"Ipsum follow-up","state":"OPEN","stateReason":null,"createdAt":"2026-10-06T09:00:00Z","closedAt":null,"parent":null,
+ "subIssuesSummary":{"total":0,"completed":0},"timelineItems":{"totalCount":0},"closedByPullRequestsReferences":{"nodes":[]}}
+]}},
+"search":{"nodes":[
+{"number":4,"body":"Reverts example/perf#2","mergedAt":"2026-10-06T11:40:00Z"}
+]}}}
+JSON
 
 # ---- directs-home: director-launched units (#53); hand values in tests/directs.rs ----
 # Cross-session messages, 2026-10-07Z. The sender's SendMessage result carries
