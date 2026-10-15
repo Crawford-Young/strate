@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import type { ElkNode } from 'elkjs/lib/elk-api'
 import ELK from 'elkjs/lib/elk.bundled.js'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { centerCalls, flowProps, resetFlow, zoomCalls } from '../tests/xyflow-mock'
+import { centerCalls, fitView, flowProps, resetFlow, zoomCalls } from '../tests/xyflow-mock'
 import type { GraphAgent, GraphEdge, LiveGraph, Workstream } from './api'
 import { Canvas, REFIT_MS } from './Canvas'
 import { NODE_HEIGHT, NODE_WIDTH } from './graphLayout'
@@ -12,18 +12,10 @@ const layout = vi.hoisted(() => vi.fn<(graph: ElkNode) => Promise<ElkNode>>())
 
 vi.mock('./elk', () => ({ elk: () => ({ layout }) }))
 
-const fitView = vi.hoisted(() => vi.fn(() => Promise.resolve(true)))
-
-vi.mock('@xyflow/react', async (importOriginal) => {
-  const mock = await import('../tests/xyflow-mock')
-  // Stable across renders, as the real instance is.
-  const flow = { ...mock.useReactFlow(), fitView }
-  return {
-    ...(await importOriginal<typeof import('@xyflow/react')>()),
-    ...mock,
-    useReactFlow: () => flow,
-  }
-})
+vi.mock('@xyflow/react', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@xyflow/react')>()),
+  ...(await import('../tests/xyflow-mock')),
+}))
 
 const real = new ELK()
 
@@ -520,7 +512,6 @@ describe('re-fit on resize', () => {
 
   beforeEach(() => {
     observers = []
-    fitView.mockClear()
     vi.stubGlobal(
       'ResizeObserver',
       class {

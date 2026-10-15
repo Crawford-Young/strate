@@ -239,38 +239,37 @@ function GraphView({ graph, selected, onSelect }: GraphViewProps) {
     }))
   return (
     <>
-      <div ref={refitOnResize} className="h-full">
-        <ReactFlow
-          nodes={nodes}
-          edges={edges}
-          nodeTypes={nodeTypes}
-          onNodesChange={onNodesChange}
-          // A handler keeps pointer events on the otherwise inert nodes; a
-          // card's click (or Enter) bubbles up to it.
-          onNodeClick={onNodeClick}
-          colorMode="dark"
-          fitView
-          fitViewOptions={FIT_VIEW_OPTIONS}
-          minZoom={0.3}
-          maxZoom={2}
-          nodesDraggable={false}
-          nodesConnectable={false}
-          nodesFocusable={false}
-          edgesFocusable={false}
-          elementsSelectable={false}
-          deleteKeyCode={null}
-          // The default (Space) swallows Space app-wide.
-          panActivationKeyCode={null}
-          className="bg-transparent"
-        >
-          <Background
-            variant={BackgroundVariant.Dots}
-            gap={20}
-            size={1}
-            color="rgb(63 63 70 / 0.5)"
-          />
-        </ReactFlow>
-      </div>
+      <ReactFlow
+        ref={refitOnResize}
+        nodes={nodes}
+        edges={edges}
+        nodeTypes={nodeTypes}
+        onNodesChange={onNodesChange}
+        // A handler keeps pointer events on the otherwise inert nodes; a
+        // card's click (or Enter) bubbles up to it.
+        onNodeClick={onNodeClick}
+        colorMode="dark"
+        fitView
+        fitViewOptions={FIT_VIEW_OPTIONS}
+        minZoom={0.3}
+        maxZoom={2}
+        nodesDraggable={false}
+        nodesConnectable={false}
+        nodesFocusable={false}
+        edgesFocusable={false}
+        elementsSelectable={false}
+        deleteKeyCode={null}
+        // The default (Space) swallows Space app-wide.
+        panActivationKeyCode={null}
+        className="bg-transparent"
+      >
+        <Background
+          variant={BackgroundVariant.Dots}
+          gap={20}
+          size={1}
+          color="rgb(63 63 70 / 0.5)"
+        />
+      </ReactFlow>
       {failure && (
         // A failed relayout keeps the last drawn graph up, under this line.
         <p role="alert" className="absolute bottom-3 left-4 z-10 text-xs text-destructive">
