@@ -3,16 +3,19 @@
 //! creates them (a stub session, its orchestrator, the agent), so a later
 //! discovery or tail of the same session or agent fills the same rows. A
 //! registry row is live while `gone = 0`: listed by the latest poll and not
-//! a finished background session.
+//! a finished background session. A row describes its process's latest
+//! `/clear` link (the `latest_links` view): `claude agents` keys a process
+//! by the session it started with, so the row names the first link while
+//! a later one runs (#68). The views read its name and state from the row.
 //!
 //! An agent has an open permission wait exactly while its `hook_state` is
 //! `needs_you`: whatever clears that state ends the wait, at the time of
-//! the record, poll or hook that cleared it. A session the registry stops
+//! the record, poll or hook that cleared it. A process the registry stops
 //! listing exited, so its orchestrator's prompt goes with it (#64).
 
 use std::collections::HashSet;
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
 
 use super::Result;
 use super::ingest::{ensure_agent, upsert_session};
@@ -30,8 +33,7 @@ pub(super) fn registry(conn: &Connection, event: &RegistryEvent) -> Result<()> {
         } => {
             conn.prepare_cached("UPDATE registry SET gone = 1, last_seen_ms = ?2 WHERE key = ?1")?
                 .execute(params![entry.key(), last_seen_ms])?;
-            exited(conn, entry.session_id.as_deref(), *last_seen_ms)?;
-            refresh(conn, entry.session_id.as_deref())
+            exited(conn, entry.session_id.as_deref(), *last_seen_ms)
         }
         RegistryEvent::Baseline { keys } => reconcile(conn, keys),
         RegistryEvent::Error { .. } => Ok(()),
@@ -54,18 +56,11 @@ fn reconcile(conn: &Connection, keys: &[String]) -> Result<()> {
         conn.prepare_cached("UPDATE registry SET gone = 1 WHERE key = ?1")?
             .execute([key])?;
         exited(conn, session_id.as_deref(), *last_seen_ms)?;
-        refresh(conn, session_id.as_deref())?;
     }
     Ok(())
 }
 
 fn upsert_entry(conn: &Connection, entry: &RegistryEntry, at_ms: i64) -> Result<()> {
-    let key = entry.key();
-    // A /clear keeps the process but moves it to a new session.
-    let before: Option<Option<String>> = conn
-        .prepare_cached("SELECT session_id FROM registry WHERE key = ?1")?
-        .query_row([&key], |r| r.get(0))
-        .optional()?;
     if let Some(session_id) = &entry.session_id {
         upsert_session(conn, session_id, None, None)?;
         ensure_agent(conn, session_id, None, "orchestrator", None)?;
@@ -81,7 +76,7 @@ fn upsert_entry(conn: &Connection, entry: &RegistryEntry, at_ms: i64) -> Result<
              state = excluded.state, last_seen_ms = excluded.last_seen_ms, gone = excluded.gone",
     )?
     .execute(params![
-        key,
+        entry.key(),
         entry.kind.as_str(),
         entry.session_id,
         entry.pid,
@@ -96,15 +91,15 @@ fn upsert_entry(conn: &Connection, entry: &RegistryEntry, at_ms: i64) -> Result<
         entry.finished(),
     ])?;
     // The registry is the orchestrator's truth: once it is not waiting, a
-    // PermissionRequest hook on the orchestrator is answered. A poll is
-    // stamped before it runs, so one stamped before the request saw the
-    // session before it asked, and answers nothing.
+    // PermissionRequest hook on its latest link's orchestrator is answered.
+    // A poll is stamped before it runs, so one stamped before the request
+    // saw the session before it asked, and answers nothing.
     if entry.status != Some(Status::Waiting) {
         let answered: Vec<i64> = conn
             .prepare_cached(
                 "UPDATE agents SET hook_state = NULL, hook_waiting_for = NULL
-                 WHERE session_id = ?1 AND agent_id IS NULL AND hook_state = 'needs_you'
-                   AND hook_at_ms <= ?2
+                 WHERE session_id = (SELECT latest FROM latest_links WHERE session_id = ?1)
+                   AND agent_id IS NULL AND hook_state = 'needs_you' AND hook_at_ms <= ?2
                  RETURNING id",
             )?
             .query_map(params![entry.session_id, at_ms], |r| r.get(0))?
@@ -113,19 +108,15 @@ fn upsert_entry(conn: &Connection, entry: &RegistryEntry, at_ms: i64) -> Result<
             end_wait(conn, agent, at_ms)?;
         }
     }
-    if let Some(Some(old)) = before
-        && entry.session_id.as_ref() != Some(&old)
-    {
-        refresh(conn, Some(&old))?;
-    }
-    refresh(conn, entry.session_id.as_deref())
+    Ok(())
 }
 
-/// Once no live registry row lists `session_id`, its process exited: its
-/// orchestrator's prompt is gone, and the wait ends when the session was
-/// last seen, or at the latest request when that came after (asked
-/// between the last poll that listed it and the one that did not).
-/// Subagent waits end on their own records or SubagentStop.
+/// Once no live registry row describes the latest link of `session_id`'s
+/// chain, its process exited: that link's orchestrator's prompt is gone,
+/// and the wait ends when the process was last seen, or at the latest
+/// request when that came after (asked between the last poll that listed
+/// it and the one that did not). Subagent waits end on their own records
+/// or SubagentStop.
 fn exited(conn: &Connection, session_id: Option<&str>, last_seen_ms: i64) -> Result<()> {
     let Some(session_id) = session_id else {
         return Ok(());
@@ -133,8 +124,11 @@ fn exited(conn: &Connection, session_id: Option<&str>, last_seen_ms: i64) -> Res
     let cleared: Vec<(i64, Option<i64>)> = conn
         .prepare_cached(
             "UPDATE agents SET hook_state = NULL, hook_waiting_for = NULL
-             WHERE session_id = ?1 AND agent_id IS NULL AND hook_state = 'needs_you'
-               AND NOT EXISTS (SELECT 1 FROM registry WHERE session_id = ?1 AND gone = 0)
+             WHERE session_id = (SELECT latest FROM latest_links WHERE session_id = ?1)
+               AND agent_id IS NULL AND hook_state = 'needs_you'
+               AND NOT EXISTS (SELECT 1 FROM registry AS r
+                   JOIN latest_links AS l ON l.session_id = r.session_id
+                   WHERE r.gone = 0 AND l.latest = agents.session_id)
              RETURNING id, hook_at_ms",
         )?
         .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -146,24 +140,6 @@ fn exited(conn: &Connection, session_id: Option<&str>, last_seen_ms: i64) -> Res
             asked.map_or(last_seen_ms, |a| a.max(last_seen_ms)),
         )?;
     }
-    Ok(())
-}
-
-/// Recomputes the orchestrator's `registry_name` and `registry_state` from
-/// the session's newest registry row: a live one first, `gone` when only
-/// gone ones are left, NULL when none lists the session.
-fn refresh(conn: &Connection, session_id: Option<&str>) -> Result<()> {
-    let Some(session_id) = session_id else {
-        return Ok(());
-    };
-    conn.prepare_cached(
-        "UPDATE agents SET (registry_name, registry_state) = (
-             SELECT name, CASE WHEN gone = 1 THEN 'gone' ELSE coalesce(status, state) END
-             FROM registry WHERE session_id = ?1
-             ORDER BY gone, last_seen_ms DESC, id DESC LIMIT 1)
-         WHERE session_id = ?1 AND agent_id IS NULL",
-    )?
-    .execute([session_id])?;
     Ok(())
 }
 

@@ -2,9 +2,9 @@
 //! `tests/fixtures/chain-home`: the Audit's one Session row per chain and
 //! workstream, a director's `--bg` unit nested under the director's row
 //! (which sits under its units' repo), and the live view: a registry row
-//! read as its process's latest link, the graph drawing every link's
-//! subagents (earlier links' marked) and a director's live units only.
-//! Every db lives in a temp dir.
+//! read as its process's latest link (and a hook wait listed on that link
+//! only), the graph drawing every link's subagents (earlier links' marked)
+//! and a director's live units only. Every db lives in a temp dir.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use rusqlite::Connection;
 use strate_core::discovery::discover;
-use strate_core::registry::{RegistryEvent, parse_snapshot};
+use strate_core::hooks::{Hook, HookEvent};
+use strate_core::registry::{RegistryEntry, RegistryEvent, parse_snapshot};
 use strate_core::store::Store;
 use strate_core::store::views::{
     self, AgentState, AuditFilter, AuditNode, GraphAgent, GraphEdge, GroupBy, LiveGraph, Metrics,
@@ -384,14 +385,24 @@ fn a_nested_rows_timeline_is_its_own_cells() {
 }
 
 /// A registry entry for `session`, interactive and busy under pid `pid`.
-fn listed(pid: u32, session: &str, name: &str) -> RegistryEvent {
+fn entry(pid: u32, session: &str, name: &str) -> RegistryEntry {
     let json = format!(
         r#"[{{"pid":{pid},"cwd":"/work/hub","kind":"interactive","startedAt":1791000000000,
              "sessionId":"{session}","name":"{name}","status":"busy"}}]"#
     );
+    parse_snapshot(json.as_bytes()).expect("entry").remove(0)
+}
+
+/// That entry, in a poll at 5000.
+fn listed(pid: u32, session: &str, name: &str) -> RegistryEvent {
+    polled(pid, session, name, 5000)
+}
+
+/// That entry, in a poll at `at_ms`.
+fn polled(pid: u32, session: &str, name: &str, at_ms: i64) -> RegistryEvent {
     RegistryEvent::Changed {
-        entry: parse_snapshot(json.as_bytes()).expect("entry").remove(0),
-        at_ms: 5000,
+        entry: entry(pid, session, name),
+        at_ms,
     }
 }
 
@@ -905,9 +916,9 @@ const RENAMED_PROCESS: &str = "
         ('g', '/p/g.jsonl', '2026-10-02T11:00:00.000Z', 'f', 2);
     INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id) VALUES
         (1, 'f', 0, '2026-10-02T10:00:00.000Z', 1), (2, 'g', 0, '2026-10-02T11:00:00.000Z', 2);
-    INSERT INTO agents (id, session_id, agent_id, kind, name, registry_name, registry_state)
-    VALUES (1, 'f', NULL, 'orchestrator', 'ticket-x-17', 'ticket-x-18', 'waiting'),
-        (2, 'g', NULL, 'orchestrator', 'ticket-x-18', NULL, NULL);
+    INSERT INTO agents (id, session_id, agent_id, kind, name) VALUES
+        (1, 'f', NULL, 'orchestrator', 'ticket-x-17'),
+        (2, 'g', NULL, 'orchestrator', 'ticket-x-18');
     INSERT INTO registry (key, kind, session_id, name, cwd, started_at_ms, status,
         waiting_for, first_seen_ms, last_seen_ms)
     VALUES ('bg:f', 'background', 'f', 'ticket-x-18', '/work/x', 1, 'waiting', 'Bash', 1, 7);
@@ -957,9 +968,9 @@ fn a_registry_row_is_its_processs_latest_link() {
 
     Connection::open(t.db())
         .expect("raw")
-        .execute_batch(
-            "UPDATE registry SET status = 'busy', waiting_for = NULL;
-             UPDATE agents SET registry_state = 'busy' WHERE id = 1;",
+        .execute(
+            "UPDATE registry SET status = 'busy', waiting_for = NULL",
+            [],
         )
         .expect("busy");
     let rows = views::workstreams(&db).expect("workstreams");
@@ -1152,9 +1163,9 @@ fn a_blocked_background_session_has_no_tab_but_needs_you() {
     // blocked, with no pid, status or waitingFor.
     Connection::open(t.db())
         .expect("raw")
-        .execute_batch(
-            "UPDATE registry SET status = NULL, waiting_for = NULL, state = 'blocked';
-             UPDATE agents SET registry_state = 'blocked' WHERE id = 1;",
+        .execute(
+            "UPDATE registry SET status = NULL, waiting_for = NULL, state = 'blocked'",
+            [],
         )
         .expect("blocked");
     let rows = views::workstreams(&db).expect("workstreams");
@@ -1184,4 +1195,108 @@ fn a_blocked_background_session_has_no_tab_but_needs_you() {
     let g = views::live_graph(&db, 2).expect("query").expect("graph");
     assert!(!g.live);
     assert_eq!(head(&g), (Some("ticket-x-18"), AgentState::NeedsYou));
+}
+
+/// A PermissionRequest hook on `session`'s orchestrator, or on its
+/// subagent `agent`, received at `at_ms`.
+fn asks(session: &str, agent: Option<&str>, at_ms: i64) -> Hook {
+    Hook {
+        received_ms: at_ms,
+        event: HookEvent::PermissionRequest {
+            session_id: session.into(),
+            agent_id: agent.map(Into::into),
+            tool_name: Some("Bash".into()),
+        },
+    }
+}
+
+/// Each listed hook wait: its session and agent id.
+fn hook_waits(db: &Connection) -> Vec<(Option<String>, Option<String>)> {
+    views::needs_you(db)
+        .expect("needs you")
+        .into_iter()
+        .filter(|n| n.source == "hook")
+        .map(|n| (n.session_id, n.agent_id))
+        .collect()
+}
+
+#[test]
+fn a_hook_wait_is_listed_only_on_its_processs_latest_link() {
+    let t = Temp::new("hook-latest");
+    let (mut store, db) = build(&t);
+    // U1's prompts were left behind when the process /cleared into U2.
+    store.apply_hook(&asks(U1, None, 6000)).expect("U1 asks");
+    store
+        .apply_hook(&asks(U1, Some(J[3]), 6000))
+        .expect("J4 asks");
+    assert_eq!(hook_waits(&db), [], "no registry row lists the process");
+    // The registry keys the process by U1: still only U2's prompt counts.
+    store
+        .apply_registry(&[listed(4202, U1, "ticket-chain-repo-7")])
+        .expect("unit live");
+    store
+        .apply_hook(&asks(U2, Some(J[7]), 7000))
+        .expect("J8 asks");
+    assert_eq!(hook_waits(&db), [(Some(U2.into()), Some(J[7].into()))]);
+    let rows = views::workstreams(&db).expect("workstreams");
+    assert_eq!(tab(&rows, "ticket-chain-repo-7").needs_you, 1);
+    // The director's canvas draws U1's subagent dimmed and done.
+    let g = graph(&db, "director-chain");
+    let state = |id: &str| {
+        g.agents
+            .iter()
+            .find(|a| a.agent_id.as_deref() == Some(id))
+            .expect("drawn")
+            .state
+    };
+    assert_eq!(state(J[3]), AgentState::Done);
+    assert_eq!(state(J[7]), AgentState::NeedsYou);
+}
+
+/// Each orchestrator permission wait: its session, start and end.
+fn orchestrator_waits(db: &Connection) -> Vec<(String, i64, Option<i64>)> {
+    db.prepare(
+        "SELECT a.session_id, w.start_ms, w.end_ms
+         FROM permission_waits AS w JOIN agents AS a ON a.id = w.agent
+         WHERE a.agent_id IS NULL ORDER BY w.start_ms, a.session_id",
+    )
+    .expect("query")
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+    .expect("rows")
+    .collect::<rusqlite::Result<_>>()
+    .expect("waits")
+}
+
+#[test]
+fn the_registry_answers_and_ends_its_processs_latest_links_prompt() {
+    let t = Temp::new("registry-chain-prompt");
+    let (mut store, db) = build(&t);
+    store
+        .apply_registry(&[listed(4202, U1, "ticket-chain-repo-7")])
+        .expect("unit live");
+    store.apply_hook(&asks(U1, None, 6000)).expect("U1 asks");
+    store.apply_hook(&asks(U2, None, 6000)).expect("U2 asks");
+    // A poll at or after the request that is not waiting answers the
+    // prompt on the process's latest link. U1's went with the /clear: the
+    // view leaves it out, and the registry leaves it be.
+    store
+        .apply_registry(&[polled(4202, U1, "ticket-chain-repo-7", 7000)])
+        .expect("answered");
+    assert_eq!(hook_waits(&db), []);
+    assert_eq!(
+        orchestrator_waits(&db),
+        [(U1.into(), 6000, None), (U2.into(), 6000, Some(7000))]
+    );
+    // Once the registry stops listing the process, its prompt is gone.
+    store
+        .apply_hook(&asks(U2, None, 8000))
+        .expect("U2 asks again");
+    store
+        .apply_registry(&[RegistryEvent::Gone {
+            entry: entry(4202, U1, "ticket-chain-repo-7"),
+            last_seen_ms: 9000,
+        }])
+        .expect("gone");
+    assert_eq!(hook_waits(&db), []);
+    assert_eq!(orchestrator_waits(&db)[2], (U2.into(), 8000, Some(9000)));
 }
