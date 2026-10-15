@@ -21,37 +21,15 @@ const SA: &str = "5e55a0a0-0000-4000-8000-00000000000a";
 const SB: &str = "5e55b0b0-0000-4000-8000-00000000000b";
 const LONG_DIR: &str = "-work--worktrees-demo-repo-7-lorem-ipsum-dolor-sit-x7k2q9";
 
-/// A temp dir removed on drop.
-struct Temp(PathBuf);
+mod common;
 
-impl Temp {
-    fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("strate-store-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("temp dir");
-        Self(dir)
-    }
+use common::{Temp, fixture_home, transcripts};
 
-    fn db(&self) -> PathBuf {
-        self.0.join("strate.db")
-    }
-
-    /// A copy of the synthetic fixture config dir, safe to delete from.
-    fn fixture(&self) -> PathBuf {
-        let root = self.0.join("claude-home");
-        copy_dir(&fixture_root(), &root);
-        root
-    }
-}
-
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn fixture_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude-home")
+/// A copy of the synthetic fixture config dir in `t`, safe to delete from.
+fn fixture(t: &Temp) -> PathBuf {
+    let root = t.path().join("claude-home");
+    copy_dir(&fixture_home("claude-home"), &root);
+    root
 }
 
 fn copy_dir(from: &Path, to: &Path) {
@@ -65,28 +43,6 @@ fn copy_dir(from: &Path, to: &Path) {
             fs::copy(&path, &dest).expect("copy");
         }
     }
-}
-
-/// Every transcript under `root/projects`, found by walking the tree
-/// rather than through the crate.
-fn transcripts(root: &Path) -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in fs::read_dir(dir).expect("readable dir") {
-            let path = entry.expect("entry").path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else {
-                out.push(path);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(&root.join("projects"), &mut out);
-    out.retain(|p| {
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        name.ends_with(".jsonl") && !p.components().any(|c| c.as_os_str() == "tool-results")
-    });
-    out
 }
 
 /// Where each transcript's checkpoint must end: just past its last newline.
@@ -187,6 +143,8 @@ fn record(path: &Arc<Path>, offset: u64, value: serde_json::Value) -> TailEvent 
     }
 }
 
+/// `events` as one batch. Unlike `common::batch` it checkpoints at the
+/// given `offset`, with an identity no real file has.
 fn batch(path: &Arc<Path>, events: Vec<TailEvent>, offset: u64) -> Batch {
     Batch {
         path: path.clone(),
@@ -317,7 +275,7 @@ fn open_creates_every_table_with_the_required_columns() {
 #[test]
 fn reopening_an_existing_store_keeps_its_rows_and_version() {
     let tmp = Temp::new("reopen");
-    let path = session_path(&tmp.0, "s1");
+    let path = session_path(tmp.path(), "s1");
     let mut store = Store::open(tmp.db()).expect("open");
     store
         .ingest(&batch(
@@ -350,7 +308,7 @@ fn reopening_an_existing_store_keeps_its_rows_and_version() {
 #[test]
 fn intents_take_defaults_and_reference_agents() {
     let tmp = Temp::new("intents");
-    let path = session_path(&tmp.0, "s1");
+    let path = session_path(tmp.path(), "s1");
     let mut store = Store::open(tmp.db()).expect("open");
     store
         .ingest(&batch(
@@ -393,7 +351,7 @@ fn intents_take_defaults_and_reference_agents() {
 #[test]
 fn wal_is_on_and_a_reader_queries_while_the_writer_holds_a_write_txn() {
     let tmp = Temp::new("wal");
-    let path = session_path(&tmp.0, "s1");
+    let path = session_path(tmp.path(), "s1");
     let mut store = Store::open(tmp.db()).expect("open");
     let conn = reader(&tmp.db());
     let mode: String = conn
@@ -428,7 +386,7 @@ fn wal_is_on_and_a_reader_queries_while_the_writer_holds_a_write_txn() {
 #[test]
 fn a_batch_and_its_checkpoint_commit_together() {
     let tmp = Temp::new("together");
-    let path = session_path(&tmp.0, "s1");
+    let path = session_path(tmp.path(), "s1");
     let mut store = Store::open(tmp.db()).expect("open");
     let b = Batch {
         checkpoint: Some(Checkpoint {
@@ -452,7 +410,7 @@ fn a_batch_and_its_checkpoint_commit_together() {
 #[test]
 fn a_rolled_back_batch_stores_neither_events_nor_checkpoint() {
     let tmp = Temp::new("rollback");
-    let path = session_path(&tmp.0, "s1");
+    let path = session_path(tmp.path(), "s1");
     let mut store = Store::open(tmp.db()).expect("open");
     let txn = store.transaction().expect("begin");
     txn.batch(&batch(
@@ -470,7 +428,7 @@ fn a_rolled_back_batch_stores_neither_events_nor_checkpoint() {
 #[test]
 fn crash_before_commit_re_delivers_the_batch_and_the_replay_adds_no_duplicates() {
     let tmp = Temp::new("crash");
-    let root = tmp.0.join("claude");
+    let root = tmp.path().join("claude");
     let file = root.join("projects/-work-x/s1.jsonl");
     fs::create_dir_all(file.parent().expect("parent")).expect("dirs");
     // Records with and without uuid, so both idempotency keys are exercised.
@@ -544,7 +502,10 @@ fn crash_before_commit_re_delivers_the_batch_and_the_replay_adds_no_duplicates()
 #[test]
 fn a_uuid_replayed_into_another_file_is_stored_once() {
     let tmp = Temp::new("uuid");
-    let (a, b) = (session_path(&tmp.0, "s1"), session_path(&tmp.0, "s2"));
+    let (a, b) = (
+        session_path(tmp.path(), "s1"),
+        session_path(tmp.path(), "s2"),
+    );
     let mut store = Store::open(tmp.db()).expect("open");
     let rec = json!({"type": "user", "uuid": "u-same", "cwd": "/work/old"});
     store
@@ -575,7 +536,7 @@ fn a_uuid_replayed_into_another_file_is_stored_once() {
 #[test]
 fn reset_drops_the_files_uuidless_events_so_the_rewrite_is_stored() {
     let tmp = Temp::new("reset");
-    let path = session_path(&tmp.0, "s1");
+    let path = session_path(tmp.path(), "s1");
     let mut store = Store::open(tmp.db()).expect("open");
     store
         .ingest(&batch(
@@ -618,7 +579,7 @@ fn reset_drops_the_files_uuidless_events_so_the_rewrite_is_stored() {
 #[test]
 fn malformed_and_error_events_store_no_rows_but_the_checkpoint_moves() {
     let tmp = Temp::new("malformed");
-    let path = session_path(&tmp.0, "s1");
+    let path = session_path(tmp.path(), "s1");
     let mut store = Store::open(tmp.db()).expect("open");
     store
         .ingest(&batch(
@@ -703,7 +664,7 @@ fn agent_text(
 #[test]
 fn fixture_ingest_produces_the_expected_sessions_agents_and_edges() {
     let tmp = Temp::new("fixture");
-    let root = tmp.fixture();
+    let root = fixture(&tmp);
     let mut store = Store::open(tmp.db()).expect("open");
     ingest_root(&mut store, &root);
     let conn = reader(&tmp.db());
@@ -910,7 +871,7 @@ fn fixture_ingest_produces_the_expected_sessions_agents_and_edges() {
 #[test]
 fn re_ingesting_the_fixture_is_idempotent() {
     let tmp = Temp::new("idempotent");
-    let root = tmp.fixture();
+    let root = fixture(&tmp);
     let mut store = Store::open(tmp.db()).expect("open");
     ingest_root(&mut store, &root);
     let conn = reader(&tmp.db());
@@ -932,7 +893,7 @@ fn re_ingesting_the_fixture_is_idempotent() {
 #[test]
 fn rows_survive_transcript_deletion() {
     let tmp = Temp::new("survive");
-    let root = tmp.fixture();
+    let root = fixture(&tmp);
     let mut store = Store::open(tmp.db()).expect("open");
     ingest_root(&mut store, &root);
     let conn = reader(&tmp.db());
@@ -968,7 +929,7 @@ fn rows_survive_transcript_deletion() {
 #[test]
 fn subagents_whose_session_file_is_gone_get_a_stub_session() {
     let tmp = Temp::new("stub");
-    let root = tmp.fixture();
+    let root = fixture(&tmp);
     fs::remove_file(root.join(format!("projects/{LONG_DIR}/{SB}.jsonl"))).expect("remove B");
     let mut store = Store::open(tmp.db()).expect("open");
     ingest_root(&mut store, &root);
@@ -998,8 +959,8 @@ fn subagents_whose_session_file_is_gone_get_a_stub_session() {
     );
 
     // The session file comes back (a restore): the stub flag clears.
-    let restored = tmp.0.join("restore");
-    copy_dir(&fixture_root(), &restored);
+    let restored = tmp.path().join("restore");
+    copy_dir(&fixture_home("claude-home"), &restored);
     fs::copy(
         restored.join(format!("projects/{LONG_DIR}/{SB}.jsonl")),
         root.join(format!("projects/{LONG_DIR}/{SB}.jsonl")),
@@ -1019,7 +980,7 @@ fn subagents_whose_session_file_is_gone_get_a_stub_session() {
 // ---- gear ---------------------------------------------------------------
 
 fn gear_store(tmp: &Temp) -> Store {
-    let root = tmp.fixture();
+    let root = fixture(tmp);
     let mut store = Store::open(tmp.db()).expect("open");
     store
         .ingest_graph(&discover(&root).expect("discover"))
@@ -1120,7 +1081,7 @@ fn hard_stop_must_stay_above_nudge() {
 #[test]
 fn an_empty_title_or_agent_name_is_no_name() {
     let tmp = Temp::new("empty-name");
-    let path = session_path(&tmp.0, "s1");
+    let path = session_path(tmp.path(), "s1");
     let mut store = Store::open(tmp.db()).expect("open");
     store
         .ingest(&batch(
@@ -1162,7 +1123,7 @@ fn an_empty_title_or_agent_name_is_no_name() {
 /// session each uuid is stored under.
 fn replay_owners(name: &str, original: &str, resume: &str) -> Vec<(String, String)> {
     let tmp = Temp::new(name);
-    let root = tmp.0.join("claude");
+    let root = tmp.path().join("claude");
     let dir = root.join("projects/-work-x");
     fs::create_dir_all(&dir).expect("project dir");
     let line = |uuid: &str, stamp: &str| {

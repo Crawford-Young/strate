@@ -919,7 +919,7 @@ fn followups(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::Store;
+    use crate::store::{Store, query_plan};
     use crate::tail::test_dir;
 
     /// `events` rows carry their whole record inline and the timing columns
@@ -932,14 +932,7 @@ mod tests {
         let db = dir.join("strate.db");
         drop(Store::open(&db).expect("open"));
         let conn = Store::open_reader(&db).expect("reader");
-        let plan = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {LINES_SQL}"))
-            .expect("plan")
-            .query_map([""], |r| r.get::<_, String>(3))
-            .expect("steps")
-            .collect::<Result<Vec<_>>>()
-            .expect("detail")
-            .join("\n");
+        let plan = query_plan(&conn, LINES_SQL).join("\n");
         assert_eq!(
             plan,
             "SEARCH events USING COVERING INDEX events_timeline (session_id=?)"

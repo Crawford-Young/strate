@@ -2,8 +2,7 @@
 //! synthetic transcripts, a discovery graph, registry polls and hooks.
 //! Every db lives in a temp dir.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use rusqlite::Connection;
@@ -15,30 +14,9 @@ use strate_core::store::views::{self, AgentState, GraphAgent, GraphEdge, Workstr
 use strate_core::store::{Gear, Store};
 use strate_core::tail::{Batch, TailEvent};
 
-/// A temp dir removed on drop.
-struct Temp(PathBuf);
+mod common;
 
-impl Temp {
-    fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("strate-views-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("temp dir");
-        Self(dir)
-    }
-
-    fn open(&self) -> (Store, Connection) {
-        let db = self.0.join("strate.db");
-        let store = Store::open(&db).expect("store");
-        let reader = Store::open_reader(&db).expect("reader");
-        (store, reader)
-    }
-}
-
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+use common::{Temp, fixture_home, records, transcripts};
 
 const PROJECT: &str = "/cfg/projects/-work-alpha";
 
@@ -46,7 +24,9 @@ fn path(rel: &str) -> Arc<Path> {
     Path::new(PROJECT).join(rel).into()
 }
 
-/// One tail batch holding `records` for the transcript at `rel`.
+/// One tail batch holding `records` for the transcript at `rel`. Unlike
+/// `common::batch` its records are synthetic, 100 bytes apart, and it
+/// carries no checkpoint.
 fn batch(rel: &str, records: &[Value]) -> Batch {
     let path = path(rel);
     let events = records
@@ -564,45 +544,21 @@ fn a_merged_workstream_reads_as_its_target_and_unknown_ids_have_no_graph() {
     assert_eq!(views::live_graph(&reader, 9999).expect("query"), None);
 }
 
-/// Every transcript under `dir`, sorted.
-fn transcripts(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for entry in fs::read_dir(dir).expect("readable dir") {
-        let path = entry.expect("entry").path();
-        if path.is_dir() {
-            out.extend(transcripts(&path));
-        } else if path.extension().is_some_and(|e| e == "jsonl") {
-            out.push(path);
-        }
-    }
-    out.sort();
-    out
-}
-
 /// The `workstreams-home` fixture, cold: its discovery graph, then each
 /// transcript as one batch.
 fn load_workstreams_home(store: &mut Store) {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/workstreams-home");
+    let root = fixture_home("workstreams-home");
     store
         .ingest_graph(&discover(&root).expect("discover"))
         .expect("graph");
-    for file in transcripts(&root.join("projects")) {
-        let text = fs::read_to_string(&file).expect("read");
-        let path: Arc<Path> = file.into();
-        let mut offset = 0u64;
-        let mut events = Vec::new();
-        for line in text.split_inclusive('\n') {
-            events.push(TailEvent::Record {
-                path: path.clone(),
-                offset,
-                value: serde_json::from_str(line).expect("fixture line is json"),
-            });
-            offset += line.len() as u64;
-        }
+    for file in transcripts(&root) {
         store
             .ingest(&Batch {
-                path,
-                events,
+                path: file.as_path().into(),
+                events: records(&file, 0..usize::MAX)
+                    .into_iter()
+                    .map(|(event, _)| event)
+                    .collect(),
                 checkpoint: None,
             })
             .expect("ingest");

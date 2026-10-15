@@ -24,41 +24,25 @@ const TORONTO: &str = "America/Toronto";
 const HAIKU: &str = "claude-haiku-4-5";
 const MIN: i64 = 60_000;
 
-/// A temp dir removed on drop.
-struct Temp(PathBuf);
+mod common;
 
-impl Temp {
-    fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("strate-audit-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("temp dir");
-        Self(dir)
-    }
+use common::{Temp, fixture_home, transcripts};
 
-    fn db(&self) -> PathBuf {
-        self.0.join("strate.db")
-    }
-
-    /// Where session `sid`'s transcript (or its subagent's) would live.
-    fn transcript(&self, sid: &str, agent: Option<&str>) -> PathBuf {
-        let project = self.0.join("projects").join("-work-audit");
-        match agent {
-            None => project.join(format!("{sid}.jsonl")),
-            Some(a) => project
-                .join(sid)
-                .join("subagents")
-                .join(format!("agent-{a}.jsonl")),
-        }
+/// Where session `sid`'s transcript (or its subagent's) would live in `t`.
+fn transcript(t: &Temp, sid: &str, agent: Option<&str>) -> PathBuf {
+    let project = t.path().join("projects").join("-work-audit");
+    match agent {
+        None => project.join(format!("{sid}.jsonl")),
+        Some(a) => project
+            .join(sid)
+            .join("subagents")
+            .join(format!("agent-{a}.jsonl")),
     }
 }
 
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-/// One batch holding `lines` as records 100 bytes apart.
+/// One batch holding `lines` as records 100 bytes apart. Unlike
+/// `common::batch` it takes records as values and checkpoints 100 bytes
+/// past the last.
 fn batch(path: &Path, lines: Vec<Value>) -> Batch {
     let path: Arc<Path> = path.into();
     let n = lines.len() as u64;
@@ -294,21 +278,7 @@ fn reader(t: &Temp) -> Connection {
 
 /// Every transcript under the cost-home fixture, one batch each.
 fn fixture_batches() -> Vec<Batch> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in fs::read_dir(dir).expect("readable dir") {
-            let path = entry.expect("entry").path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|e| e == "jsonl") {
-                out.push(path);
-            }
-        }
-    }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cost-home/projects");
-    let mut paths = Vec::new();
-    walk(&root, &mut paths);
-    paths.sort();
-    paths
+    transcripts(&fixture_home("cost-home"))
         .iter()
         .map(|p| {
             let lines = fs::read_to_string(p).expect("read");
@@ -372,7 +342,7 @@ fn a_window_across_local_midnight_splits_into_two_days() {
     let t = Temp::new("midnight");
     let mut store = Store::open_in(t.db(), TORONTO).expect("open");
     store
-        .ingest(&batch(&t.transcript("s1", None), across_midnight()))
+        .ingest(&batch(&transcript(&t, "s1", None), across_midnight()))
         .expect("ingest");
     let db = reader(&t);
     invariants(&db);
@@ -457,10 +427,10 @@ fn dst_days_are_25_and_23_hours() {
         ),
     ];
     store
-        .ingest(&batch(&t.transcript("fall", None), fall))
+        .ingest(&batch(&transcript(&t, "fall", None), fall))
         .expect("fall");
     store
-        .ingest(&batch(&t.transcript("spring", None), spring))
+        .ingest(&batch(&transcript(&t, "spring", None), spring))
         .expect("spring");
     let db = reader(&t);
     invariants(&db);
@@ -538,10 +508,10 @@ fn a_dst_days_timeline_sits_on_the_wall_clock() {
         ),
     ];
     store
-        .ingest(&batch(&t.transcript("spring", None), spring))
+        .ingest(&batch(&transcript(&t, "spring", None), spring))
         .expect("spring");
     store
-        .ingest(&batch(&t.transcript("fall", None), fall))
+        .ingest(&batch(&transcript(&t, "fall", None), fall))
         .expect("fall");
     let db = reader(&t);
     let year = AuditFilter {
@@ -624,10 +594,10 @@ fn a_renamed_transcript_splits_per_window_and_a_subagent_keeps_its_own() {
         ),
     ];
     store
-        .ingest(&batch(&t.transcript("s1", None), main))
+        .ingest(&batch(&transcript(&t, "s1", None), main))
         .expect("main");
     store
-        .ingest(&batch(&t.transcript("s1", Some("a9")), sub))
+        .ingest(&batch(&transcript(&t, "s1", Some("a9")), sub))
         .expect("sub");
     let db = reader(&t);
     invariants(&db);
@@ -669,7 +639,7 @@ fn a_request_with_no_timestamp_lands_in_a_cell_with_no_day() {
     let mut lines = across_midnight();
     lines.push(reply("r3", None, "req_3", HAIKU, tokens(3000, 0)));
     store
-        .ingest(&batch(&t.transcript("s1", None), lines))
+        .ingest(&batch(&transcript(&t, "s1", None), lines))
         .expect("ingest");
     let db = reader(&t);
     invariants(&db);
@@ -688,7 +658,7 @@ fn a_zone_change_recomputes_every_cell_and_the_same_zone_does_not() {
     let t = Temp::new("tz-change");
     let mut store = Store::open_in(t.db(), "UTC").expect("open");
     store
-        .ingest(&batch(&t.transcript("s1", None), across_midnight()))
+        .ingest(&batch(&transcript(&t, "s1", None), across_midnight()))
         .expect("ingest");
     drop(store);
     let days = || -> Vec<Option<String>> {
@@ -758,7 +728,7 @@ fn a_model_switch_splits_a_cell_per_model_with_the_time_on_one() {
         ),
     ];
     store
-        .ingest(&batch(&t.transcript("s1", None), lines))
+        .ingest(&batch(&transcript(&t, "s1", None), lines))
         .expect("ingest");
     let db = reader(&t);
     invariants(&db);
@@ -805,7 +775,7 @@ fn a_regroup_that_drops_a_window_leaves_no_cell_without_one() {
         ),
     ];
     store
-        .ingest(&batch(&t.transcript("s1", None), main))
+        .ingest(&batch(&transcript(&t, "s1", None), main))
         .expect("ingest");
     // The second title stops counting: a regroup drops its window.
     Connection::open(t.db())

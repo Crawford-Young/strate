@@ -4,37 +4,17 @@
 //! row nested under a director's still counts in the spans above it.
 //! Every db lives in a temp dir.
 
-use std::path::Path;
-
 use rusqlite::Connection;
 use strate_core::discovery::discover;
 use strate_core::store::Store;
 use strate_core::store::views::{self, AuditFilter, AuditNode, GroupBy, NodeKind, audit};
-use strate_core::tail::{Batch, Checkpoint, FileIdentity};
 
 mod common;
 
-use common::{Temp, fixture_home, records, transcripts};
+use common::{Temp, batch, fixture_home, transcripts};
 
 const S: i64 = 1000;
 const MIN: i64 = 60 * S;
-
-/// The whole of `path` as one batch, each line a record at its byte offset.
-fn batch(path: &Path) -> Batch {
-    let records = records(path, 0..usize::MAX);
-    let offset = records.last().map_or(0, |(_, end)| *end);
-    Batch {
-        path: path.into(),
-        events: records.into_iter().map(|(event, _)| event).collect(),
-        checkpoint: Some(Checkpoint {
-            offset,
-            identity: FileIdentity {
-                volume: 0,
-                index: 0,
-            },
-        }),
-    }
-}
 
 /// A cold build of `tests/fixtures/chain-home` in UTC, and a reader on it.
 fn chain_home(t: &Temp) -> (Store, Connection) {

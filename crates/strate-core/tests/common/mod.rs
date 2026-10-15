@@ -1,12 +1,17 @@
-//! Fixture loading shared by the tests that replay a synthetic home from
-//! `tests/fixtures` through the store.
+//! Fixture loading shared by the integration tests: temp dirs, the
+//! synthetic homes under `tests/fixtures`, and their transcripts as record
+//! events and batches.
+
+#![allow(dead_code, reason = "each test binary uses a subset")]
 
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use strate_core::tail::TailEvent;
+use rusqlite::Connection;
+use strate_core::store::Store;
+use strate_core::tail::{Batch, Checkpoint, FileIdentity, TailEvent};
 
 /// A temp dir removed on drop.
 pub struct Temp(PathBuf);
@@ -19,8 +24,20 @@ impl Temp {
         Self(dir)
     }
 
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+
     pub fn db(&self) -> PathBuf {
         self.0.join("strate.db")
+    }
+
+    /// The writer on [`Self::db`], and a reader on it.
+    pub fn open(&self) -> (Store, Connection) {
+        let db = self.db();
+        let store = Store::open(&db).expect("store");
+        let reader = Store::open_reader(&db).expect("reader");
+        (store, reader)
     }
 }
 
@@ -30,20 +47,26 @@ impl Drop for Temp {
     }
 }
 
-/// The synthetic home `tests/fixtures/<name>`.
-pub fn fixture_home(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name)
+/// `tests/fixtures`.
+pub fn fixtures() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
-/// Every transcript under `root/projects`, sorted.
+/// The synthetic home `tests/fixtures/<name>`.
+pub fn fixture_home(name: &str) -> PathBuf {
+    fixtures().join(name)
+}
+
+/// Every transcript under `root/projects`, sorted. A `tool-results` dir
+/// holds tool output, never a transcript.
 pub fn transcripts(root: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in fs::read_dir(dir).expect("readable dir") {
             let path = entry.expect("entry").path();
             if path.is_dir() {
-                walk(&path, out);
+                if path.file_name() != Some("tool-results".as_ref()) {
+                    walk(&path, out);
+                }
             } else if path.extension().is_some_and(|e| e == "jsonl") {
                 out.push(path);
             }
@@ -77,4 +100,22 @@ pub fn records(path: &Path, range: Range<usize>) -> Vec<(TailEvent, u64)> {
         offset = end;
     }
     out
+}
+
+/// The whole of `path` as one batch, each line a record at its byte offset,
+/// checkpointed at the end of its last line.
+pub fn batch(path: &Path) -> Batch {
+    let records = records(path, 0..usize::MAX);
+    let offset = records.last().map_or(0, |(_, end)| *end);
+    Batch {
+        path: path.into(),
+        events: records.into_iter().map(|(event, _)| event).collect(),
+        checkpoint: Some(Checkpoint {
+            offset,
+            identity: FileIdentity {
+                volume: 0,
+                index: 0,
+            },
+        }),
+    }
 }

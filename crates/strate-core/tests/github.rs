@@ -11,10 +11,12 @@ use rusqlite::{Connection, params};
 use strate_core::github::{Revert, Runner, cli_runner, fetch_repo, refresh};
 use strate_core::store::{Store, gh_issues, gh_repos, gh_reverts};
 
+mod common;
+
+use common::{Temp, fixtures};
+
 fn fixture(name: &str) -> Vec<u8> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/github")
-        .join(name);
+    let path = fixtures().join("github").join(name);
     fs::read(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"))
 }
 
@@ -41,28 +43,6 @@ fn ok(name: &str) -> io::Result<Vec<u8>> {
 
 fn arg<'a>(call: &'a [String], key: &str) -> Option<&'a str> {
     call.iter().find_map(|a| a.strip_prefix(&format!("{key}=")))
-}
-
-/// A temp dir removed on drop.
-struct Temp(PathBuf);
-
-impl Temp {
-    fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("strate-gh-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("temp dir");
-        Self(dir)
-    }
-
-    fn db(&self) -> PathBuf {
-        self.0.join("strate.db")
-    }
-}
-
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
 }
 
 #[test]

@@ -2,41 +2,18 @@
 //! synthetic entries and payloads, alongside tail ingest of the same
 //! sessions and agents. Every db lives in a temp dir.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use rusqlite::{Connection, params};
 use serde_json::json;
 use strate_core::hooks::{Hook, HookEvent};
 use strate_core::registry::{RegistryEntry, RegistryEvent, parse_snapshot};
-use strate_core::store::Store;
 use strate_core::tail::{Batch, TailEvent};
 
-/// A temp dir removed on drop.
-struct Temp(PathBuf);
+mod common;
 
-impl Temp {
-    fn new(name: &str) -> Self {
-        let dir = std::env::temp_dir().join(format!("strate-live-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).expect("temp dir");
-        Self(dir)
-    }
-
-    fn open(&self) -> (Store, Connection) {
-        let db = self.0.join("strate.db");
-        let store = Store::open(&db).expect("store");
-        let reader = Store::open_reader(&db).expect("reader");
-        (store, reader)
-    }
-}
-
-impl Drop for Temp {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+use common::Temp;
 
 fn entry(json: &str) -> RegistryEntry {
     parse_snapshot(format!("[{json}]").as_bytes())
@@ -62,7 +39,9 @@ fn with_status(e: &RegistryEntry, status: &str) -> RegistryEntry {
     entry(&json.to_string())
 }
 
-/// One tail batch holding `records` for the transcript at `rel`.
+/// One tail batch holding `records` for the transcript at `rel`. Unlike
+/// `common::batch` its records are synthetic, 100 bytes apart, and it
+/// carries no checkpoint.
 fn batch(rel: &str, records: &[serde_json::Value]) -> Batch {
     let path: Arc<Path> = Path::new("/cfg/projects/-work-alpha").join(rel).into();
     let events = records

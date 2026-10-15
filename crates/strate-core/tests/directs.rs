@@ -58,7 +58,9 @@ fn records(path: &Path) -> Vec<TailEvent> {
         .collect()
 }
 
-/// `events` as one batch, checkpointed past its last record.
+/// `events` as one batch. Unlike `common::batch` it takes any run of
+/// records, down to one, and checkpoints one byte past the last one's
+/// offset rather than at the end of its line.
 fn batch(events: Vec<TailEvent>) -> Batch {
     let TailEvent::Record { path, offset, .. } = events.last().expect("non-empty") else {
         unreachable!("records only")
