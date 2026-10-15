@@ -1300,3 +1300,96 @@ fn the_registry_answers_and_ends_its_processs_latest_links_prompt() {
     assert_eq!(hook_waits(&db), []);
     assert_eq!(orchestrator_waits(&db)[2], (U2.into(), 8000, Some(9000)));
 }
+
+/// The cold build without `session`'s transcripts (its orchestrator's and
+/// its subagents'), and a reader on it.
+fn build_without(t: &Temp, session: &str) -> (Store, Connection) {
+    let mut store = Store::open_in(t.db(), "UTC").expect("open");
+    store
+        .ingest_graph(&discover(&home()).expect("discover"))
+        .expect("graph");
+    for path in transcripts() {
+        if !path.to_string_lossy().contains(session) {
+            store.ingest(&batch(&path)).expect("ingest");
+        }
+    }
+    let reader = Store::open_reader(t.db()).expect("reader");
+    (store, reader)
+}
+
+/// Ingests `session`'s transcripts (its orchestrator's, then its
+/// subagents').
+fn ingest_link(store: &mut Store, session: &str) {
+    for path in transcripts() {
+        if path.to_string_lossy().contains(session) {
+            store.ingest(&batch(&path)).expect("ingest");
+        }
+    }
+}
+
+/// Each permission wait: its session, agent id, start and end.
+fn waits(db: &Connection) -> Vec<(String, Option<String>, i64, Option<i64>)> {
+    db.prepare(
+        "SELECT a.session_id, a.agent_id, w.start_ms, w.end_ms
+         FROM permission_waits AS w JOIN agents AS a ON a.id = w.agent
+         ORDER BY w.start_ms, a.session_id, a.agent_id",
+    )
+    .expect("query")
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+    .expect("rows")
+    .collect::<rusqlite::Result<_>>()
+    .expect("waits")
+}
+
+#[test]
+fn an_earlier_links_open_waits_end_at_the_next_links_first_record() {
+    let t = Temp::new("earlier-waits");
+    let (mut store, db) = build_without(&t, U2);
+    // 2026-10-08: U1 asks at 11:10, after its last record (11:03:55); so
+    // does P2, of another process. U2's first record is 11:30:00.
+    let (asked, next, after) = (1_791_457_800_000, 1_791_459_000_000, 1_791_459_060_000);
+    store.apply_hook(&asks(U1, None, asked)).expect("U1 asks");
+    store.apply_hook(&asks(P2, None, asked)).expect("P2 asks");
+    // J4's request came after U2 began: not one the /clear took.
+    store
+        .apply_hook(&asks(U1, Some(J[3]), after))
+        .expect("J4 asks");
+    ingest_link(&mut store, U2);
+    assert_eq!(
+        waits(&db),
+        [
+            (U1.into(), None, asked, Some(next)),
+            (P2.into(), None, asked, None),
+            (U1.into(), Some(J[3].into()), after, None),
+        ]
+    );
+    let state: Option<String> = db
+        .query_row(
+            "SELECT hook_state FROM agents WHERE session_id = ?1 AND agent_id IS NULL",
+            [U1],
+            |r| r.get(0),
+        )
+        .expect("U1");
+    assert_eq!(state, None, "an ended wait's agent no longer needs you");
+}
+
+#[test]
+fn an_earlier_links_subagent_wait_ends_with_its_link() {
+    let t = Temp::new("earlier-subagent-wait");
+    let (mut store, db) = build_without(&t, U2);
+    let (asked, next) = (1_791_457_800_000, 1_791_459_000_000);
+    store
+        .apply_hook(&asks(U1, Some(J[3]), asked))
+        .expect("J4 asks");
+    ingest_link(&mut store, U2);
+    assert_eq!(
+        waits(&db),
+        [(U1.into(), Some(J[3].into()), asked, Some(next))]
+    );
+    // A later U2 batch leaves its own link's wait be: U2 is the latest.
+    store
+        .apply_hook(&asks(U2, None, next + 70_000))
+        .expect("U2 asks");
+    ingest_link(&mut store, U2);
+    assert_eq!(waits(&db)[1], (U2.into(), None, next + 70_000, None));
+}

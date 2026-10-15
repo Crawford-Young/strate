@@ -794,7 +794,10 @@ fn permission_waits_count_on_the_day_they_started_in_their_window_repo() {
             "ExitPlanMode",
         ))
         .expect("b3 plans");
-    // G3 (perf-3) still waiting; G4 (Unlinked) 30 s.
+    // G3 (perf-3) still waiting: its request comes after both links'
+    // transcripts were stored and no batch follows, so neither its own
+    // reply (10:20) nor G4's first record (10:30) ends it (#78). G4
+    // (Unlinked) 30 s.
     store
         .apply_hook(&permission("2026-10-13T10:00:00.000Z", G3, None))
         .expect("g3");
