@@ -19,7 +19,9 @@ pub(crate) fn tree(group_by: GroupBy, cells: &Cells, gh: &Gh) -> AuditNode {
 /// How a node's elapsed time ends.
 #[derive(Clone, Copy)]
 enum End {
-    /// Its own span (a session or agent).
+    /// Its own windows' (a session or agent): its elapsed is the time they
+    /// cover, while the span it reports up covers its children's too, so a
+    /// row nested under a director's counts in the spans above it.
     Own,
     /// Closed or merged at.
     Closed(i64),
@@ -38,7 +40,8 @@ pub(crate) struct Step {
     /// Sorts siblings of one kind.
     order: String,
     end: End,
-    span: Option<(i64, i64)>,
+    /// The windows it spans, each once.
+    spans: Vec<(i64, i64)>,
     elapsed: Option<i64>,
     progress: Option<Progress>,
     /// Read from the GitHub cache.
@@ -55,14 +58,13 @@ impl Step {
     }
 
     /// Another cell's copy of this step: a Session row (or its
-    /// orchestrator) spans every window of its chain, and sorts by the
-    /// earliest. Every other step's copies are the same.
+    /// orchestrator) spans each of its windows, and sorts by the earliest.
+    /// Every other step's copies are the same.
     fn widen(&mut self, other: &Self) {
-        if let Some((start, end)) = other.span {
-            self.span = Some(match self.span {
-                Some((s, e)) => (s.min(start), e.max(end)),
-                None => (start, end),
-            });
+        for span in &other.spans {
+            if !self.spans.contains(span) {
+                self.spans.push(*span);
+            }
         }
         if other.order < self.order {
             self.order.clone_from(&other.order);
@@ -76,7 +78,7 @@ impl Step {
             label,
             order,
             end: End::Derived,
-            span: None,
+            spans: Vec::new(),
             elapsed: None,
             progress: None,
             github: false,
@@ -241,7 +243,8 @@ fn pr_step(gh: &Gh, repo: &str, issue: i64, number: i64) -> Step {
     step
 }
 
-/// A window's Session row, sorted by its start.
+/// A window's Session row, sorted by its start, over the window's span
+/// when it holds a cell in the filter.
 fn window_step(window: &Window) -> Step {
     let start = window.span.map_or(0, |s| s.0);
     let mut step = Step::new(
@@ -251,7 +254,7 @@ fn window_step(window: &Window) -> Step {
         format!("{start:020}/{}", window.row),
     );
     step.end = End::Own;
-    step.span = window.span;
+    step.spans.extend(window.span.filter(|_| window.in_filter));
     step
 }
 
@@ -266,7 +269,7 @@ fn agent_step(cell: &Cell, cells: &Cells) -> Step {
                 "orchestrator".into(),
                 String::new(),
             );
-            step.span = cells.window(cell).span;
+            step.spans.extend(cells.window(cell).span);
             step
         }
         Some(id) => {
@@ -369,12 +372,19 @@ impl Node {
         let end = finished.iter().filter_map(|f| f.1.map(|s| s.1)).max();
         let any_open = finished.iter().any(|f| f.2);
         let (span, open) = match step.end {
-            End::Own => (step.span, false),
+            End::Own => {
+                let start = step.spans.iter().map(|s| s.0).chain(start).min();
+                let end = step.spans.iter().map(|s| s.1).chain(end).max();
+                (start.zip(end), false)
+            }
             End::Closed(at) => (start.map(|s| (s, at)), false),
             End::Open => (start.zip(end), true),
             End::Derived => (start.zip(end), any_open),
         };
-        metrics.elapsed_ms = step.elapsed.or(span.map(|(s, e)| (e - s).max(0)));
+        metrics.elapsed_ms = step.elapsed.or(match step.end {
+            End::Own => covered(step.spans),
+            _ => span.map(|(s, e)| (e - s).max(0)),
+        });
         metrics.open = open;
         metrics.progress = step.progress;
         let node = AuditNode {
@@ -387,6 +397,19 @@ impl Node {
         };
         (node, span, open)
     }
+}
+
+/// The time `spans` cover, each instant once; `None` with none.
+fn covered(mut spans: Vec<(i64, i64)>) -> Option<i64> {
+    spans.sort_unstable();
+    let mut total = None;
+    let mut reached = i64::MIN;
+    for (start, end) in spans {
+        let start = start.max(reached);
+        *total.get_or_insert(0) += (end - start).max(0);
+        reached = reached.max(end);
+    }
+    total
 }
 
 impl Tokens {

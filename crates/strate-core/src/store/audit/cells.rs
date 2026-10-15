@@ -116,7 +116,6 @@ impl Cells {
             },
             agents: Agent::load_all(conn, from, to)?,
         };
-        let mut seen_windows: HashSet<usize> = HashSet::new();
         let mut seen_agents: HashSet<(String, String)> = HashSet::new();
         // A cell with a NULL day (a request with no usable timestamp) is in
         // no range: `day BETWEEN` is never true for NULL.
@@ -135,12 +134,12 @@ impl Cells {
         while let Some(r) = rows.next()? {
             let row = CellRow::read(r)?;
             let window = out.windows.get(conn, gh, &row.session_id, row.segment_id)?;
-            let w = &out.windows.list[window];
+            let w = &mut out.windows.list[window];
             let wanted = |repo: &String| filter.repos.contains(repo);
             if !filter.repos.is_empty() && !w.filed_under().is_some_and(wanted) {
                 continue;
             }
-            let first_in_window = seen_windows.insert(window);
+            let first_in_window = !std::mem::replace(&mut w.in_filter, true);
             let mut share = Share {
                 cost_usd: row.cost_usd,
                 unpriced: row.unpriced,
@@ -240,6 +239,10 @@ pub(crate) struct Window {
     /// Its start to the next window's start, or to the session's last
     /// activity.
     pub(crate) span: Option<(i64, i64)>,
+    /// Holds a cell in the filter. A director's window that holds none (it
+    /// sent a unit's first message outside the range) shows its row, but
+    /// adds no time to it.
+    pub(crate) in_filter: bool,
 }
 
 impl Window {
@@ -335,6 +338,7 @@ impl Windows {
             rotation: parsed.is_some_and(|p| p.rotation.is_some()),
             label: named.name,
             span: named.start.map(|s| (s, end.unwrap_or(s).max(s))),
+            in_filter: false,
         });
         let at = self.list.len() - 1;
         self.index.insert(key, at);
@@ -517,30 +521,31 @@ fn launched_from(
     chain: &str,
     workstream: i64,
 ) -> Result<Option<(String, Option<i64>)>> {
-    conn.prepare_cached(
-        "SELECT x.parent, CASE WHEN e.agent_id IS NULL THEN (
-                 SELECT g.id FROM segments AS g
-                 WHERE g.session_id = e.session_id AND g.start_offset <= e.byte_offset
-                 ORDER BY g.start_offset DESC LIMIT 1
-             ) ELSE (
-                 SELECT a.segment_id FROM agents AS a
-                 WHERE a.session_id = e.session_id AND a.agent_id = e.agent_id
-             ) END
-         FROM directs AS x
-         JOIN sessions AS c ON c.session_id = x.child
-         JOIN events AS e ON e.sent_msg_id = x.msg_id AND e.session_id = x.parent
-         WHERE ifnull(c.process_root, c.session_id) = ?1
-           AND EXISTS (SELECT 1 FROM segments AS g
-               JOIN workstream_roots AS r ON r.id = g.workstream_id
-               WHERE g.session_id = x.child AND r.root = ?2)
-         ORDER BY c.started_at IS NULL, c.started_at, x.child, e.id
-         LIMIT 1",
-    )?
-    .query_row(rusqlite::params![chain, workstream], |r| {
-        Ok((r.get(0)?, r.get(1)?))
-    })
-    .optional()
+    conn.prepare_cached(LAUNCHED_FROM_SQL)?
+        .query_row(rusqlite::params![chain, workstream], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()
 }
+
+/// [`launched_from`]'s query.
+const LAUNCHED_FROM_SQL: &str = "SELECT x.parent, CASE WHEN e.agent_id IS NULL THEN (
+             SELECT g.id FROM segments AS g
+             WHERE g.session_id = e.session_id AND g.start_offset <= e.byte_offset
+             ORDER BY g.start_offset DESC LIMIT 1
+         ) ELSE (
+             SELECT a.segment_id FROM agents AS a
+             WHERE a.session_id = e.session_id AND a.agent_id = e.agent_id
+         ) END
+     FROM directs AS x
+     JOIN sessions AS c ON c.session_id = x.child
+     JOIN events AS e ON e.sent_msg_id = x.msg_id AND e.session_id = x.parent
+     WHERE (c.process_root = ?1 OR c.process_root IS NULL AND c.session_id = ?1)
+       AND EXISTS (SELECT 1 FROM segments AS g
+           JOIN workstream_roots AS r ON r.id = g.workstream_id
+           WHERE g.session_id = x.child AND r.root = ?2)
+     ORDER BY c.started_at IS NULL, c.started_at, x.child, e.id
+     LIMIT 1";
 
 /// The Session row (chain and workstream) of the window a unit's Session
 /// row (`chain`'s windows in `workstream`) was [`launched_from`]; `None`
@@ -565,12 +570,7 @@ fn director_row(conn: &Connection, chain: &str, workstream: i64) -> Result<Optio
 /// window's start, `None` when no window has one.
 fn row_start(conn: &Connection, chain: &str, workstream: i64) -> Result<Option<i64>> {
     let starts: Vec<Option<String>> = conn
-        .prepare_cached(
-            "SELECT g.started_at FROM segments AS g
-             JOIN sessions AS s ON s.session_id = g.session_id
-             JOIN workstream_roots AS r ON r.id = g.workstream_id
-             WHERE ifnull(s.process_root, s.session_id) = ?1 AND r.root = ?2",
-        )?
+        .prepare_cached(ROW_START_SQL)?
         .query_map(rusqlite::params![chain, workstream], |r| r.get(0))?
         .collect::<Result<_>>()?;
     Ok(starts
@@ -578,6 +578,13 @@ fn row_start(conn: &Connection, chain: &str, workstream: i64) -> Result<Option<i
         .filter_map(|s| s.as_deref().and_then(parse_timestamp))
         .min())
 }
+
+/// [`row_start`]'s query.
+const ROW_START_SQL: &str = "SELECT g.started_at FROM segments AS g
+     JOIN sessions AS s ON s.session_id = g.session_id
+     JOIN workstream_roots AS r ON r.id = g.workstream_id
+     WHERE (s.process_root = ?1 OR s.process_root IS NULL AND s.session_id = ?1)
+         AND r.root = ?2";
 
 /// A unit's Session row, as [`unit_rows`] reads it.
 struct UnitRow {
@@ -595,17 +602,7 @@ struct UnitRow {
 /// that row, in chain and workstream order.
 fn unit_rows(conn: &Connection, chain: &str, workstream: i64) -> Result<Vec<UnitRow>> {
     let candidates: Vec<(String, i64, String, bool)> = conn
-        .prepare_cached(
-            "SELECT DISTINCT ifnull(c.process_root, c.session_id), r.root, w.name, w.fallback
-             FROM directs AS x
-             JOIN sessions AS p ON p.session_id = x.parent
-             JOIN sessions AS c ON c.session_id = x.child
-             JOIN segments AS g ON g.session_id = x.child
-             JOIN workstream_roots AS r ON r.id = g.workstream_id
-             JOIN workstreams AS w ON w.id = r.root
-             WHERE ifnull(p.process_root, p.session_id) = ?1
-             ORDER BY 1, 2",
-        )?
+        .prepare_cached(UNIT_ROWS_SQL)?
         .query_map([chain], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
         })?
@@ -627,6 +624,19 @@ fn unit_rows(conn: &Connection, chain: &str, workstream: i64) -> Result<Vec<Unit
     }
     Ok(out)
 }
+
+/// [`unit_rows`]' query: each row (chain and workstream) of a session
+/// `?1`'s sessions directed, with its merge-resolved name.
+const UNIT_ROWS_SQL: &str = "SELECT DISTINCT ifnull(c.process_root, c.session_id), r.root, w.name,
+         w.fallback
+     FROM directs AS x
+     JOIN sessions AS p ON p.session_id = x.parent
+     JOIN sessions AS c ON c.session_id = x.child
+     JOIN segments AS g ON g.session_id = x.child
+     JOIN workstream_roots AS r ON r.id = g.workstream_id
+     JOIN workstreams AS w ON w.id = r.root
+     WHERE (p.process_root = ?1 OR p.process_root IS NULL AND p.session_id = ?1)
+     ORDER BY 1, 2";
 
 /// Every repo a `director-<repo>` name can name: the GitHub cache's, and
 /// those window names parse to.
@@ -675,24 +685,25 @@ const SESSION_SQL: &str = "SELECT
 /// `workstream` (a Session row's sessions), newest first: the latest
 /// session's first, each session's in link order, newest first.
 fn row_links(conn: &Connection, chain: &str, workstream: i64) -> Result<Vec<PrLink>> {
-    conn.prepare_cached(
-        "SELECT l.pr_url, l.pr_number, l.pr_repository
-         FROM github_links AS l JOIN sessions AS s ON s.session_id = l.session_id
-         WHERE ifnull(s.process_root, s.session_id) = ?1
-           AND EXISTS (SELECT 1 FROM segments AS g
-               JOIN workstream_roots AS r ON r.id = g.workstream_id
-               WHERE g.session_id = s.session_id AND r.root = ?2)
-         ORDER BY s.started_at IS NULL, s.started_at DESC, s.session_id DESC, l.id DESC",
-    )?
-    .query_map(rusqlite::params![chain, workstream], |r| {
-        Ok(PrLink {
-            url: r.get(0)?,
-            number: r.get(1)?,
-            repository: r.get(2)?,
-        })
-    })?
-    .collect()
+    conn.prepare_cached(ROW_LINKS_SQL)?
+        .query_map(rusqlite::params![chain, workstream], |r| {
+            Ok(PrLink {
+                url: r.get(0)?,
+                number: r.get(1)?,
+                repository: r.get(2)?,
+            })
+        })?
+        .collect()
 }
+
+/// [`row_links`]' query.
+const ROW_LINKS_SQL: &str = "SELECT l.pr_url, l.pr_number, l.pr_repository
+     FROM github_links AS l JOIN sessions AS s ON s.session_id = l.session_id
+     WHERE (s.process_root = ?1 OR s.process_root IS NULL AND s.session_id = ?1)
+       AND EXISTS (SELECT 1 FROM segments AS g
+           JOIN workstream_roots AS r ON r.id = g.workstream_id
+           WHERE g.session_id = s.session_id AND r.root = ?2)
+     ORDER BY s.started_at IS NULL, s.started_at DESC, s.session_id DESC, l.id DESC";
 
 impl Session {
     fn load(conn: &Connection, session_id: &str) -> Result<Self> {
@@ -889,6 +900,37 @@ mod tests {
             session.contains("COVERING INDEX events_session_time"),
             "{session}"
         );
+        drop(conn);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    /// A Session row's queries find its chain's sessions by the
+    /// process-root index and the session key, then their rows by key: no
+    /// scan of `sessions`, `directs`, `segments` or `github_links` for
+    /// every row (#67). Only `workstream_roots`' merge walk scans, over
+    /// `workstreams`.
+    #[test]
+    fn a_rows_chain_is_read_by_index() {
+        let dir = test_dir("chain-plans");
+        let db = dir.join("strate.db");
+        drop(Store::open(&db).expect("open"));
+        let conn = Store::open_reader(&db).expect("reader");
+        for (name, sql, chain) in [
+            ("launched_from", LAUNCHED_FROM_SQL, "c"),
+            ("row_start", ROW_START_SQL, "s"),
+            ("unit_rows", UNIT_ROWS_SQL, "p"),
+            ("row_links", ROW_LINKS_SQL, "s"),
+        ] {
+            let found = plan(&conn, sql);
+            let by_root =
+                format!("SEARCH {chain} USING INDEX sessions_process_root (process_root=?)");
+            assert!(found.contains(&by_root), "{name}: {found}");
+            let scans = found
+                .lines()
+                .filter(|step| step.starts_with("SCAN "))
+                .filter(|step| !["SCAN workstreams", "SCAN r"].contains(step));
+            assert_eq!(scans.count(), 0, "{name}: {found}");
+        }
         drop(conn);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
