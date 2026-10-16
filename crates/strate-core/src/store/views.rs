@@ -15,7 +15,9 @@
 //! to the next has no tab. A background session `blocked` on the user is
 //! not running either: no tab and no unit node, only a needs-you
 //! ([`needs_you`]) on its latest link. A hook's needs-you is on a latest
-//! link only (#68): a `/clear` left an earlier link's prompt behind.
+//! link only (#68): a `/clear` left an earlier link's prompt behind. A
+//! registry wait and a hook wait on one stop are one needs-you row, the
+//! hook's (#84).
 //!
 //! A workstream draws one session: of the sessions with a segment in it, a
 //! live one first, then the latest segment start. Its live graph is that
@@ -559,19 +561,34 @@ pub fn workstream_costs(conn: &Connection) -> Result<Vec<WorkstreamCost>> {
     .collect()
 }
 
+/// How far apart a registry wait and a hook wait can start and still be
+/// one stop. The poller runs every second and stamps a poll before it
+/// runs; the real store's pairs were 23 to 375 ms apart. A registry wait
+/// starts at the poll that first saw it waiting (`waiting_since_ms`).
+const SAME_STOP_MS: i64 = 5_000;
+
 /// Everything waiting on the user, oldest first: the `needs_you` view, on
 /// latest links (#68). A registry wait is its process's latest link's (see
 /// [`listings`]), and a hook wait is listed only on a latest link, so each
 /// names that session and counts toward its workstream.
+///
+/// One stop is one row (#84): a registry wait that started within
+/// [`SAME_STOP_MS`] of a hook wait on its link (the orchestrator's or a
+/// worker's: the registry describes the whole process) is that wait, and
+/// the hook's row stays, since it names the tool. The view keeps both
+/// signals, as recorded; every count of waits reads this list.
 pub fn needs_you(conn: &Connection) -> Result<Vec<NeedsYou>> {
     let mut stmt = conn.prepare_cached(
         "SELECT n.source, n.session_id, n.agent_id, n.waiting_for, n.since_ms, w.root
          FROM needs_you AS n
          LEFT JOIN sessions AS s ON s.session_id = n.session_id
          LEFT JOIN workstream_roots AS w ON w.id = s.workstream_id
+         WHERE n.source = 'hook' OR NOT EXISTS (SELECT 1 FROM needs_you AS h
+             WHERE h.source = 'hook' AND h.session_id = n.session_id
+               AND abs(h.since_ms - n.since_ms) <= ?1)
          ORDER BY n.since_ms, n.session_id, n.agent_id",
     )?;
-    stmt.query_map([], |r| {
+    stmt.query_map([SAME_STOP_MS], |r| {
         Ok(NeedsYou {
             source: r.get(0)?,
             session_id: r.get(1)?,
@@ -1384,6 +1401,107 @@ mod tests {
         assert_eq!(graph.session_id, "p");
         assert_eq!(graph.agents.len(), 1, "{:?}", graph.agents);
         assert!(graph.edges.is_empty());
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_registry_wait_and_a_hook_wait_on_one_stop_are_one_row() {
+        // Each session has a hook wait from 10000 and a registry wait whose
+        // start differs: s by 375 ms (the real store's gap), u by 5000 ms,
+        // v by 5001 ms, x on a subagent by 2000 ms, b blocked in the
+        // background. g's registry row is gone, so g needs nothing. A
+        // wait's start is never its row's last change (99999).
+        let (dir, store) = seeded(
+            "views-one-stop",
+            "INSERT INTO workstreams (id, name) VALUES (1, 'demo'), (2, 'other');
+             INSERT INTO sessions (session_id, workstream_id) VALUES
+                 ('s', 1), ('u', NULL), ('v', 2), ('x', NULL), ('b', NULL),
+                 ('g', NULL);
+             INSERT INTO agents (session_id, agent_id, kind, hook_state, hook_waiting_for,
+                 hook_at_ms)
+             SELECT session_id, NULL, 'orchestrator', 'needs_you', 'AskUserQuestion', 10000
+             FROM sessions WHERE session_id <> 'x'
+             UNION ALL SELECT 'x', NULL, 'orchestrator', NULL, NULL, NULL
+             UNION ALL SELECT 'x', 'a1', 'subagent', 'needs_you', 'Bash', 10000;
+             INSERT INTO registry (key, kind, session_id, cwd, started_at_ms, status, state,
+                 waiting_for, first_seen_ms, last_seen_ms, gone, waiting_since_ms) VALUES
+                 ('s', 'interactive', 's', '/w', 1, 'waiting', NULL, 'input needed', 1, 99999, 0,
+                     10375),
+                 ('u', 'interactive', 'u', '/w', 1, 'waiting', NULL, 'input needed', 1, 99999, 0,
+                     15000),
+                 ('v', 'interactive', 'v', '/w', 1, 'waiting', NULL, 'input needed', 1, 99999, 0,
+                     15001),
+                 ('x', 'interactive', 'x', '/w', 1, 'waiting', NULL, 'input needed', 1, 99999, 0,
+                     12000),
+                 ('b', 'background', 'b', '/w', 1, NULL, 'blocked', NULL, 1, 99999, 0, 10200),
+                 ('g', 'interactive', 'g', '/w', 1, 'waiting', NULL, 'input needed', 1, 99999, 1,
+                     10000);",
+        );
+        let rows: Vec<_> = needs_you(&store.conn)
+            .expect("needs_you")
+            .into_iter()
+            .map(|n| (n.source, n.session_id, n.agent_id, n.since_ms))
+            .collect();
+        let row = |source: &str, session: &str, agent: Option<&str>, since| {
+            (
+                source.into(),
+                Some(session.into()),
+                agent.map(String::from),
+                Some(since),
+            )
+        };
+        assert_eq!(
+            rows,
+            [
+                row("hook", "b", None, 10000),
+                row("hook", "s", None, 10000),
+                row("hook", "u", None, 10000),
+                row("hook", "v", None, 10000),
+                row("hook", "x", Some("a1"), 10000),
+                row("registry", "v", None, 15001),
+            ]
+        );
+        // The header's and the tab's count read the same rows.
+        let counts: Vec<(i64, i64, AgentState)> = workstreams(&store.conn)
+            .expect("workstreams")
+            .iter()
+            .map(|w| (w.id, w.needs_you, w.state))
+            .collect();
+        assert!(counts.contains(&(1, 1, AgentState::NeedsYou)), "{counts:?}");
+        assert!(counts.contains(&(2, 2, AgentState::NeedsYou)), "{counts:?}");
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_v17_registry_wait_starts_at_its_last_change() {
+        let dir = crate::tail::test_dir("views-v17-wait-start");
+        let db = dir.join("strate.db");
+        let mut v17 = Connection::open(&db).expect("v17 db");
+        super::super::migrate::migrate(&mut v17, &super::super::migrate::MIGRATIONS[..17])
+            .expect("v17");
+        v17.execute_batch(
+            "INSERT INTO registry (key, kind, session_id, cwd, started_at_ms, status, state,
+                 waiting_for, first_seen_ms, last_seen_ms) VALUES
+                 ('w', 'interactive', 'w', '/w', 1, 'waiting', NULL, 'input', 1, 500),
+                 ('b', 'background', 'b', '/w', 1, NULL, 'blocked', NULL, 1, 600),
+                 ('i', 'interactive', 'i', '/w', 1, 'busy', NULL, NULL, 1, 700);",
+        )
+        .expect("v17 rows");
+        drop(v17);
+
+        let store = super::super::Store::open_in(&db, "UTC").expect("upgrade");
+        let starts: Vec<(String, Option<i64>)> = store
+            .conn
+            .prepare("SELECT key, waiting_since_ms FROM registry ORDER BY key")
+            .expect("starts")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("rows")
+            .collect::<Result<_>>()
+            .expect("starts");
+        let want = [("b", Some(600)), ("i", None), ("w", Some(500))];
+        assert_eq!(starts, want.map(|(k, s)| (k.to_string(), s)));
         drop(store);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }

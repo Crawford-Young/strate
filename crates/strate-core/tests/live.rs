@@ -9,6 +9,7 @@ use rusqlite::{Connection, params};
 use serde_json::json;
 use strate_core::hooks::{Hook, HookEvent};
 use strate_core::registry::{RegistryEntry, RegistryEvent, parse_snapshot};
+use strate_core::store::views;
 use strate_core::tail::{Batch, TailEvent};
 
 mod common;
@@ -213,6 +214,99 @@ fn a_registry_entry_shows_before_its_transcript_and_waiting_is_needs_you() {
         )
         .expect("gone row");
     assert_eq!(gone, (1, 3000));
+}
+
+/// (source, since ms) of each `needs_you` row, sorted.
+fn starts(reader: &Connection) -> Vec<(String, i64)> {
+    let mut out: Vec<_> = needs_you(reader).into_iter().map(|n| (n.2, n.4)).collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn a_registry_wait_keeps_its_start_while_it_waits_and_stays_one_stop_with_its_hook() {
+    let temp = Temp::new("registry-wait-start");
+    let (mut store, reader) = temp.open();
+    let alpha = waiting_alpha();
+    store
+        .apply_registry(&[RegistryEvent::Appeared {
+            entry: alpha.clone(),
+            at_ms: 1000,
+        }])
+        .expect("waits");
+    store
+        .apply_hook(&permission(1300, None, "AskUserQuestion"))
+        .expect("asks");
+    // Still waiting: the entry changes, then a restarted strate lists it
+    // again a minute on.
+    let renamed = entry(
+        r#"{"pid":4101,"cwd":"/work/alpha","kind":"interactive","startedAt":1791000000000,
+            "sessionId":"s-alpha","name":"alpha-2","status":"waiting","waitingFor":"input"}"#,
+    );
+    store
+        .apply_registry(&[RegistryEvent::Changed {
+            entry: renamed.clone(),
+            at_ms: 9000,
+        }])
+        .expect("changed");
+    store
+        .apply_registry(&[
+            RegistryEvent::Appeared {
+                entry: renamed,
+                at_ms: 60_000,
+            },
+            RegistryEvent::Baseline {
+                keys: vec![alpha.key()],
+            },
+        ])
+        .expect("restart");
+    assert_eq!(
+        starts(&reader),
+        [("hook".into(), 1300), ("registry".into(), 1000)]
+    );
+    let rows = views::needs_you(&reader).expect("needs_you");
+    let sources: Vec<&str> = rows.iter().map(|n| n.source.as_str()).collect();
+    assert_eq!(sources, ["hook"], "one stop");
+
+    // Answered, then a new wait: it starts anew.
+    store
+        .apply_registry(&[
+            RegistryEvent::Changed {
+                entry: with_status(&alpha, "busy"),
+                at_ms: 70_000,
+            },
+            RegistryEvent::Changed {
+                entry: alpha,
+                at_ms: 80_000,
+            },
+        ])
+        .expect("waits again");
+    assert_eq!(starts(&reader), [("registry".into(), 80_000)]);
+}
+
+#[test]
+fn a_blocked_background_session_keeps_its_start_while_blocked() {
+    let temp = Temp::new("registry-blocked-start");
+    let (mut store, reader) = temp.open();
+    let blocked = |name: &str| {
+        entry(&format!(
+            r#"{{"id":"bg-1","cwd":"/work/beta","kind":"background","startedAt":1791000000500,
+                "sessionId":"s-beta","name":"{name}","state":"blocked"}}"#
+        ))
+    };
+    store
+        .apply_registry(&[RegistryEvent::Appeared {
+            entry: blocked("beta-1"),
+            at_ms: 100,
+        }])
+        .expect("blocked");
+    store
+        .apply_registry(&[RegistryEvent::Changed {
+            entry: blocked("beta-2"),
+            at_ms: 5000,
+        }])
+        .expect("renamed");
+    assert_eq!(starts(&reader), [("registry".into(), 100)]);
 }
 
 fn registry_row(reader: &Connection, key: &str) -> (i64, i64) {

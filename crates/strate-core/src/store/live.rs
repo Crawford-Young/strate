@@ -65,15 +65,21 @@ fn upsert_entry(conn: &Connection, entry: &RegistryEntry, at_ms: i64) -> Result<
         upsert_session(conn, session_id, None, None)?;
         ensure_agent(conn, session_id, None, "orchestrator", None)?;
     }
+    // A wait on the user keeps the start of the poll that first saw it
+    // (#84): a change mid-wait, or a restart listing it again, is the same
+    // wait.
+    let waits = entry.status == Some(Status::Waiting) || entry.state.as_deref() == Some("blocked");
     conn.prepare_cached(
         "INSERT INTO registry (key, kind, session_id, pid, bg_id, name, cwd, started_at_ms,
-             status, waiting_for, state, first_seen_ms, last_seen_ms, gone)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13)
+             status, waiting_for, state, first_seen_ms, last_seen_ms, gone, waiting_since_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?13, ?14)
          ON CONFLICT (key) DO UPDATE SET kind = excluded.kind,
              session_id = excluded.session_id, pid = excluded.pid, bg_id = excluded.bg_id,
              name = excluded.name, cwd = excluded.cwd, started_at_ms = excluded.started_at_ms,
              status = excluded.status, waiting_for = excluded.waiting_for,
-             state = excluded.state, last_seen_ms = excluded.last_seen_ms, gone = excluded.gone",
+             state = excluded.state, last_seen_ms = excluded.last_seen_ms, gone = excluded.gone,
+             waiting_since_ms = CASE WHEN excluded.waiting_since_ms IS NOT NULL
+                 THEN coalesce(registry.waiting_since_ms, excluded.waiting_since_ms) END",
     )?
     .execute(params![
         entry.key(),
@@ -89,6 +95,7 @@ fn upsert_entry(conn: &Connection, entry: &RegistryEntry, at_ms: i64) -> Result<
         entry.state,
         at_ms,
         entry.finished(),
+        waits.then_some(at_ms),
     ])?;
     // The registry is the orchestrator's truth: once it is not waiting, a
     // PermissionRequest hook on its latest link's orchestrator is answered.

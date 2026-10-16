@@ -74,7 +74,8 @@ export function NeedsYouChip({ waits, sessions, tabs, onGoToTab }: NeedsYouChipP
   return (
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger
-        className={`${badgeVariants({ variant: 'outline' })} gap-1.5 hover:bg-item-hover`}
+        // whitespace-nowrap until the library's Badge has it (component-library#139).
+        className={`${badgeVariants({ variant: 'outline' })} gap-1.5 whitespace-nowrap hover:bg-item-hover`}
       >
         <StatusDot state="needs-you" />
         {count === 1 ? '1 needs you' : `${count} need you`}
