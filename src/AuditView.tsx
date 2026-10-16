@@ -1,6 +1,7 @@
 // The full-screen Audit view (#27): one bar (the "Audit" heading, the controls, Refresh GitHub,
 // Export CSV and "‹ Live"), the performance sections (#51), then Spend: a daily chart stacked by
-// repo, the tree table and, docked below, the selected row's timeline. It stays mounted while
+// the tree's top rows, the tree table with its breakdown columns (#54) and, docked below, the
+// selected row's timeline. One read serves the chart and the tree. It stays mounted while
 // hidden, like LiveShell, reads nothing then, and takes focus each time it is shown. It reads when
 // shown, when a control changes and after Refresh GitHub, never on a store change or a timer.
 import {
@@ -24,7 +25,7 @@ import {
   type AuditPath,
   type GithubError,
 } from './api'
-import { dailyChart, hasPath, hoursLabel, lastDays, repoOptions, shortDay } from './audit'
+import { dailyChart, dayRange, hasPath, hoursLabel, lastDays, repoChips, shortDay } from './audit'
 import { AuditControls, PRESET_DAYS, type Controls } from './AuditControls'
 import { AuditDetail } from './AuditDetail'
 import { AuditTable } from './AuditTable'
@@ -42,8 +43,7 @@ interface AuditViewProps {
 const START: Controls = {
   range: '7d',
   custom: { from: '', to: '' },
-  repo: null,
-  groupBy: 'hierarchy',
+  repos: [],
   measure: 'usd',
 }
 
@@ -75,7 +75,7 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
   }
 
   const [controls, setControls] = useState(START)
-  // The selected row, for the row detail. A path means nothing under another grouping.
+  // The selected row, for the row detail.
   const [selected, setSelected] = useState<{ path: AuditPath; label: string } | null>(null)
   // Stable, so the memoized table skips rerenders that change none of its props.
   const select = useCallback(
@@ -84,35 +84,25 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
     [],
   )
   const [exportError, setExportError] = useState<string | null>(null)
-  const change = (patch: Partial<Controls>) => {
-    if (patch.groupBy !== undefined && patch.groupBy !== controls.groupBy) setSelected(null)
-    setControls((c) => ({ ...c, ...patch }))
-  }
+  const change = (patch: Partial<Controls>) => setControls((c) => ({ ...c, ...patch }))
 
   // Recomputed each render, so the range rolls over at local midnight.
   const days =
     controls.range === 'custom'
       ? controls.custom
       : lastDays(PRESET_DAYS[controls.range], new Date())
-  const filter: AuditFilter = {
-    ...days,
-    repos: controls.repo === null ? [] : [controls.repo],
-    groupBy: controls.groupBy,
-  }
-  // Every repo, so the repo select lists them all; the chart narrows to the picked one itself.
-  const daily = useAudit({ ...days, repos: [], groupBy: 'day' }, !hidden, version)
-  // By day over every repo, the table's rollup is the chart's, so one read serves both.
-  const sameRead = controls.groupBy === 'day' && controls.repo === null
-  const own = useAudit(filter, !hidden && !sameRead, version)
-  const main = sameRead ? daily : own
-  // Days and repos only: the grouping is not part of the read.
+  // Every dimension is a column of the one tree, so it is always the hierarchy.
+  const filter: AuditFilter = { ...days, repos: controls.repos, groupBy: 'hierarchy' }
+  const main = useAudit(filter, !hidden, version)
   const perf = usePerformance(filter, !hidden, version)
   const chart = useMemo(
-    () =>
-      daily.audit && dailyChart(daily.audit, controls.measure, controls.repo, days.from, days.to),
-    [daily.audit, controls.measure, controls.repo, days.from, days.to],
+    () => main.audit && dailyChart(main.audit, controls.measure, days.from, days.to),
+    [main.audit, controls.measure, days.from, days.to],
   )
-  const repos = useMemo(() => (daily.audit ? repoOptions(daily.audit) : []), [daily.audit])
+  // Stable per range, so the memoized table only redraws when something it shows changes.
+  const range = useMemo(() => dayRange(days.from, days.to), [days.from, days.to])
+  // Listed from the read itself, which names every repo in range whatever the filter.
+  const repos = repoChips(main.audit, controls.repos)
   // A row a new repo or range no longer holds is no longer selected.
   const shown = selected && main.audit && hasPath(main.audit.root, selected.path) ? selected : null
 
@@ -139,7 +129,11 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
   }
 
   return (
-    <div hidden={hidden} className="flex h-screen flex-col bg-background text-foreground">
+    // The page never scrolls: the main panel does, alone.
+    <div
+      hidden={hidden}
+      className="flex h-screen flex-col overflow-hidden bg-background text-foreground"
+    >
       <AuditControls
         title={
           <h1
@@ -182,10 +176,9 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
       />
       <ResizablePanelGroup id="strate-audit" orientation="vertical" className="min-h-0 flex-1">
         <ResizablePanel id="audit-main" minSize="20%">
-          <main
-            aria-busy={main.pending}
-            className="h-full space-y-4 overflow-auto p-4 aria-busy:opacity-70"
-          >
+          {/* The panel's own box scrolls (react-resizable-panels sets overflow: auto on it), so
+              main is not a scroll box too: nested, the two drew two scrollbars (#54). */}
+          <main aria-busy={main.pending} className="space-y-4 p-4 aria-busy:opacity-70">
             {exportError !== null && (
               <Alert variant="destructive">
                 <AlertDescription>Export failed: {exportError}</AlertDescription>
@@ -239,7 +232,9 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
                     className="outline-none"
                   >
                     <AuditTable
-                      nodes={main.audit.root.children}
+                      root={main.audit.root}
+                      days={range}
+                      measure={controls.measure}
                       selected={shown?.path ?? null}
                       onSelect={select}
                       // The tree on screen may be the last filter's while this one is read.

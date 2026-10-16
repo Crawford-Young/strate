@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { audit, headline, node } from '../tests/audit-fixtures'
+import { audit, headline, node, slice } from '../tests/audit-fixtures'
 import { agentRow, performance } from '../tests/performance-fixtures'
 import {
   auditPerformance,
@@ -10,10 +10,9 @@ import {
   onStoreChanged,
   writeExport,
   type Audit,
-  type AuditFilter,
   type TimelineDay,
 } from './api'
-import { compact, dailyChart } from './audit'
+import { compact, dailyChart, shortDay } from './audit'
 import { AuditView } from './AuditView'
 import { totals } from './performance'
 
@@ -62,20 +61,36 @@ const DAY = 24 * HOUR
 
 // Hierarchy: acme/web (an epic with a GitHub issue, plus an issue known only from a window
 // name), acme/api, then Unlinked, which costs the most so a sort would move it if it could.
+// The top rows carry their $ and agent-hours per day, for the chart and the By day column.
 const tree: Audit = audit(
   [
-    node('repo', 'acme/web', { costUsd: 6.5, unpriced: 2, agentMs: 3 * HOUR, activeMs: 2 * HOUR }, [
-      node(
-        'epic',
-        '10',
-        { costUsd: 4, progress: { completed: 1, total: 2 }, elapsedMs: 2 * DAY, open: true },
-        [node('issue', '11', { costUsd: 4 }, [], { label: '#11 Fix', github: true })],
-        { label: '#10 Epic', github: true },
-      ),
-      node('issue', '13', { costUsd: 2.5 }, [], { label: '#13 Guess' }),
-    ]),
+    node(
+      'repo',
+      'acme/web',
+      {
+        costUsd: 6.5,
+        unpriced: 2,
+        agentMs: 4 * HOUR,
+        activeMs: 2 * HOUR,
+        byDay: [slice('2026-10-12', 2.5, 3 * HOUR), slice('2026-10-13', 4, HOUR)],
+        byAgentType: [slice('implementer', 4, 4 * HOUR), slice('orchestrator', 2.5)],
+        byModel: [slice('model-a', 6.5, 4 * HOUR)],
+      },
+      [
+        node(
+          'epic',
+          '10',
+          { costUsd: 4, progress: { completed: 1, total: 2 }, elapsedMs: 2 * DAY, open: true },
+          [node('issue', '11', { costUsd: 4 }, [], { label: '#11 Fix', github: true })],
+          { label: '#10 Epic', github: true },
+        ),
+        node('issue', '13', { costUsd: 2.5 }, [], { label: '#13 Guess' }),
+      ],
+    ),
     node('repo', 'acme/api', {
       costUsd: 1,
+      agentMs: HOUR / 2,
+      byDay: [slice('2026-10-12', 1, HOUR / 2)],
       tokens: { input: 1000, output: 200, cacheRead: 3000, cacheWrite: 300 },
       sessions: 3,
       agents: 5,
@@ -83,9 +98,13 @@ const tree: Audit = audit(
       waitMs: 30 * 60_000,
       elapsedMs: 90 * 60_000,
     }),
-    node('unlinked', 'unlinked', { costUsd: 9 }, [], { label: 'Unlinked' }),
+    node('unlinked', '', { costUsd: 9, byDay: [slice('2026-10-11', 9)] }, [], {
+      label: 'Unlinked',
+    }),
   ],
   {
+    repos: ['acme/api', 'acme/web'],
+    unlinked: true,
     headline: headline({
       issuesClosed: 3,
       medianElapsedMs: DAY + 4 * HOUR,
@@ -95,15 +114,9 @@ const tree: Audit = audit(
   },
 )
 
-const byDay: Audit = audit([
-  node('group', '2026-10-12', {}, [
-    node('repo', 'acme/api', { costUsd: 1, agentMs: HOUR / 2, activeMs: 9 * HOUR }),
-    node('repo', 'acme/web', { costUsd: 2.5, agentMs: 3 * HOUR, activeMs: 9 * HOUR }),
-  ]),
-  node('group', '2026-10-13', {}, [
-    node('repo', 'acme/web', { costUsd: 4, agentMs: HOUR, activeMs: 9 * HOUR }),
-  ]),
-])
+// The root holds every split key its rows do: the breakdown colours are picked over it.
+tree.root.metrics.byAgentType = [slice('implementer', 4, 4 * HOUR), slice('orchestrator', 2.5)]
+tree.root.metrics.byModel = [slice('model-a', 6.5, 4 * HOUR)]
 
 const timelineDays: TimelineDay[] = [
   {
@@ -118,17 +131,13 @@ const timelineDays: TimelineDay[] = [
 
 const perf = performance({ agents: [agentRow({ dispatches: 4, completed: 4, costUsd: 2 })] })
 
-const calls = (groupBy: (g: string) => boolean) =>
-  rollupMock.mock.calls.map(([f]) => f).filter((f) => groupBy(f.groupBy))
-const treeCalls = () => calls((g) => g !== 'day')
-const lastTreeFilter = () => treeCalls().at(-1) as AuditFilter
+const reads = () => rollupMock.mock.calls.length
+const lastFilter = () => rollupMock.mock.lastCall?.[0]
 
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ['Date'] })
   vi.setSystemTime(new Date(2026, 9, 13, 15, 0))
-  rollupMock
-    .mockReset()
-    .mockImplementation((f) => Promise.resolve(f.groupBy === 'day' ? byDay : tree))
+  rollupMock.mockReset().mockResolvedValue(tree)
   performanceMock.mockReset().mockResolvedValue(perf)
   refreshMock.mockReset().mockResolvedValue()
   timelineMock.mockReset().mockResolvedValue(timelineDays)
@@ -157,14 +166,13 @@ const sortBy = (name: string) =>
     within(within(region('Breakdown')).getByRole('columnheader', { name })).getByRole('button'),
   )
 const tableRow = (name: RegExp) => within(region('Breakdown')).getByRole('row', { name })
+/** The name button of the tree row `name`, which a repo chip may share. */
+const rowButton = (name: string) => within(region('Breakdown')).getByRole('button', { name })
 const pick = (name: string) => fireEvent.click(screen.getByRole('radio', { name }))
 
-/** Opens the Select named `label` and picks `option`. */
-async function choose(label: string, option: string) {
-  const trigger = screen.getByRole('combobox', { name: label })
-  fireEvent.keyDown(trigger, { key: 'Enter' })
-  fireEvent.click(await screen.findByRole('option', { name: option }))
-}
+/** The repo chip `name`. */
+const chip = (name: string) =>
+  within(screen.getByRole('group', { name: 'Repos' })).getByRole('button', { name })
 
 /** The chart's data table: one row per day, the day then each series. */
 const chartRows = () =>
@@ -185,29 +193,27 @@ const tableRows = () =>
     .map((r) => r.querySelector('[aria-pressed]')?.textContent)
 
 describe('loading', () => {
-  it('reads each rollup once on show, and never again on a store change', async () => {
+  it('reads the rollup once on show, and never again on a store change', async () => {
     await show()
     await flush()
-    expect(calls(() => true)).toHaveLength(2)
+    expect(reads()).toBe(1)
     for (let i = 0; i < 3; i++) storeChanged()
     await flush()
     expect(onStoreChanged).not.toHaveBeenCalled()
-    expect(calls(() => true)).toHaveLength(2)
+    expect(reads()).toBe(1)
   })
 
-  it('rereads each rollup, and the selected row, each time it is shown again', async () => {
+  it('rereads the rollup, and the selected row, each time it is shown again', async () => {
     const { rerender } = await show()
-    fireEvent.click(screen.getByRole('button', { name: 'acme/api' }))
+    fireEvent.click(rowButton('acme/api'))
     await flush()
-    expect([calls(() => true).length, timelineMock.mock.calls.length]).toEqual([2, 1])
+    expect([reads(), timelineMock.mock.calls.length]).toEqual([1, 1])
     rerender(<AuditView hidden onBack={() => {}} />)
     await flush()
-    expect([calls(() => true).length, timelineMock.mock.calls.length]).toEqual([2, 1])
+    expect([reads(), timelineMock.mock.calls.length]).toEqual([1, 1])
     rerender(<AuditView hidden={false} onBack={() => {}} />)
     await flush()
-    expect(calls((g) => g === 'day')).toHaveLength(2)
-    expect(treeCalls()).toHaveLength(2)
-    expect(timelineMock).toHaveBeenCalledTimes(2)
+    expect([reads(), timelineMock.mock.calls.length]).toEqual([2, 2])
   })
 
   it('reads nothing while hidden', async () => {
@@ -224,43 +230,42 @@ describe('loading', () => {
   })
 
   it('reports a failed rollup', async () => {
-    rollupMock.mockImplementation((f) =>
-      f.groupBy === 'day' ? Promise.resolve(byDay) : Promise.reject('bad day: 2026-13-01'),
-    )
+    rollupMock.mockRejectedValue('bad day: 2026-13-01')
     render(<AuditView hidden={false} onBack={() => {}} />)
     expect(await screen.findByRole('alert')).toHaveTextContent('bad day: 2026-13-01')
   })
 })
 
 describe('controls', () => {
-  it('start on the last 7 local days, every repo, by Repo › Epic › Issue › PR', async () => {
+  it('start on the last 7 local days and every repo', async () => {
     await show()
-    expect(lastTreeFilter()).toEqual({
+    expect(lastFilter()).toEqual({
       from: '2026-10-07',
       to: '2026-10-13',
       repos: [],
       groupBy: 'hierarchy',
     })
     expect(screen.getByRole('radio', { name: '7d' })).toHaveAttribute('aria-checked', 'true')
+    expect(chip('All repos')).toHaveAttribute('aria-pressed', 'true')
   })
 
   it('switch the range to 14 or 30 days', async () => {
     await show()
     pick('14d')
-    expect(lastTreeFilter()).toMatchObject({ from: '2026-09-30', to: '2026-10-13' })
+    expect(lastFilter()).toMatchObject({ from: '2026-09-30', to: '2026-10-13' })
     pick('30d')
-    expect(lastTreeFilter()).toMatchObject({ from: '2026-09-14', to: '2026-10-13' })
+    expect(lastFilter()).toMatchObject({ from: '2026-09-14', to: '2026-10-13' })
   })
 
   it('take a custom range from the date picker, starting from the current one', async () => {
     await show()
     pick('Custom')
-    expect(lastTreeFilter()).toMatchObject({ from: '2026-10-07', to: '2026-10-13' })
+    expect(lastFilter()).toMatchObject({ from: '2026-10-07', to: '2026-10-13' })
     fireEvent.click(screen.getByRole('button', { name: /October 7, 2026 – October 13, 2026/ }))
     fireEvent.click(await screen.findByRole('button', { name: /October 1st, 2026/ }))
-    expect(lastTreeFilter()).toMatchObject({ from: '2026-10-01' })
+    expect(lastFilter()).toMatchObject({ from: '2026-10-01' })
     fireEvent.click(screen.getByRole('button', { name: /October 3rd, 2026/ }))
-    expect(lastTreeFilter()).toMatchObject({ from: '2026-10-01', to: '2026-10-03' })
+    expect(lastFilter()).toMatchObject({ from: '2026-10-01', to: '2026-10-03' })
   })
 
   it('keep the custom range when the picker is cleared', async () => {
@@ -270,24 +275,49 @@ describe('controls', () => {
     const oct7 = () => screen.getByRole('button', { name: /October 7th, 2026/ })
     await screen.findByRole('grid', { name: /October 2026/ })
     fireEvent.click(oct7())
-    expect(lastTreeFilter()).toMatchObject({ from: '2026-10-07', to: '2026-10-07' })
+    expect(lastFilter()).toMatchObject({ from: '2026-10-07', to: '2026-10-07' })
     // A one-day range picked again clears the picker; the filter keeps its last range.
     fireEvent.click(oct7())
-    expect(lastTreeFilter()).toMatchObject({ from: '2026-10-07', to: '2026-10-07' })
+    expect(lastFilter()).toMatchObject({ from: '2026-10-07', to: '2026-10-07' })
     expect(
       screen.getByRole('button', { name: /October 7, 2026 – October 7, 2026/ }),
     ).toBeInTheDocument()
   })
 
-  it('filter to one repo, picked from the repos with work in range', async () => {
+  it("list the read's repos as chips, then Unlinked, with All repos first", async () => {
     await show()
-    await choose('Repo', 'acme/web')
-    expect(lastTreeFilter()).toMatchObject({ repos: ['acme/web'] })
-    const reads = treeCalls().length
-    await choose('Repo', 'All repos')
+    const chips = within(screen.getByRole('group', { name: 'Repos' }))
+      .getAllByRole('button')
+      .map((b) => b.textContent)
+    expect(chips).toEqual(['All repos', 'acme/api', 'acme/web', 'Unlinked'])
+  })
+
+  it('filter to any repos picked, Unlinked as the empty slug, All repos for every one', async () => {
+    await show()
+    fireEvent.click(chip('acme/web'))
+    expect(lastFilter()).toMatchObject({ repos: ['acme/web'] })
+    expect(chip('All repos')).toHaveAttribute('aria-pressed', 'false')
+    expect(chip('acme/web')).toHaveAttribute('aria-pressed', 'true')
+    fireEvent.click(chip('Unlinked'))
+    expect(lastFilter()).toMatchObject({ repos: ['acme/web', ''] })
+    fireEvent.click(chip('acme/web'))
+    expect(lastFilter()).toMatchObject({ repos: [''] })
+    const before = reads()
+    fireEvent.click(chip('All repos'))
     // Every repo was read at open, so it comes from the cache.
-    expect(treeCalls()).toHaveLength(reads)
-    expect(screen.getByRole('combobox', { name: 'Repo' })).toHaveTextContent('All repos')
+    expect(reads()).toBe(before)
+    expect(chip('All repos')).toHaveAttribute('aria-pressed', 'true')
+    expect(chip('Unlinked')).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('fall back to every repo when the last picked one is unpicked, or All repos is clicked again', async () => {
+    await show()
+    fireEvent.click(chip('acme/api'))
+    fireEvent.click(chip('acme/api'))
+    expect(chip('All repos')).toHaveAttribute('aria-pressed', 'true')
+    expect(chip('acme/api')).toHaveAttribute('aria-pressed', 'false')
+    fireEvent.click(chip('All repos'))
+    expect(chip('All repos')).toHaveAttribute('aria-pressed', 'true')
   })
 
   it('keep the range and measure when their pressed item is clicked again', async () => {
@@ -301,9 +331,7 @@ describe('controls', () => {
   it('keep the last rollup on screen, marked busy, while a new filter is read', async () => {
     await show()
     const lands: (() => void)[] = []
-    rollupMock.mockImplementation(
-      (f) => new Promise((r) => lands.push(() => r(f.groupBy === 'day' ? byDay : tree))),
-    )
+    rollupMock.mockImplementation(() => new Promise((r) => lands.push(() => r(tree))))
     pick('14d')
     expect(screen.getByRole('main')).toHaveAttribute('aria-busy', 'true')
     expect(tableRows()).toEqual(['acme/web', 'acme/api', 'Unlinked'])
@@ -311,12 +339,10 @@ describe('controls', () => {
     expect(screen.getByRole('main')).toHaveAttribute('aria-busy', 'false')
   })
 
-  it('group by any of the spec groupings', async () => {
+  it('have no Group by picker: every dimension is a column of the one tree', async () => {
     await show()
-    await choose('Group by', 'Model')
-    expect(lastTreeFilter()).toMatchObject({ groupBy: 'model' })
-    await choose('Group by', 'Agent type')
-    expect(lastTreeFilter()).toMatchObject({ groupBy: 'agent_type' })
+    expect(screen.queryByRole('combobox')).toBeNull()
+    expect(screen.queryByText(/Group by/)).toBeNull()
   })
 })
 
@@ -380,13 +406,13 @@ describe('performance', () => {
     expect(performanceMock).toHaveBeenCalledTimes(2)
   })
 
-  it('follows the repo filter and range, but not the grouping', async () => {
+  it('follows the repo chips and range, but not the measure', async () => {
     await show()
     await flush()
-    await choose('Group by', 'Model')
+    pick('Hours')
     await flush()
     expect(performanceMock).toHaveBeenCalledOnce()
-    await choose('Repo', 'acme/web')
+    fireEvent.click(chip('acme/web'))
     await flush()
     pick('14d')
     await flush()
@@ -417,23 +443,16 @@ describe('performance', () => {
     await show()
     await screen.findByRole('region', { name: 'Outcome' })
     expect(screen.queryByText(/Cloud sessions/)).not.toBeInTheDocument()
-    rollupMock.mockImplementation((f) =>
-      Promise.resolve(
-        f.groupBy === 'day' ? byDay : { ...tree, headline: headline({ cloudUncounted: true }) },
-      ),
-    )
+    rollupMock.mockResolvedValue({ ...tree, headline: headline({ cloudUncounted: true }) })
     pick('14d')
     expect(await screen.findByText(/Cloud sessions are not counted/)).toBeInTheDocument()
   })
 
   it('warns about repos with no GitHub data', async () => {
-    rollupMock.mockImplementation((f) =>
-      Promise.resolve(
-        f.groupBy === 'day'
-          ? byDay
-          : { ...tree, githubErrors: [{ repo: 'acme/web', error: 'gh: not logged in' }] },
-      ),
-    )
+    rollupMock.mockResolvedValue({
+      ...tree,
+      githubErrors: [{ repo: 'acme/web', error: 'gh: not logged in' }],
+    })
     render(<AuditView hidden={false} onBack={() => {}} />)
     expect(await screen.findByRole('alert')).toHaveTextContent('acme/web: gh: not logged in')
   })
@@ -451,9 +470,9 @@ describe('GitHub refresh', () => {
     expect(refreshMock).not.toHaveBeenCalled()
   })
 
-  it('is busy until the refresh is stored, then rereads each shown rollup and the row once', async () => {
+  it('is busy until the refresh is stored, then rereads the rollup and the row once', async () => {
     await show()
-    fireEvent.click(screen.getByRole('button', { name: 'acme/api' }))
+    fireEvent.click(rowButton('acme/api'))
     await flush()
     let stored!: () => void
     refreshMock.mockReturnValue(new Promise((r) => (stored = r)))
@@ -462,24 +481,12 @@ describe('GitHub refresh', () => {
     expect(refreshButton()).toHaveTextContent('Refreshing…')
     expect(refreshButton()).toBeDisabled()
     await flush()
-    expect([calls(() => true).length, timelineMock.mock.calls.length]).toEqual([2, 1])
+    expect([reads(), timelineMock.mock.calls.length]).toEqual([1, 1])
     await act(async () => stored())
     await flush()
     expect(refreshButton()).toHaveTextContent('Refresh GitHub')
     expect(refreshButton()).toBeEnabled()
-    expect(calls((g) => g === 'day')).toHaveLength(2)
-    expect(treeCalls()).toHaveLength(2)
-    expect(timelineMock).toHaveBeenCalledTimes(2)
-  })
-
-  it('rereads the one shared rollup once when the table is by day over every repo', async () => {
-    await show()
-    await choose('Group by', 'Day')
-    await flush()
-    const before = calls(() => true).length
-    fireEvent.click(refreshButton())
-    await flush()
-    expect(calls(() => true)).toHaveLength(before + 1)
+    expect([reads(), timelineMock.mock.calls.length]).toEqual([2, 2])
   })
 
   it('reports a failure, rereads nothing, and clears the report on the next try', async () => {
@@ -492,7 +499,7 @@ describe('GitHub refresh', () => {
     await flush()
     expect(screen.getByRole('alert')).toHaveTextContent('GitHub refresh failed: no engine')
     expect(refreshButton()).toBeEnabled()
-    expect(calls(() => true)).toHaveLength(2)
+    expect(reads()).toBe(1)
     fireEvent.click(refreshButton())
     await flush()
     expect(screen.queryByRole('alert')).toBeNull()
@@ -515,19 +522,16 @@ describe('GitHub refresh', () => {
 })
 
 describe('daily chart', () => {
-  it('stacks $ by repo, a row per day of the range, from an every-repo by-day rollup', async () => {
+  it("stacks $ by the tree's top rows, a row per day of the range, from the tree's own read", async () => {
     await show()
+    await flush()
     expect(within(region('Per day')).getByRole('columnheader', { name: 'Day' })).toBeInTheDocument()
-    expect(calls((g) => g === 'day').at(-1)).toEqual({
-      from: '2026-10-07',
-      to: '2026-10-13',
-      repos: [],
-      groupBy: 'day',
-    })
+    expect(reads()).toBe(1)
     const rows = chartRows()
     expect(rows).toHaveLength(7)
-    expect(rows.at(-2)?.slice(1)).toEqual(['$1.00', '$2.50'])
-    expect(rows.at(-1)?.slice(1)).toEqual(['$0.00', '$4.00'])
+    expect(rows.at(-3)?.slice(1)).toEqual(['$0.00', '$0.00', '$9.00'])
+    expect(rows.at(-2)?.slice(1)).toEqual(['$2.50', '$1.00', '$0.00'])
+    expect(rows.at(-1)?.slice(1)).toEqual(['$4.00', '$0.00', '$0.00'])
   })
 
   it('follows the $ / hours toggle, hours being agent-hours', async () => {
@@ -539,22 +543,22 @@ describe('daily chart', () => {
     expect(within(region('Per day')).getByRole('heading')).toHaveTextContent(
       'Agent-hours per day, stacked by repo',
     )
-    expect(chartRows().at(-2)?.slice(1)).toEqual(['0.5h', '3h'])
+    expect(chartRows().at(-2)?.slice(1)).toEqual(['3h', '0.5h', '0h'])
   })
 
-  it('shares one read with the table when it too is by day over every repo', async () => {
+  it('charts the rows of the filtered tree, so a repo picked charts what its tree shows', async () => {
+    // A unit of acme/web whose director sits under acme/ops: the tree shows its $ there.
+    const ops = node('repo', 'acme/ops', { costUsd: 3, byDay: [slice('2026-10-13', 3)] })
+    rollupMock.mockImplementation((f) =>
+      Promise.resolve(f.repos.length ? audit([ops], { repos: tree.repos }) : tree),
+    )
     await show()
-    await choose('Group by', 'Day')
-    expect(calls((g) => g === 'day')).toHaveLength(1)
-    expect(tableRows()).toEqual(['2026-10-12', '2026-10-13'])
-  })
-
-  it('keeps only the picked repo, without a new by-day read', async () => {
-    await show()
-    const daily = calls((g) => g === 'day').length
-    await choose('Repo', 'acme/web')
-    expect(chartRows().at(-1)?.slice(1)).toEqual(['$4.00'])
-    expect(calls((g) => g === 'day')).toHaveLength(daily)
+    fireEvent.click(chip('acme/web'))
+    await flush()
+    expect(chartRows().at(-1)?.slice(1)).toEqual(['$3.00'])
+    expect(within(region('Per day')).getByRole('list', { name: 'Legend' })).toHaveTextContent(
+      /^acme\/ops$/,
+    )
   })
 })
 
@@ -571,6 +575,9 @@ describe('tree table', () => {
       'Agent-hours (wall)',
       'Waiting on you',
       '$',
+      'By day',
+      'By agent type',
+      'By model',
       'Tokens',
       'Sessions',
       'Agents',
@@ -584,13 +591,17 @@ describe('tree table', () => {
     const api = within(tableRow(/acme\/api/))
       .getAllByRole('cell')
       .map((c) => c.textContent)
+    // The name carries its level badge; the breakdown cells draw bars, with no text.
     expect(api).toEqual([
-      'acme/api',
+      'acme/apirepo',
       '1h 30m',
       '0m',
-      '0m',
+      '30m',
       '30m',
       '$1.00',
+      '',
+      '',
+      '',
       '4.5k',
       '3',
       '5',
@@ -647,17 +658,17 @@ describe('tree table', () => {
       .getAllByRole('cell')
       .map((c) => c.textContent)
     // Background agent-hours are measured like foreground ones: no estimate marker (#60).
-    expect(web[3]).toBe('3h 0m')
+    expect(web[3]).toBe('4h 0m')
     expect(screen.queryByText(/≈/)).toBeNull()
     expect(web[5]).toBe('$6.50 +2 unpriced')
     const epic = within(tableRow(/#10 Epic/))
       .getAllByRole('cell')
       .map((c) => c.textContent)
     expect(epic[1]).toBe('2d 0h · open')
-    expect(epic[10]).toBe('1/2')
+    expect(epic[13]).toBe('1/2')
   })
 
-  it('selects a row by its path, and forgets it when the grouping changes', async () => {
+  it('selects a row by its path', async () => {
     await show()
     fireEvent.click(screen.getByRole('button', { name: 'Expand repo acme/web' }))
     fireEvent.click(screen.getByRole('button', { name: 'Expand epic #10 Epic' }))
@@ -665,47 +676,47 @@ describe('tree table', () => {
     expect(fix()).toHaveAttribute('aria-pressed', 'false')
     fireEvent.click(fix())
     expect(fix()).toHaveAttribute('aria-pressed', 'true')
-    expect(screen.getByRole('button', { name: 'acme/web' })).toHaveAttribute(
-      'aria-pressed',
-      'false',
+    expect(rowButton('acme/web')).toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('draws By day over the range and the splits on the measure the chart uses', async () => {
+    await show()
+    const web = within(tableRow(/^acme\/web/))
+    const days = ['2026-10-07', '2026-10-08', '2026-10-09', '2026-10-10', '2026-10-11']
+    const quiet = days.map((d) => `${shortDay(d)} $0.00`).join(', ')
+    expect(web.getByRole('img', { name: /^By day/ })).toHaveAccessibleName(
+      `By day: ${quiet}, ${shortDay('2026-10-12')} $2.50, ${shortDay('2026-10-13')} $4.00`,
     )
-    await choose('Group by', 'Day')
-    await choose('Group by', 'Repo › Epic › Issue › PR')
-    expect(fix()).toHaveAttribute('aria-pressed', 'false')
+    expect(web.getByText('implementer 62%')).toBeInTheDocument()
+    pick('Hours')
+    expect(web.getByRole('img', { name: /^By agent type/ })).toHaveAccessibleName(
+      'By agent type: implementer 4h (100%)',
+    )
+    expect(web.getByRole('img', { name: /^By model/ })).toHaveAccessibleName(
+      'By model: model-a 4h (100%)',
+    )
   })
 
   it('lets no row be picked while a new filter is read over the old tree', async () => {
     await show()
     rollupMock.mockImplementation(() => new Promise(() => {}))
     pick('14d')
-    expect(screen.getByRole('button', { name: 'acme/web' })).toBeDisabled()
+    expect(rowButton('acme/web')).toBeDisabled()
   })
 
   it('drops the selection once its row is gone from the new rollup', async () => {
     rollupMock.mockImplementation((f) =>
       Promise.resolve(
-        f.groupBy === 'day'
-          ? byDay
-          : f.repos.length
-            ? audit(tree.root.children.filter((n) => n.key === f.repos[0]))
-            : tree,
+        f.repos.length ? audit(tree.root.children.filter((n) => n.key === f.repos[0])) : tree,
       ),
     )
     await show()
-    fireEvent.click(screen.getByRole('button', { name: 'acme/web' }))
+    fireEvent.click(rowButton('acme/web'))
     expect(screen.getByRole('complementary', { name: 'Row detail' })).toBeInTheDocument()
-    await choose('Repo', 'acme/api')
-    await screen.findByRole('button', { name: 'acme/api' })
+    fireEvent.click(chip('acme/api'))
+    await within(region('Breakdown')).findByRole('button', { name: 'acme/api' })
     await vi.waitFor(() => expect(tableRows()).toEqual(['acme/api']))
     expect(screen.queryByRole('complementary', { name: 'Row detail' })).toBeNull()
-  })
-
-  it('keeps rows expanded by node, not position, across a change of grouping', async () => {
-    await show()
-    fireEvent.click(screen.getByRole('button', { name: 'Expand repo acme/web' }))
-    await choose('Group by', 'Day')
-    await choose('Group by', 'Repo › Epic › Issue › PR')
-    expect(tableRows().slice(0, 3)).toEqual(['acme/web', '#10 Epic', '#13 Guess'])
   })
 })
 
@@ -791,13 +802,6 @@ describe('row detail', () => {
     expect(region('Breakdown')).toHaveFocus()
   })
 
-  it('closes when the grouping changes, since its path means nothing there', async () => {
-    await show()
-    selectFix()
-    await choose('Group by', 'Day')
-    expect(screen.queryByRole('complementary', { name: 'Row detail' })).toBeNull()
-  })
-
   it('says so when the row has no activity in range', async () => {
     timelineMock.mockResolvedValue([])
     await show()
@@ -810,33 +814,6 @@ describe('row detail', () => {
     await show()
     selectFix()
     expect(await within(detail()).findByRole('alert')).toHaveTextContent('bad day: 2026-13-01')
-  })
-
-  it('warns that marks name no repo only for a row that spans repos', async () => {
-    await show()
-    await choose('Group by', 'Day')
-    const note = /spans repos/
-    fireEvent.click(await screen.findByRole('button', { name: '2026-10-12' }))
-    expect(within(detail()).getByText(note)).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Expand group 2026-10-12' }))
-    fireEvent.click(screen.getByRole('button', { name: 'acme/api' }))
-    expect(within(detail()).queryByText(note)).toBeNull()
-  })
-
-  it('does not warn for a PR group, which is one repo', async () => {
-    rollupMock.mockImplementation((f) =>
-      Promise.resolve(
-        f.groupBy === 'day'
-          ? byDay
-          : f.groupBy === 'pr'
-            ? audit([node('group', 'acme/web#12', {}, [], { label: 'PR #12' })])
-            : tree,
-      ),
-    )
-    await show()
-    await choose('Group by', 'PR')
-    fireEvent.click(await screen.findByRole('button', { name: 'PR #12' }))
-    expect(within(detail()).queryByText(/spans repos/)).toBeNull()
   })
 })
 
@@ -887,6 +864,16 @@ describe('export', () => {
   })
 })
 
+describe('scrolling', () => {
+  it('scrolls once: the page clips, and the main area leaves scrolling to its panel', async () => {
+    const { container } = await show()
+    expect((container.firstElementChild as HTMLElement).className).toMatch(/\boverflow-hidden\b/)
+    const main = screen.getByRole('main')
+    expect(main.className).not.toMatch(/overflow|h-full/)
+    expect(screen.getByTestId('panel-audit-main')).toContainElement(main)
+  })
+})
+
 describe('control bar', () => {
   it('is the only bar: the Audit heading at its start, ‹ Live at its end, going back', async () => {
     const onBack = vi.fn()
@@ -896,6 +883,8 @@ describe('control bar', () => {
     const bar = heading.parentElement as HTMLElement
     expect(bar.firstElementChild).toBe(heading)
     expect(within(bar).getByRole('radio', { name: '7d' })).toBeInTheDocument()
+    expect(within(bar).getByRole('group', { name: 'Repos' })).toBeInTheDocument()
+    expect(within(bar).getByRole('radio', { name: 'Hours' })).toBeInTheDocument()
     const buttons = within(bar)
       .getAllByRole('button')
       .map((b) => b.textContent)

@@ -102,6 +102,12 @@ describe('commands', () => {
           elapsedMs: null,
           open: false,
           progress: { completed: 1, total: 2 },
+          byDay: [{ key: '2026-10-04', costUsd: 0.065, agentMs: 180000 }],
+          byAgentType: [
+            { key: 'orchestrator', costUsd: 0.065, agentMs: 0 },
+            { key: 'recon', costUsd: 0, agentMs: 180000 },
+          ],
+          byModel: [{ key: 'claude-opus-5-5', costUsd: 0.065, agentMs: 180000 }],
         },
         children: [],
       },
@@ -113,6 +119,8 @@ describe('commands', () => {
         cloudUncounted: true,
       },
       githubErrors: [{ repo: 'other', error: 'gh: not logged in' }],
+      repos: ['demo', 'other'],
+      unlinked: true,
     }
     invokeMock.mockResolvedValueOnce(audit)
     await expect(auditRollup(filter)).resolves.toEqual(audit)

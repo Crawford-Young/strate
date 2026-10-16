@@ -20,7 +20,7 @@ use strate_core::discovery::discover;
 use strate_core::github::{Runner, refresh};
 use strate_core::store::Store;
 use strate_core::store::views::{
-    Audit, AuditFilter, AuditNode, GroupBy, NodeKind, SpanKind, TimelineDay, TimelineMark,
+    Audit, AuditFilter, AuditNode, GroupBy, Metrics, NodeKind, SpanKind, TimelineDay, TimelineMark,
     TimelineSpan, audit, audit_timeline,
 };
 
@@ -537,6 +537,194 @@ fn the_repo_filter_keeps_the_named_repos() {
 }
 
 #[test]
+fn the_repo_filter_takes_the_empty_slug_as_unlinked() {
+    let t = Temp::new("unlinked");
+    let db = build(&t);
+    let run = |repos: &[&str]| {
+        audit(
+            &db,
+            &filter("2026-10-01", "2026-10-31", repos, GroupBy::Hierarchy),
+        )
+        .expect("audit")
+        .root
+    };
+    let all = october(&db, GroupBy::Hierarchy).root;
+    let unlinked = run(&[""]);
+    let kinds: Vec<_> = unlinked.children.iter().map(|c| c.kind).collect();
+    assert_eq!(kinds, [NodeKind::Unlinked]);
+    assert_eq!(
+        unlinked.children[0],
+        *child(&all, NodeKind::Unlinked, ""),
+        "the same node as with every repo"
+    );
+    let kinds: Vec<_> = run(&["other", ""])
+        .children
+        .iter()
+        .map(|c| c.kind)
+        .collect();
+    assert_eq!(kinds, [NodeKind::Repo, NodeKind::Unlinked]);
+}
+
+#[test]
+fn the_audit_lists_every_repo_in_range_whatever_the_repo_filter() {
+    let t = Temp::new("chips");
+    let db = build(&t);
+    let run = |from: &str, to: &str, repos: &[&str]| {
+        let a = audit(&db, &filter(from, to, repos, GroupBy::Hierarchy)).expect("audit");
+        (a.repos, a.unlinked)
+    };
+    let both = (vec!["demo".to_string(), "other".to_string()], true);
+    assert_eq!(run("2026-10-01", "2026-10-31", &[]), both);
+    assert_eq!(run("2026-10-01", "2026-10-31", &["other"]), both);
+    assert_eq!(run("2026-10-01", "2026-10-31", &["nope"]), both);
+    // other-3 works on Oct 5 only; the unnamed session on Oct 4 only.
+    assert_eq!(
+        run("2026-10-05", "2026-10-05", &[]),
+        (vec!["demo".to_string(), "other".to_string()], false)
+    );
+    assert_eq!(
+        run("2026-10-04", "2026-10-04", &["demo"]),
+        (vec!["demo".to_string()], true)
+    );
+    assert_eq!(run("2026-09-01", "2026-09-30", &[]), (vec![], false));
+}
+
+/// The node at `path` (`[kind, key]` steps) under `node`.
+fn at<'a>(node: &'a AuditNode, path: &[(NodeKind, String)]) -> Option<&'a AuditNode> {
+    path.iter().try_fold(node, |n, (kind, key)| {
+        n.children.iter().find(|c| c.kind == *kind && &c.key == key)
+    })
+}
+
+/// `m`'s split by the key `by` groups on: `(key, $, agent ms)` per slice.
+fn split(m: &Metrics, by: GroupBy) -> Vec<(&str, f64, i64)> {
+    let slices = match by {
+        GroupBy::Day => &m.by_day,
+        GroupBy::AgentType => &m.by_agent_type,
+        GroupBy::Model => &m.by_model,
+        GroupBy::Hierarchy | GroupBy::Pr => unreachable!("no split by {by:?}"),
+    };
+    slices
+        .iter()
+        .map(|s| (s.key.as_str(), s.cost_usd, s.agent_ms))
+        .collect()
+}
+
+/// Every node's slices under `by` sum to its own $ and agent-hours, in key
+/// order, each key once.
+fn check_split_sums(node: &AuditNode, by: GroupBy, path: &str) {
+    let path = format!("{path}/{:?}:{}", node.kind, node.key);
+    let slices = split(&node.metrics, by);
+    let keys: Vec<_> = slices.iter().map(|s| s.0).collect();
+    assert!(keys.windows(2).all(|w| w[0] < w[1]), "{path}: {keys:?}");
+    let usd: f64 = slices.iter().map(|s| s.1).sum();
+    assert!(close(node.metrics.cost_usd, usd), "{path}: $");
+    let ms: i64 = slices.iter().map(|s| s.2).sum();
+    assert_eq!(node.metrics.agent_ms, ms, "{path}: agent ms");
+    for c in &node.children {
+        check_split_sums(c, by, &path);
+    }
+}
+
+/// Each slice of each node under `by` is the same node's $ and agent-hours
+/// under that key's Group in `groups` (the tree grouped by `by`); returns
+/// how many slices it checked.
+fn check_split_groups(
+    node: &AuditNode,
+    path: &mut Vec<(NodeKind, String)>,
+    by: GroupBy,
+    groups: &AuditNode,
+) -> usize {
+    let mut checked = 0;
+    for (key, usd, ms) in split(&node.metrics, by) {
+        let group = child(groups, NodeKind::Group, key);
+        let same = at(group, path).unwrap_or_else(|| panic!("no {path:?} under {key}"));
+        assert!(close(same.metrics.cost_usd, usd), "{path:?} {key}: $");
+        assert_eq!(same.metrics.agent_ms, ms, "{path:?} {key}: agent ms");
+        checked += 1;
+    }
+    for c in &node.children {
+        path.push((c.kind, c.key.clone()));
+        checked += check_split_groups(c, path, by, groups);
+        path.pop();
+    }
+    checked
+}
+
+fn nodes(node: &AuditNode) -> usize {
+    1 + node.children.iter().map(nodes).sum::<usize>()
+}
+
+#[test]
+fn teammates_split_as_one_teammate_type() {
+    // teams-home: a lead and four teammates, typed `general-purpose` in
+    // their meta (a real store holds each one's name there, strate#86);
+    // the splits and the group-by read them all as `teammate`.
+    let t = Temp::new("teammates");
+    drop(build_without_gh(&t, "teams-home"));
+    let db = Store::open_reader(t.db()).expect("reader");
+    let day =
+        |group_by| audit(&db, &filter("2026-10-09", "2026-10-09", &[], group_by)).expect("audit");
+    let root = day(GroupBy::Hierarchy).root;
+    let types = split(&root.metrics, GroupBy::AgentType);
+    let keys: Vec<_> = types.iter().map(|s| s.0).collect();
+    assert_eq!(keys, ["orchestrator", "teammate"]);
+    assert_eq!(types[1].2, root.metrics.agent_ms, "every teammate's wall");
+    let groups: Vec<_> = day(GroupBy::AgentType)
+        .root
+        .children
+        .iter()
+        .map(|c| c.key.clone())
+        .collect();
+    assert_eq!(groups, ["orchestrator", "teammate"]);
+}
+
+#[test]
+fn every_node_splits_its_spend_by_day_agent_type_and_model() {
+    let t = Temp::new("splits");
+    let db = build(&t);
+    for (from, to) in [
+        ("2026-10-01", "2026-10-31"),
+        ("2026-10-04", "2026-10-04"),
+        ("2026-10-05", "2026-10-05"),
+    ] {
+        let tree = audit(&db, &filter(from, to, &[], GroupBy::Hierarchy))
+            .expect("audit")
+            .root;
+        for by in [GroupBy::Day, GroupBy::AgentType, GroupBy::Model] {
+            check_split_sums(&tree, by, &format!("{from}..{to} {by:?}"));
+            // A slice for each node under each Group, and no other.
+            let groups = audit(&db, &filter(from, to, &[], by)).expect("audit").root;
+            let checked = check_split_groups(&tree, &mut Vec::new(), by, &groups);
+            let grouped: usize = groups.children.iter().map(nodes).sum();
+            assert_eq!(checked, grouped, "{from}..{to} {by:?}");
+        }
+    }
+    let root = october(&db, GroupBy::Hierarchy).root;
+    let keys =
+        |m: &Metrics, by| -> Vec<String> { split(m, by).iter().map(|s| s.0.to_string()).collect() };
+    let m = &root.metrics;
+    assert_eq!(keys(m, GroupBy::Day), ["2026-10-04", "2026-10-05"]);
+    assert_eq!(
+        keys(m, GroupBy::AgentType),
+        ["implementer", "orchestrator", "recon"]
+    );
+    assert_eq!(
+        keys(m, GroupBy::Model),
+        ["claude-opus-5-5", "claude-sonnet-5-5"]
+    );
+    assert_eq!(m.by_agent_type[2].agent_ms, 120 * S, "recon");
+    // The closed issue's PR: demo-9 on Oct 4, its -s2 across midnight.
+    let pr = child(issue(&root, "9"), NodeKind::Pr, "12");
+    assert_eq!(
+        keys(&pr.metrics, GroupBy::Day),
+        ["2026-10-04", "2026-10-05"]
+    );
+    let usd: f64 = pr.metrics.by_day.iter().map(|s| s.cost_usd).sum();
+    assert!(close(0.065, usd));
+}
+
+#[test]
 fn group_bys_put_the_hierarchy_under_each_group() {
     let t = Temp::new("groups");
     let db = build(&t);
@@ -734,7 +922,10 @@ fn the_filter_and_tree_use_the_webview_shape() {
     let value = serde_json::to_value(october(&db, GroupBy::Hierarchy)).expect("json");
     let mut keys: Vec<_> = value.as_object().expect("audit").keys().cloned().collect();
     keys.sort();
-    assert_eq!(keys, ["githubErrors", "headline", "root"]);
+    assert_eq!(
+        keys,
+        ["githubErrors", "headline", "repos", "root", "unlinked"]
+    );
     assert_eq!(
         value["githubErrors"][0]
             .as_object()
@@ -773,6 +964,9 @@ fn the_filter_and_tree_use_the_webview_shape() {
             "activeMs",
             "agentMs",
             "agents",
+            "byAgentType",
+            "byDay",
+            "byModel",
             "costUsd",
             "elapsedMs",
             "open",
@@ -792,6 +986,14 @@ fn the_filter_and_tree_use_the_webview_shape() {
         .collect();
     keys.sort();
     assert_eq!(keys, ["cacheRead", "cacheWrite", "input", "output"]);
+    let mut keys: Vec<_> = root["metrics"]["byDay"][0]
+        .as_object()
+        .expect("slice")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["agentMs", "costUsd", "key"]);
     let mut keys: Vec<_> = root.as_object().expect("node").keys().cloned().collect();
     keys.sort();
     assert_eq!(

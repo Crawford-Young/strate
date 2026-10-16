@@ -27,9 +27,6 @@ interface AuditDetailProps {
 
 export function AuditDetail({ filter, path, label, active, version, onClose }: AuditDetailProps) {
   const { days, error } = useTimeline(filter, path, active, version)
-  // Marks read `#9 closed` with no repo, which is ambiguous in a row that holds several: a day,
-  // agent type or model group (a PR group is one repo, and so is anything below a top level).
-  const spansRepos = path.length === 1 && path[0]?.[0] === 'group' && filter.groupBy !== 'pr'
   return (
     <aside
       aria-label="Row detail"
@@ -38,9 +35,7 @@ export function AuditDetail({ filter, path, label, active, version, onClose }: A
       <header className="flex flex-none items-center gap-3 border-b border-border px-4 py-2">
         <h2 className="truncate text-sm font-semibold">{label}</h2>
         <p className="flex-1 truncate text-xs text-muted-foreground">
-          {spansRepos
-            ? 'This row spans repos: a mark names its issue or PR without the repo.'
-            : 'Active, waiting and subagent time (non-idle) per day.'}
+          Active, waiting and subagent time (non-idle) per day.
         </p>
         <Button variant="ghost" size="icon" aria-label="Close row detail" onClick={onClose}>
           <X aria-hidden className="size-4" />

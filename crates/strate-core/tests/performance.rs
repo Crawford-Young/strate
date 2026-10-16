@@ -738,6 +738,26 @@ fn the_repo_filter_applies_to_every_section() {
 }
 
 #[test]
+fn the_repo_filter_takes_the_empty_slug_as_unlinked() {
+    let t = Temp::new("unlinked");
+    let db = built(&t);
+    let all = read(&db, &[]);
+    let p = read(&db, &[""]);
+    assert!(p.outcome.unlinked_usd > 0.0);
+    assert_eq!(
+        (p.outcome.unlinked_usd, p.outcome.unlinked_workstreams),
+        (all.outcome.unlinked_usd, all.outcome.unlinked_workstreams)
+    );
+    assert!(close(
+        p.outcome.days.iter().map(|d| d.spend_usd).sum(),
+        p.outcome.unlinked_usd
+    ));
+    assert!(!p.bottleneck.days.is_empty());
+    assert!(p.bottleneck.days.iter().all(|d| d.repo.is_none()));
+    assert_eq!(p.waste.repos, 0, "no GitHub repo is Unlinked");
+}
+
+#[test]
 fn performance_serializes_in_camel_case_and_a_bad_day_is_an_error() {
     let t = Temp::new("json");
     let db = built(&t);
