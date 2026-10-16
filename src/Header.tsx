@@ -78,7 +78,8 @@ export function Header({
         </TabsList>
       )}
       <div className="flex-1" />
-      <div className="flex items-center gap-1.5">
+      {/* The tab strip gives way to these, by scrolling: the chip never wraps or shrinks (#84). */}
+      <div className="flex flex-none items-center gap-1.5">
         {/* Unmounted with nothing waiting, so a wait that returns finds the list closed. */}
         {waits.length > 0 && (
           <NeedsYouChip
