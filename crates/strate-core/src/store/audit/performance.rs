@@ -443,10 +443,11 @@ struct Read<'a> {
 }
 
 impl Read<'_> {
-    /// Whether windows of `repo` (`None`: Unlinked) are in the filter.
+    /// Whether windows of `repo` (`None`: Unlinked, `""` in the filter)
+    /// are in the filter.
     fn wanted(&self, repo: Option<&str>) -> bool {
-        self.filter.repos.is_empty()
-            || repo.is_some_and(|r| self.filter.repos.iter().any(|w| w == r))
+        let slug = repo.unwrap_or("");
+        self.filter.repos.is_empty() || self.filter.repos.iter().any(|w| w == slug)
     }
 
     /// The local day of `ms`, when the range holds it.

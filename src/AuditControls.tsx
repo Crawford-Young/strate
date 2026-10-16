@@ -1,19 +1,10 @@
-// The Audit view's only bar: `title` at its left start, then date range, repo, group by and the
-// chart's $ / hours toggle, with `actions` at its right end (Refresh GitHub, Export CSV and
-// "‹ Live", #27 U2). Its box matches the live header's, so "‹ Live" lands where Audit was.
-import {
-  DateRangePicker,
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-  ToggleGroup,
-  ToggleGroupItem,
-} from '@crawfordyoung/ui'
+// The Audit view's only bar: `title` at its left start, then date range, the repo chips and
+// the $ / hours toggle (the chart and breakdown columns), with `actions` at its right end
+// (Refresh GitHub, Export CSV and "‹ Live", #27 U2). Its box matches the live header's, so
+// "‹ Live" lands where Audit was.
+import { DateRangePicker, Toggle, ToggleGroup, ToggleGroupItem } from '@crawfordyoung/ui'
 import type { ReactNode } from 'react'
-import type { GroupBy } from './api'
-import { localDay, parseDay, type Measure } from './audit'
+import { localDay, parseDay, UNLINKED, type Measure } from './audit'
 
 /** The range presets, each the last that many local days. */
 export const PRESET_DAYS = { '7d': 7, '14d': 14, '30d': 30 } as const
@@ -25,28 +16,17 @@ export interface Controls {
   range: Range
   /** The custom range's local days, used while `range` is custom. */
   custom: { from: string; to: string }
-  /** One repo slug, or null for every repo (Unlinked included). */
-  repo: string | null
-  groupBy: GroupBy
+  /** The repos picked, `UNLINKED` for the windows in none; empty for every repo. */
+  repos: string[]
   measure: Measure
 }
-
-const GROUP_BY: [GroupBy, string][] = [
-  ['hierarchy', 'Repo › Epic › Issue › PR'],
-  ['day', 'Day'],
-  ['pr', 'PR'],
-  ['agent_type', 'Agent type'],
-  ['model', 'Model'],
-]
-
-// Radix Select items can't have an empty value.
-const ALL_REPOS = '*'
 
 interface AuditControlsProps {
   value: Controls
   /** The current range's local days, which a switch to custom starts from. */
   days: { from: string; to: string }
   onChange: (patch: Partial<Controls>) => void
+  /** The repo chips, in order (see `repoChips`). */
   repos: string[]
   /** The view's heading, first in the bar. */
   title?: ReactNode
@@ -94,39 +74,32 @@ export function AuditControls({
           }}
         />
       )}
-      <Select
-        value={value.repo ?? ALL_REPOS}
-        onValueChange={(repo) => onChange({ repo: repo === ALL_REPOS ? null : repo })}
-      >
-        <SelectTrigger aria-label="Repo" className="h-8 w-48">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          <SelectItem value={ALL_REPOS}>All repos</SelectItem>
-          {repos.map((r) => (
-            <SelectItem key={r} value={r}>
-              {r}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-      <Select value={value.groupBy} onValueChange={(groupBy: GroupBy) => onChange({ groupBy })}>
-        <SelectTrigger aria-label="Group by" className="h-8 w-56">
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent>
-          {GROUP_BY.map(([g, label]) => (
-            <SelectItem key={g} value={g}>
-              {label}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
+      <div role="group" aria-label="Repos" className="flex flex-wrap gap-1.5">
+        <Chip
+          label="All repos"
+          pressed={value.repos.length === 0}
+          // Pressed again it stays: every repo is already in.
+          onPressedChange={(on) => on && onChange({ repos: [] })}
+        />
+        {repos.map((r) => (
+          <Chip
+            key={r}
+            label={r === UNLINKED ? 'Unlinked' : r}
+            pressed={value.repos.includes(r)}
+            onPressedChange={(on) => {
+              const picked = new Set(value.repos)
+              if (on) picked.add(r)
+              else picked.delete(r)
+              onChange({ repos: repos.filter((x) => picked.has(x)) })
+            }}
+          />
+        ))}
+      </div>
       <ToggleGroup
         type="single"
         variant="outline"
         size="sm"
-        aria-label="Chart measure"
+        aria-label="Measure"
         value={value.measure}
         onValueChange={(measure: Measure | '') => {
           if (measure) onChange({ measure })
@@ -138,5 +111,31 @@ export function AuditControls({
       <div className="flex-1" />
       {actions}
     </div>
+  )
+}
+
+/**
+ * A repo filter chip, the shape of the library's FilterChip, which is not exported yet
+ * (component-library#139): a pill that is pressed while its repo is in the filter.
+ */
+function Chip({
+  label,
+  pressed,
+  onPressedChange,
+}: {
+  label: string
+  pressed: boolean
+  onPressedChange: (pressed: boolean) => void
+}) {
+  return (
+    <Toggle
+      variant="outline"
+      size="sm"
+      pressed={pressed}
+      onPressedChange={onPressedChange}
+      className="h-7 rounded-full px-3 text-xs"
+    >
+      {label}
+    </Toggle>
   )
 }

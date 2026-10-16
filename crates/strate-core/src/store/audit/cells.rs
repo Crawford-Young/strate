@@ -2,7 +2,7 @@
 //! they belong to, each resolved once.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension, Row};
 
@@ -16,6 +16,11 @@ use crate::time::parse_timestamp;
 pub(crate) struct Cells {
     /// In day order, the orchestrator's first.
     pub(crate) list: Vec<Cell>,
+    /// The repos the range's windows are filed under, whatever the repo
+    /// filter.
+    pub(crate) repos: BTreeSet<String>,
+    /// Some window in the range is filed under none.
+    pub(crate) unlinked: bool,
     windows: Windows,
     agents: HashMap<(String, String), Agent>,
 }
@@ -110,6 +115,8 @@ impl Cells {
         let (from, to) = (day(&filter.from)?, day(&filter.to)?);
         let mut out = Self {
             list: Vec::new(),
+            repos: BTreeSet::new(),
+            unlinked: false,
             windows: Windows {
                 named: Named::load_all(conn, from, to)?,
                 ..Windows::default()
@@ -135,8 +142,16 @@ impl Cells {
             let row = CellRow::read(r)?;
             let window = out.windows.get(conn, gh, &row.session_id, row.segment_id)?;
             let w = &mut out.windows.list[window];
-            let wanted = |repo: &String| filter.repos.contains(repo);
-            if !filter.repos.is_empty() && !w.filed_under().is_some_and(wanted) {
+            let filed = w.filed_under();
+            match filed {
+                Some(repo) if !out.repos.contains(repo) => {
+                    out.repos.insert(repo.clone());
+                }
+                Some(_) => {}
+                None => out.unlinked = true,
+            }
+            let slug = filed.map_or("", String::as_str);
+            if !filter.repos.is_empty() && !filter.repos.iter().any(|r| r == slug) {
                 continue;
             }
             let first_in_window = !std::mem::replace(&mut w.in_filter, true);
@@ -821,6 +836,8 @@ fn linked_pr(prs: &[GhPr], links: &[PrLink], repo: &str) -> Option<i64> {
 pub(crate) struct Agent {
     pub(crate) label: String,
     pub(crate) agent_type: Option<String>,
+    /// A teammate (`agents.kind`), not a dispatched subagent.
+    pub(crate) teammate: bool,
     pub(crate) run_ms: Option<i64>,
 }
 
@@ -834,7 +851,8 @@ impl Agent {
     ) -> Result<HashMap<(String, String), Self>> {
         conn.prepare_cached(
             "SELECT session_id, agent_id,
-                 coalesce(name, description, agent_type), agent_type, run_ms
+                 coalesce(name, description, agent_type), agent_type, run_ms,
+                 kind = 'teammate'
              FROM agents
              WHERE agent_id IS NOT NULL AND session_id IN (
                  SELECT session_id FROM audit_cells
@@ -849,6 +867,7 @@ impl Agent {
                     label: r.get::<_, Option<String>>(2)?.unwrap_or(agent_id),
                     agent_type: r.get(3)?,
                     run_ms: r.get(4)?,
+                    teammate: r.get(5)?,
                 },
             ))
         })?
@@ -861,6 +880,7 @@ impl Agent {
             label: agent_id.to_string(),
             agent_type: None,
             run_ms: None,
+            teammate: false,
         }
     }
 }

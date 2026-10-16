@@ -88,7 +88,7 @@ export interface LiveGraph {
   edges: GraphEdge[]
 }
 
-/** How the Audit tree's top level groups the cells. */
+/** How the Audit tree's top level groups the cells. The view reads `hierarchy` only (#54). */
 export type GroupBy = 'hierarchy' | 'day' | 'pr' | 'agent_type' | 'model'
 
 /** What auditRollup sums: the cells on local days `from..=to`. */
@@ -97,7 +97,7 @@ export interface AuditFilter {
   from: string
   /** Local day, `YYYY-MM-DD`, inclusive. */
   to: string
-  /** Repo slugs; empty means every window, Unlinked included. */
+  /** Repo slugs, `''` for Unlinked windows; empty means every window. */
   repos: string[]
   groupBy: GroupBy
 }
@@ -140,6 +140,19 @@ export interface Metrics {
   open: boolean
   /** On an epic, or an issue with sub-issues. */
   progress: Progress | null
+  /** By local day. */
+  byDay: Slice[]
+  /** By agent type: `orchestrator`, `teammate`, a subagent's type, or `''` (unknown). */
+  byAgentType: Slice[]
+  /** By model (`''`: a cell with no requests). */
+  byModel: Slice[]
+}
+
+/** A node's $ and agent-hours under one key of a split; a split's slices are in key order. */
+export interface Slice {
+  key: string
+  costUsd: number
+  agentMs: number
 }
 
 export interface AuditNode {
@@ -182,6 +195,10 @@ export interface Audit {
   headline: Headline
   /** The repos whose GitHub data is missing or stale. */
   githubErrors: GithubError[]
+  /** The repos the range's windows are in, sorted, whatever the repo filter. */
+  repos: string[]
+  /** Some window in the range is in no repo. */
+  unlinked: boolean
 }
 
 /** An Audit node's `[kind, key]` steps from the root (the root's own may lead). */

@@ -5,15 +5,43 @@ use std::collections::HashMap;
 
 use super::cells::{Cell, Cells, Place, Share, Time, Window};
 use super::gh::{Gh, GhPr};
-use super::{AuditNode, GroupBy, Metrics, NodeKind, Progress, Tokens};
+use super::{AuditNode, GroupBy, Metrics, NodeKind, Progress, Slice, Tokens};
 
 /// The rollup tree over `cells`, its top level grouped by `group_by`.
 pub(crate) fn tree(group_by: GroupBy, cells: &Cells, gh: &Gh) -> AuditNode {
     let mut root = Node::root();
     for cell in &cells.list {
-        root.insert(path(group_by, cell, cells, gh), &cell.share);
+        let keys = Keys {
+            day: &cell.day,
+            agent_type: agent_type(cell, cells).unwrap_or_default(),
+            model: cell.model.as_deref().unwrap_or_default(),
+        };
+        root.insert(path(group_by, cell, cells, gh), &cell.share, &keys);
     }
     root.finish().0
+}
+
+/// `cell`'s agent type: `orchestrator`, `teammate`, or its subagent's type
+/// when known.
+fn agent_type<'a>(cell: &'a Cell, cells: &'a Cells) -> Option<&'a str> {
+    let Some(id) = &cell.agent_id else {
+        return Some("orchestrator");
+    };
+    let agent = cells.agent(cell, id)?;
+    // Interim: a teammate's stored type is its own name (strate#86), one
+    // series per teammate, so every teammate reads as one type until the
+    // real type is stored.
+    if agent.teammate {
+        return Some("teammate");
+    }
+    agent.agent_type.as_deref()
+}
+
+/// A cell's key in each split; `""` where it has none.
+struct Keys<'a> {
+    day: &'a str,
+    agent_type: &'a str,
+    model: &'a str,
 }
 
 /// How a node's elapsed time ends.
@@ -138,16 +166,10 @@ fn group_step(group_by: GroupBy, cell: &Cell, cells: &Cells, gh: &Gh) -> Option<
         // Session time is on the orchestrator's cells, so a subagent type's
         // group shows 0 session-level active and waiting; its Agent nodes
         // carry their own.
-        GroupBy::AgentType => {
-            let kind = match &cell.agent_id {
-                None => Some("orchestrator".to_string()),
-                Some(id) => cells.agent(cell, id).and_then(|a| a.agent_type.clone()),
-            };
-            match kind {
-                Some(k) => (k.clone(), k),
-                None => (String::new(), "Unknown".into()),
-            }
-        }
+        GroupBy::AgentType => match agent_type(cell, cells) {
+            Some(k) => (k.to_string(), k.to_string()),
+            None => (String::new(), "Unknown".into()),
+        },
         // Keyed by the PR's own repo, which may not be the issue's.
         GroupBy::Pr => match &cells.window(cell).place {
             Place::Linked {
@@ -288,8 +310,36 @@ fn agent_step(cell: &Cell, cells: &Cells) -> Step {
 struct Node {
     step: Step,
     metrics: Metrics,
+    by_day: Split,
+    by_agent_type: Split,
+    by_model: Split,
     children: Vec<Node>,
     index: HashMap<(NodeKind, String), usize>,
+}
+
+/// A node's $ and agent-hours per key of one split, while the tree is built.
+#[derive(Default)]
+struct Split(HashMap<String, Slice>);
+
+impl Split {
+    fn add(&mut self, key: &str, s: &Share) {
+        let slice = match self.0.get_mut(key) {
+            Some(slice) => slice,
+            None => self.0.entry(key.to_string()).or_insert_with(|| Slice {
+                key: key.to_string(),
+                ..Slice::default()
+            }),
+        };
+        slice.cost_usd += s.cost_usd.unwrap_or(0.0);
+        slice.agent_ms += s.agent_ms;
+    }
+
+    /// The slices, in key order.
+    fn finish(self) -> Vec<Slice> {
+        let mut slices: Vec<Slice> = self.0.into_values().collect();
+        slices.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+        slices
+    }
 }
 
 impl Node {
@@ -306,15 +356,18 @@ impl Node {
         Self {
             step,
             metrics: Metrics::default(),
+            by_day: Split::default(),
+            by_agent_type: Split::default(),
+            by_model: Split::default(),
             children: Vec::new(),
             index: HashMap::new(),
         }
     }
 
-    /// Adds `share` to this node and to each node along `steps`, creating
-    /// the missing ones and widening the rest.
-    fn insert(&mut self, steps: Vec<Step>, share: &Share) {
-        self.add(share);
+    /// Adds `share` to this node and to each node along `steps`, under
+    /// `keys` in each split, creating the missing ones and widening the rest.
+    fn insert(&mut self, steps: Vec<Step>, share: &Share, keys: &Keys) {
+        self.add(share, keys);
         let mut node = self;
         for step in steps {
             let key = (step.kind, step.key.clone());
@@ -330,11 +383,14 @@ impl Node {
                 }
             };
             node = &mut node.children[i];
-            node.add(share);
+            node.add(share, keys);
         }
     }
 
-    fn add(&mut self, s: &Share) {
+    fn add(&mut self, s: &Share, keys: &Keys) {
+        self.by_day.add(keys.day, s);
+        self.by_agent_type.add(keys.agent_type, s);
+        self.by_model.add(keys.model, s);
         let m = &mut self.metrics;
         if let Some(c) = s.cost_usd {
             m.cost_usd += c;
@@ -361,9 +417,15 @@ impl Node {
         let Node {
             step,
             mut metrics,
+            by_day,
+            by_agent_type,
+            by_model,
             mut children,
             ..
         } = self;
+        metrics.by_day = by_day.finish();
+        metrics.by_agent_type = by_agent_type.finish();
+        metrics.by_model = by_model.finish();
         children.sort_by(|a, b| {
             (a.step.kind as u8, &a.step.order).cmp(&(b.step.kind as u8, &b.step.order))
         });

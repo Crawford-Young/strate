@@ -1,10 +1,16 @@
-// Pure helpers for the Audit view: local-day ranges, number labels, and the daily chart's rows.
-import type { StackedBarDatum, StackedBarSeries } from '@crawfordyoung/ui'
-import type { Audit, AuditNode, AuditPath } from './api'
+// Pure helpers for the Audit view: local-day ranges, number labels, the repo chips, the daily
+// chart's rows and the breakdown columns' colours and segments.
+import type {
+  ChartToken,
+  InlineStackedBarSegment,
+  StackedBarDatum,
+  StackedBarSeries,
+} from '@crawfordyoung/ui'
+import type { Audit, AuditNode, AuditPath, Slice } from './api'
 
 const HOUR = 3_600_000
 
-/** What the daily chart and the $ / hours toggle measure: $, or agent-hours (subagent wall time, as the table's column). */
+/** What the chart and breakdown columns measure: $, or agent-hours (subagent wall time, as the table's column). */
 export type Measure = 'usd' | 'hours'
 
 const pad = (n: number) => String(n).padStart(2, '0')
@@ -58,46 +64,109 @@ export function hasPath(root: AuditNode, path: AuditPath): boolean {
   return at !== undefined
 }
 
-const measured = (node: AuditNode, measure: Measure) =>
-  measure === 'usd' ? node.metrics.costUsd : node.metrics.agentMs / HOUR
+/** A node's or slice's measure: $, or agent-hours in hours. */
+export const measured = (m: { costUsd: number; agentMs: number }, measure: Measure) =>
+  measure === 'usd' ? m.costUsd : m.agentMs / HOUR
 
-/** Repos (and Unlinked) under each day of a by-day rollup. */
-const dayChildren = (byDay: Audit) => byDay.root.children.flatMap((day) => day.children)
+/** The repo filter's slug for the windows in no repo. */
+export const UNLINKED = ''
 
-/** The repos with work in a by-day rollup, sorted. */
-export function repoOptions(byDay: Audit): string[] {
-  const repos = dayChildren(byDay).filter((n) => n.kind === 'repo')
-  return [...new Set(repos.map((n) => n.key))].sort()
+/**
+ * The repo chips: the repos the read lists (every one in range, whatever the filter), sorted,
+ * then Unlinked when the range has any. A picked one the range no longer holds stays, so it
+ * can be unpicked.
+ */
+export function repoChips(read: Audit | null, picked: string[]): string[] {
+  const repos = new Set([...(read?.repos ?? []), ...picked.filter((r) => r !== UNLINKED)])
+  const unlinked = read?.unlinked || picked.includes(UNLINKED)
+  return [...[...repos].sort(), ...(unlinked ? [UNLINKED] : [])]
 }
 
 /**
- * The daily chart from a by-day rollup: one row per day `from..=to` (days with no work are
- * empty) and one series per repo, sorted, then Unlinked. `repo` keeps that repo only. Series
- * keys are `s0`, `s1`…, since a chart reads a dotted key as a path and slugs can hold dots.
+ * The daily chart: one row per day `from..=to` (days with no work are empty) and one series
+ * per top row of the tree (its repos, then Unlinked), so it charts what the tree shows under
+ * any filter. Series keys are `s0`, `s1`…, since a chart reads a dotted key as a path and
+ * slugs can hold dots.
  */
 export function dailyChart(
-  byDay: Audit,
+  read: Audit,
   measure: Measure,
-  repo: string | null,
   from: string,
   to: string,
 ): { data: StackedBarDatum[]; series: StackedBarSeries[] } {
-  const id = (n: AuditNode) => `${n.kind}:${n.key}`
-  const nodes = dayChildren(byDay).filter((n) => repo === null || n.key === repo)
-  const order = (n: AuditNode) => `${n.kind === 'unlinked' ? 1 : 0}${n.key}`
-  const unique = new Map(nodes.map((n) => [id(n), n]))
-  const sorted = [...unique.values()].sort((a, b) => order(a).localeCompare(order(b)))
-  const keys = new Map(sorted.map((n, i) => [id(n), `s${i}`]))
-  const series = sorted.map((n) => ({ key: keys.get(id(n)) as string, label: n.label }))
-
-  const days = new Map(byDay.root.children.map((day) => [day.key, day]))
+  const rows = read.root.children
+  const series = rows.map((n, i) => ({ key: `s${i}`, label: n.label }))
+  const byDay = rows.map((n) => new Map(n.metrics.byDay.map((s) => [s.key, s])))
   const data = dayRange(from, to).map((day) => {
     const row: Record<string, string | number> = { day }
-    for (const n of days.get(day)?.children ?? []) {
-      const key = keys.get(id(n))
-      if (key) row[key] = measured(n, measure)
-    }
+    byDay.forEach((days, i) => {
+      const s = days.get(day)
+      if (s) row[`s${i}`] = measured(s, measure)
+    })
     return row
   })
   return { data, series }
+}
+
+/**
+ * A split's colours, picked once over the whole tree so a key keeps its colour on every row:
+ * `named` in legend order, and `other`, the colour of every key folded into one Other
+ * segment (null when none folds).
+ */
+export interface Palette {
+  named: Map<string, ChartToken>
+  other: ChartToken | null
+}
+
+/** Other's colour in both splits; no named series takes it, so none reads as Other. */
+const OTHER: ChartToken = 5
+
+/**
+ * `pinned` keys keep their token; the rest, by $ over `slices` (a tie by key), take `tokens`
+ * in turn, and any past them fold into Other.
+ */
+function palette(
+  slices: Slice[],
+  tokens: readonly ChartToken[],
+  pinned: Readonly<Record<string, ChartToken>> = {},
+): Palette {
+  const named = new Map<string, ChartToken>()
+  for (const s of slices) if (s.key in pinned) named.set(s.key, pinned[s.key] as ChartToken)
+  const rest = slices
+    .filter((s) => !(s.key in pinned))
+    .sort((a, b) => b.costUsd - a.costUsd || a.key.localeCompare(b.key))
+  rest.slice(0, tokens.length).forEach((s, i) => named.set(s.key, tokens[i] as ChartToken))
+  return { named, other: rest.length > tokens.length ? OTHER : null }
+}
+
+/** The agent types' colours: the orchestrator always --chart-6, the others 1..4. */
+export const agentTypePalette = (slices: Slice[]) =>
+  palette(slices, [1, 2, 3, 4], { orchestrator: 6 })
+
+/** The models' colours, starting off the agent types' first ones. */
+export const modelPalette = (slices: Slice[]) => palette(slices, [4, 3, 2, 1, 6])
+
+export const agentTypeLabel = (key: string) => key || 'Unknown'
+
+export const modelLabel = (key: string) => key || 'No requests'
+
+/**
+ * A row's slices as bar segments on `measure`, in legend order, then one Other for the keys
+ * `palette` folds. A segment key is `slice:<key>`, or `other`, so none can clash.
+ */
+export function segments(
+  slices: Slice[],
+  palette: Palette,
+  measure: Measure,
+  label: (key: string) => string,
+): InlineStackedBarSegment[] {
+  const value = new Map(slices.map((s) => [s.key, measured(s, measure)]))
+  const named = [...palette.named].flatMap(([key, color]) => {
+    const v = value.get(key)
+    return v === undefined ? [] : [{ key: `slice:${key}`, label: label(key), value: v, color }]
+  })
+  if (palette.other === null) return named
+  const other = slices.filter((s) => !palette.named.has(s.key))
+  const total = other.reduce((sum, s) => sum + measured(s, measure), 0)
+  return [...named, { key: 'other', label: 'Other', value: total, color: palette.other }]
 }

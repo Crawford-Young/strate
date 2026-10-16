@@ -35,15 +35,18 @@
 //! row nests, and so does the repo filter (see [`AuditFilter`]).
 //!
 //! Every node sums the cells under it. $, tokens, agent-hours (subagent
-//! wall) and the counts are additive at every level. Sessions, agents and
-//! rotations count once, on the first cell in the filter of each window or
-//! subagent: a window across midnight is a session on its first day. Active
-//! and waiting come from the orchestrator cells, which carry the session
-//! timeline, so they are additive from Session up. An Agent node shows its
-//! own active and waiting time, which is not summed into its session, since
-//! its agents run in parallel. Elapsed and epic progress are per level.
-//! Cells with no activity, requests or subagent run (a window sitting open
-//! overnight) are left out, so they put no node on a day.
+//! wall) and the counts are additive at every level, and so are a node's $
+//! and agent-hours split by local day, agent type and model (#54): the
+//! slice for a key is what that key's Group node holds on the same path.
+//! Sessions, agents and rotations count once, on the first cell in the
+//! filter of each window or subagent: a window across midnight is a session
+//! on its first day. Active and waiting come from the orchestrator cells,
+//! which carry the session timeline, so they are additive from Session up.
+//! An Agent node shows its own active and waiting time, which is not summed
+//! into its session, since its agents run in parallel. Elapsed and epic
+//! progress are per level. Cells with no activity, requests or subagent run
+//! (a window sitting open overnight) are left out, so they put no node on a
+//! day.
 //!
 //! Modules: `gh` reads the GitHub cache, `cells` the cells in a filter and
 //! the windows and subagents they belong to, `tree` builds each cell's path
@@ -82,13 +85,13 @@ pub enum GroupBy {
 }
 
 /// What [`audit`] rolls up: the cells on local days `from..=to`
-/// (`YYYY-MM-DD`) of windows in `repos` (repo slugs; empty: every window,
-/// Unlinked included). A window is in the repo its name parses to, or a
-/// director's in the repo its row is placed under. A unit's cells still
-/// nest under its director's row wherever that is placed, so a director
-/// with units in two repos shows, under its own placement, when either is
-/// filtered: holding only the filtered repo's units, and its own cells only
-/// when its placement is filtered.
+/// (`YYYY-MM-DD`) of windows in `repos` (repo slugs, `""` for the windows
+/// in none; empty: every window). A window is in the repo its name parses
+/// to, or a director's in the repo its row is placed under. A unit's cells
+/// still nest under its director's row wherever that is placed, so a
+/// director with units in two repos shows, under its own placement, when
+/// either is filtered: holding only the filtered repo's units, and its own
+/// cells only when its placement is filtered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditFilter {
@@ -160,6 +163,23 @@ pub struct Metrics {
     pub open: bool,
     /// On an epic, or an issue with sub-issues.
     pub progress: Option<Progress>,
+    /// By local day.
+    pub by_day: Vec<Slice>,
+    /// By agent type: `orchestrator`, `teammate`, a subagent's type, or
+    /// `""` (unknown).
+    pub by_agent_type: Vec<Slice>,
+    /// By model (`""`: a cell with no requests).
+    pub by_model: Vec<Slice>,
+}
+
+/// A node's $ and agent-hours under one key of a split, its slices in key
+/// order.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Slice {
+    pub key: String,
+    pub cost_usd: f64,
+    pub agent_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -205,6 +225,11 @@ pub struct Audit {
     /// The repos whose GitHub data is missing or stale: their issues show
     /// no title, epic or PR.
     pub github_errors: Vec<GithubError>,
+    /// The repos the range's windows are filed under, sorted, whatever the
+    /// repo filter: what it can pick from.
+    pub repos: Vec<String>,
+    /// Some window in the range is in no repo (`""` in the repo filter).
+    pub unlinked: bool,
 }
 
 /// A repo (slug) whose latest GitHub refresh failed, and why.
@@ -223,5 +248,7 @@ pub fn audit(conn: &Connection, filter: &AuditFilter) -> Result<Audit> {
         root: tree::tree(filter.group_by, &cells, &gh),
         headline: headline::headline(conn, &gh, &cells)?,
         github_errors: gh::github_errors(conn)?,
+        repos: cells.repos.iter().cloned().collect(),
+        unlinked: cells.unlinked,
     })
 }

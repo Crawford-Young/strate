@@ -1,14 +1,63 @@
-// The Audit tree table: one row per node, every spec metric, sortable, expandable. Unlinked
-// stays last under any sort, and a row's name selects it (by path) for the row detail (#27 U2).
-import { Badge, DataTable } from '@crawfordyoung/ui'
+// The Audit tree table: one row per node, its level named by a badge, every spec metric,
+// sortable, expandable, and its $ or agent-hours split by day, agent type and model (#54).
+// Unlinked stays last under any sort, and a row's name selects it (by path) for the row
+// detail (#27 U2).
+import {
+  Badge,
+  DataTable,
+  InlineStackedBar,
+  Sparkbars,
+  type ChartToken,
+  type InlineStackedBarSegment,
+} from '@crawfordyoung/ui'
 import type { ColumnDef, Row } from '@tanstack/react-table'
 import { memo, useMemo, type ReactNode } from 'react'
-import type { AuditNode, AuditPath, Metrics } from './api'
-import { compact } from './audit'
+import type { AuditNode, AuditPath, Metrics, NodeKind, Slice } from './api'
+import {
+  agentTypeLabel,
+  agentTypePalette,
+  compact,
+  hoursLabel,
+  measured,
+  modelLabel,
+  modelPalette,
+  segments,
+  shortDay,
+  type Measure,
+  type Palette,
+} from './audit'
 import { duration, money } from './format'
 
 /** Node kinds read from GitHub: only these can lack GitHub data worth flagging. */
 const FROM_GITHUB = new Set(['epic', 'issue', 'pr'])
+
+/** Each row's level, on its badge; the hierarchy has no Root or Group row. */
+const LEVEL: Partial<Record<NodeKind, string>> = {
+  repo: 'repo',
+  unlinked: 'no issue',
+  epic: 'epic',
+  issue: 'issue',
+  pr: 'PR',
+  session: 'session',
+  agent: 'agent',
+}
+
+// Literal, so Tailwind generates each; the same classes the library's bars use.
+const SWATCH: Record<ChartToken, string> = {
+  1: 'bg-chart-1',
+  2: 'bg-chart-2',
+  3: 'bg-chart-3',
+  4: 'bg-chart-4',
+  5: 'bg-chart-5',
+  6: 'bg-chart-6',
+}
+
+/** A split's colours over the whole tree, and how its keys read. */
+interface Split {
+  name: string
+  palette: Palette
+  label: (key: string) => string
+}
 
 const pathOf = (row: Row<AuditNode>): AuditPath =>
   [...row.getParentRows(), row].map((r) => [r.original.kind, r.original.key])
@@ -48,8 +97,12 @@ const plain = (header: string, value: (m: Metrics) => number, show = (n: number)
   column(header, value, (m) => show(value(m)))
 
 interface AuditTableProps {
-  /** The rollup root's children. */
-  nodes: AuditNode[]
+  /** The rollup root: its children are the rows, and its splits pick the colours. */
+  root: AuditNode
+  /** The range's local days, one By day bar each. */
+  days: string[]
+  /** What the breakdown columns measure. */
+  measure: Measure
   selected: AuditPath | null
   onSelect: (path: AuditPath, label: string) => void
   /** Rows can't be picked: the tree on screen is an older filter's, being replaced. */
@@ -58,31 +111,135 @@ interface AuditTableProps {
 
 /** Memoized: Audit rerenders on every store change, which leaves these props alone. */
 export const AuditTable = memo(function AuditTable({
-  nodes,
+  root,
+  days,
+  measure,
   selected,
   onSelect,
   disabled = false,
 }: AuditTableProps) {
+  const splits = useMemo(
+    () => ({
+      agentType: {
+        name: 'Agent type',
+        palette: agentTypePalette(root.metrics.byAgentType),
+        label: agentTypeLabel,
+      },
+      model: { name: 'Model', palette: modelPalette(root.metrics.byModel), label: modelLabel },
+    }),
+    [root],
+  )
   const columns = useMemo(
-    () => columnsFor(selected, onSelect, disabled),
-    [selected, onSelect, disabled],
+    () => columnsFor({ selected, onSelect, disabled, days, measure, splits }),
+    [selected, onSelect, disabled, days, measure, splits],
   )
   return (
-    <DataTable
-      columns={columns}
-      data={nodes}
-      getSubRows={(n) => (n.children.length ? n.children : undefined)}
-      getRowId={rowId}
-      getRowLabel={(n) => `${n.kind} ${n.label}`}
-    />
+    <div className="space-y-4">
+      <div className="flex flex-wrap gap-x-8 gap-y-1.5">
+        <Legend split={splits.agentType} />
+        <Legend split={splits.model} />
+      </div>
+      <DataTable
+        columns={columns}
+        data={root.children}
+        getSubRows={(n) => (n.children.length ? n.children : undefined)}
+        getRowId={rowId}
+        getRowLabel={(n) => `${n.kind} ${n.label}`}
+      />
+    </div>
   )
 })
 
-function columnsFor(
-  selected: AuditPath | null,
-  onSelect: AuditTableProps['onSelect'],
-  disabled: boolean,
-): ColumnDef<AuditNode>[] {
+/**
+ * A split's colour key: each named series, then Other when keys fold into it. The markup
+ * of the library's chart legend, which is not exported yet (component-library#139).
+ */
+function Legend({ split: { name, palette, label } }: { split: Split }) {
+  // Keyed as the bar segments are, so Other never clashes with a key.
+  const items = [...palette.named].map(([key, color]) => ({
+    id: `slice:${key}`,
+    label: label(key),
+    color,
+  }))
+  if (palette.other !== null) items.push({ id: 'other', label: 'Other', color: palette.other })
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+      <span className="text-muted-foreground">{name}</span>
+      <ul aria-label={`${name} colours`} className="flex flex-wrap gap-x-4 gap-y-1">
+        {items.map((item) => (
+          <li key={item.id} className="flex items-center gap-1.5">
+            <span
+              aria-hidden
+              className={`inline-block size-2.5 rounded-sm ${SWATCH[item.color]}`}
+            />
+            {item.label}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+/** A row's split as a thin stacked bar, its biggest share named under it. */
+function SplitBar({
+  name,
+  bars,
+  format,
+}: {
+  name: string
+  bars: InlineStackedBarSegment[]
+  format: (value: number) => string
+}) {
+  const total = bars.reduce((sum, b) => sum + b.value, 0)
+  const top = bars.reduce<InlineStackedBarSegment | null>(
+    (best, b) => (best === null || b.value > best.value ? b : best),
+    null,
+  )
+  return (
+    <InlineStackedBar
+      name={name}
+      segments={bars}
+      format={format}
+      label={
+        top && total > 0 ? `${top.label} ${Math.round((top.value / total) * 100)}%` : undefined
+      }
+    />
+  )
+}
+
+interface ColumnsFor {
+  selected: AuditPath | null
+  onSelect: AuditTableProps['onSelect']
+  disabled: boolean
+  days: string[]
+  measure: Measure
+  splits: { agentType: Split; model: Split }
+}
+
+/** A breakdown column: not sortable, a bar per row. */
+const breakdown = (header: string, cell: (n: AuditNode) => ReactNode): ColumnDef<AuditNode> => ({
+  id: header,
+  header,
+  enableSorting: false,
+  cell: ({ row }) => cell(row.original),
+})
+
+function columnsFor({
+  selected,
+  onSelect,
+  disabled,
+  days,
+  measure,
+  splits,
+}: ColumnsFor): ColumnDef<AuditNode>[] {
+  const format = measure === 'usd' ? money : hoursLabel
+  const split = ({ name, palette, label }: Split, slices: Slice[]) => (
+    <SplitBar
+      name={`By ${name.toLowerCase()}`}
+      bars={segments(slices, palette, measure, label)}
+      format={format}
+    />
+  )
   return [
     {
       id: 'Name',
@@ -104,6 +261,9 @@ function columnsFor(
             >
               {node.label}
             </button>
+            <Badge variant="outline" data-testid="level" className="text-muted-foreground">
+              {LEVEL[node.kind]}
+            </Badge>
             {!node.github && FROM_GITHUB.has(node.kind) && (
               <Badge variant="outline" title="Known only from a window name: no GitHub data">
                 no GitHub
@@ -127,6 +287,19 @@ function columnsFor(
       (m) => m.costUsd,
       (m) => `${money(m.costUsd)}${m.unpriced > 0 ? ` +${m.unpriced} unpriced` : ''}`,
     ),
+    breakdown('By day', (n) => {
+      const byDay = new Map(n.metrics.byDay.map((s) => [s.key, measured(s, measure)]))
+      return (
+        <Sparkbars
+          name="By day"
+          values={days.map((d) => byDay.get(d) ?? 0)}
+          labels={days.map(shortDay)}
+          format={format}
+        />
+      )
+    }),
+    breakdown('By agent type', (n) => split(splits.agentType, n.metrics.byAgentType)),
+    breakdown('By model', (n) => split(splits.model, n.metrics.byModel)),
     plain('Tokens', tokenTotal, compact),
     plain('Sessions', (m) => m.sessions),
     plain('Agents', (m) => m.agents),
