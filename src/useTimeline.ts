@@ -12,7 +12,7 @@ export function useTimeline(
   active: boolean,
   version: number,
 ): { days: TimelineDay[] | null; error: string | null } {
-  const key = JSON.stringify([filter.from, filter.to, filter.repos, filter.groupBy, path])
+  const key = JSON.stringify([filter.from, filter.to, filter.repos, path])
   const loaded = useLoad(active && path !== null ? key : null, version, () =>
     auditTimeline(filter, path as AuditPath),
   )

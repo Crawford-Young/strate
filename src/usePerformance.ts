@@ -1,10 +1,7 @@
 import { auditPerformance, type AuditFilter, type Performance } from './api'
 import { useCachedRead } from './useCachedRead'
 
-/**
- * The performance read for `filter`'s days and repos, cached and reread as `useAudit` does.
- * The grouping is not part of the read, so changing it neither rereads nor marks it pending.
- */
+/** The performance read for `filter`'s days and repos, cached and reread as `useAudit` does. */
 export function usePerformance(
   filter: AuditFilter,
   active: boolean,

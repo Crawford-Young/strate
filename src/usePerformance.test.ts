@@ -8,7 +8,7 @@ vi.mock('./api', () => ({ auditPerformance: vi.fn() }))
 
 const performanceMock = vi.mocked(auditPerformance)
 
-const week: AuditFilter = { from: '2026-10-07', to: '2026-10-13', repos: [], groupBy: 'hierarchy' }
+const week: AuditFilter = { from: '2026-10-07', to: '2026-10-13', repos: [] }
 // Each read answers with the number of reads before it, in `openIssues`.
 const answer = () =>
   Promise.resolve(
@@ -71,15 +71,6 @@ describe('usePerformance', () => {
     expect(result.current.pending).toBe(true)
     await settle()
     expect(shown(result)).toBe(2)
-  })
-
-  it('ignores the grouping, which the read does not depend on', async () => {
-    const { result, rerender } = setup(week, true)
-    await settle()
-    rerender({ filter: { ...week, groupBy: 'model' } })
-    expect(result.current.pending).toBe(false)
-    await settle()
-    expect(performanceMock).toHaveBeenCalledTimes(1)
   })
 
   it('caches per range and repos', async () => {

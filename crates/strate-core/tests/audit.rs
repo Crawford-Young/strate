@@ -15,9 +15,7 @@ use serde_json::{Value, json};
 use strate_core::cost::Usage;
 use strate_core::discovery::discover;
 use strate_core::store::Store;
-use strate_core::store::views::{
-    AuditFilter, GroupBy, SpanKind, TimelineDay, TimelineSpan, audit_timeline,
-};
+use strate_core::store::views::{AuditFilter, SpanKind, TimelineDay, TimelineSpan, audit_timeline};
 use strate_core::tail::{Batch, Checkpoint, FileIdentity, TailEvent};
 
 const TORONTO: &str = "America/Toronto";
@@ -518,7 +516,6 @@ fn a_dst_days_timeline_sits_on_the_wall_clock() {
         from: "2026-01-01".into(),
         to: "2026-12-31".into(),
         repos: vec![],
-        group_by: GroupBy::Hierarchy,
     };
     let days = audit_timeline(&db, &year, &[]).expect("timeline");
     // The DayTimeline axis is the 24 h wall clock, so a span sits at its

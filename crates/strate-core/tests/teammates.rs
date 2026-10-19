@@ -13,7 +13,7 @@ use strate_core::discovery::discover;
 use strate_core::hooks::{Hook, HookEvent};
 use strate_core::registry::{RegistryEvent, parse_snapshot};
 use strate_core::store::Store;
-use strate_core::store::views::{self, AgentState, AuditFilter, GroupBy};
+use strate_core::store::views::{self, AgentState, AuditFilter};
 use strate_core::tail::Batch;
 use strate_core::time::parse_timestamp;
 
@@ -161,7 +161,6 @@ fn the_performance_agents_table_shows_teammates_by_their_spawned_type() {
         from: "2026-10-09".into(),
         to: "2026-10-09".into(),
         repos: vec![],
-        group_by: GroupBy::Hierarchy,
     };
     let p = views::performance(&db, &filter).expect("performance");
     let mut rows: Vec<(&str, bool, i64)> = p

@@ -99,9 +99,9 @@ fn timeline(
     reader.read(|conn| views::audit_timeline(conn, filter, path))
 }
 
-/// The Audit performance read for `filter` (its group-by is ignored):
-/// outcome per local day, agents per type and model, bottleneck per day and
-/// repo, and waste. A bad day in the filter is an error.
+/// The Audit performance read for `filter`: outcome per local day, agents
+/// per type and model, bottleneck per day and repo, and waste. A bad day in
+/// the filter is an error.
 #[tauri::command(async)]
 pub fn audit_performance(
     reader: State<'_, Reader>,
@@ -150,8 +150,6 @@ fn write_to(path: &Path, text: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use strate_core::store::views::GroupBy;
-
     use super::*;
 
     #[test]
@@ -174,7 +172,6 @@ mod tests {
             from: from.into(),
             to: "2026-10-31".into(),
             repos: vec![],
-            group_by: GroupBy::Hierarchy,
         };
         let audit = rollup(&reader, &filter("2026-10-01")).expect("an empty store rolls up");
         assert!(audit.root.children.is_empty());

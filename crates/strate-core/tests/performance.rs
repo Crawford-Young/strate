@@ -20,7 +20,7 @@ use strate_core::hooks::{Hook, HookEvent};
 use strate_core::registry::{RegistryEvent, parse_snapshot};
 use strate_core::store::Store;
 use strate_core::store::views::{
-    self, AgentState, AuditFilter, GroupBy, Performance, PermissionWaits, Tokens, performance,
+    self, AgentState, AuditFilter, Performance, PermissionWaits, Tokens, performance,
 };
 use strate_core::tail::{Batch, Checkpoint, FileIdentity, TailEvent};
 use strate_core::time::parse_timestamp;
@@ -379,7 +379,6 @@ fn filter(from: &str, to: &str, repos: &[&str]) -> AuditFilter {
         from: from.into(),
         to: to.into(),
         repos: repos.iter().map(|r| r.to_string()).collect(),
-        group_by: GroupBy::Hierarchy,
     }
 }
 

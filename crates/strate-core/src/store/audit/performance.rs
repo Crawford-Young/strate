@@ -208,8 +208,8 @@ pub struct Peak {
     pub model: String,
 }
 
-/// The performance read for `filter`; its group-by is ignored. Fails on a
-/// day that is not `YYYY-MM-DD`.
+/// The performance read for `filter`. Fails on a day that is not
+/// `YYYY-MM-DD`.
 pub fn performance(conn: &Connection, filter: &AuditFilter) -> Result<Performance> {
     let range = Range::new(filter)?;
     let gh = Gh::load(conn)?;

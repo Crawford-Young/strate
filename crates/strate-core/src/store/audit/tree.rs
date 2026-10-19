@@ -5,29 +5,32 @@ use std::collections::HashMap;
 
 use super::cells::{Cell, Cells, Place, Share, Time, Window};
 use super::gh::{Gh, GhPr};
-use super::{AuditNode, GroupBy, Metrics, NodeKind, Progress, Slice, Tokens};
+use super::{AuditNode, Metrics, NodeKind, Progress, Slice, Tokens};
 
-/// The rollup tree over `cells`, its top level grouped by `group_by`.
-pub(crate) fn tree(group_by: GroupBy, cells: &Cells, gh: &Gh) -> AuditNode {
+/// The rollup tree over `cells`.
+pub(crate) fn tree(cells: &Cells, gh: &Gh) -> AuditNode {
     let mut root = Node::root();
     for cell in &cells.list {
         let keys = Keys {
             day: &cell.day,
-            agent_type: agent_type(cell, cells).unwrap_or_default(),
+            agent_type: agent_type(cell, cells),
             model: cell.model.as_deref().unwrap_or_default(),
         };
-        root.insert(path(group_by, cell, cells, gh), &cell.share, &keys);
+        root.insert(path(cell, cells, gh), &cell.share, &keys);
     }
     root.finish().0
 }
 
 /// `cell`'s agent type: `orchestrator`, or its subagent's or teammate's
-/// stored type when known.
-fn agent_type<'a>(cell: &'a Cell, cells: &'a Cells) -> Option<&'a str> {
+/// stored type (`""`: unknown).
+fn agent_type<'a>(cell: &'a Cell, cells: &'a Cells) -> &'a str {
     let Some(id) = &cell.agent_id else {
-        return Some("orchestrator");
+        return "orchestrator";
     };
-    cells.agent(cell, id)?.agent_type.as_deref()
+    cells
+        .agent(cell, id)
+        .and_then(|a| a.agent_type.as_deref())
+        .unwrap_or_default()
 }
 
 /// A cell's key in each split; `""` where it has none.
@@ -131,52 +134,18 @@ impl Step {
     }
 }
 
-/// `cell`'s path from the root: its Group node under `group_by` (none under
-/// Hierarchy), then the place of its outermost Session row (Repo > Epic >
-/// Issue > PR, a director's Repo alone, or Unlinked), its Session rows (a
-/// unit's under its director's; see [`Cells::rows`]) and its Agent node. The tree adds the
-/// cell to every node on it; the cells under a node are those whose path
-/// passes through that node's `(kind, key)` steps.
-pub(crate) fn path(group_by: GroupBy, cell: &Cell, cells: &Cells, gh: &Gh) -> Vec<Step> {
+/// `cell`'s path from the root: the place of its outermost Session row
+/// (Repo > Epic > Issue > PR, a director's Repo alone, or Unlinked), its
+/// Session rows (a unit's under its director's; see [`Cells::rows`]) and its
+/// Agent node. The tree adds the cell to every node on it; the cells under a
+/// node are those whose path passes through that node's `(kind, key)` steps.
+pub(crate) fn path(cell: &Cell, cells: &Cells, gh: &Gh) -> Vec<Step> {
     let rows = cells.rows(cell);
-    let mut steps = Vec::with_capacity(7 + rows.len());
-    steps.extend(group_step(group_by, cell, cells, gh));
+    let mut steps = Vec::with_capacity(6 + rows.len());
     steps.extend(place_steps(rows[0], gh));
     steps.extend(rows.into_iter().map(window_step));
     steps.push(agent_step(cell, cells));
     steps
-}
-
-/// `cell`'s Group node under `group_by`; Hierarchy has none.
-fn group_step(group_by: GroupBy, cell: &Cell, cells: &Cells, gh: &Gh) -> Option<Step> {
-    let (key, label) = match group_by {
-        GroupBy::Hierarchy => return None,
-        GroupBy::Day => (cell.day.clone(), cell.day.clone()),
-        GroupBy::Model => match &cell.model {
-            Some(m) => (m.clone(), m.clone()),
-            None => (String::new(), "No requests".into()),
-        },
-        // Session time is on the orchestrator's cells, so a subagent type's
-        // group shows 0 session-level active and waiting; its Agent nodes
-        // carry their own.
-        GroupBy::AgentType => match agent_type(cell, cells) {
-            Some(k) => (k.to_string(), k.to_string()),
-            None => (String::new(), "Unknown".into()),
-        },
-        // Keyed by the PR's own repo, which may not be the issue's.
-        GroupBy::Pr => match &cells.window(cell).place {
-            Place::Linked {
-                repo,
-                issue,
-                pr: Some(n),
-            } => {
-                let repo = gh.pr(repo, *issue, *n).map_or(repo, |p| &p.repo);
-                (format!("{repo}#{n}"), format!("{repo} #{n}"))
-            }
-            _ => (String::new(), "No PR".into()),
-        },
-    };
-    Some(Step::new(NodeKind::Group, key.clone(), label, key))
 }
 
 /// The steps a window's row is placed by: Repo > Epic > Issue > PR; a

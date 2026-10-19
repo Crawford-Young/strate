@@ -15,7 +15,7 @@ use serde::Serialize;
 use super::cells::{Cell, Cells};
 use super::gh::Gh;
 use super::tree::Step;
-use super::{AuditFilter, GroupBy, NodeKind};
+use super::{AuditFilter, NodeKind};
 use crate::store::Result;
 use crate::store::account::{self, Run};
 use crate::time::{self, Cat};
@@ -68,9 +68,8 @@ pub struct TimelineDay {
 type CellKey<'a> = (&'a str, Option<&'a str>, Option<i64>, &'a str);
 
 /// The days in `filter` with work or a mark of the node at `path` (its
-/// steps from the root, which may lead with the root's own), under
-/// `filter.group_by`. An unknown path has no days. Fails on a day that is
-/// not `YYYY-MM-DD`.
+/// steps from the root, which may lead with the root's own). An unknown
+/// path has no days. Fails on a day that is not `YYYY-MM-DD`.
 pub fn audit_timeline(
     conn: &Connection,
     filter: &AuditFilter,
@@ -86,7 +85,7 @@ pub fn audit_timeline(
     let mut timed: HashSet<CellKey> = HashSet::new();
     let mut marks: BTreeSet<(i64, String)> = BTreeSet::new();
     for cell in &cells.list {
-        let steps = super::tree::path(filter.group_by, cell, &cells, &gh);
+        let steps = super::tree::path(cell, &cells, &gh);
         if !under(&steps, path) {
             continue;
         }
@@ -123,21 +122,11 @@ pub fn audit_timeline(
             }
         }
     }
-    // A day row's marks are that day's only: its cells' issues and PRs may
-    // close on another day, which is another row.
-    let own_day = match (filter.group_by, path.first()) {
-        (GroupBy::Day, Some((NodeKind::Group, day))) => Some(day.as_str()),
-        _ => None,
-    };
     for (at, label) in marks {
         let (Some(day), Some(at_ms)) = (time::local_day(&tz, at), time::wall_ms(&tz, at)) else {
             continue;
         };
-        let shown = match own_day {
-            Some(own) => day == own,
-            None => (filter.from.as_str()..=filter.to.as_str()).contains(&day.as_str()),
-        };
-        if shown {
+        if (filter.from.as_str()..=filter.to.as_str()).contains(&day.as_str()) {
             entry(&mut days, &day)
                 .marks
                 .push(TimelineMark { at_ms, label });
