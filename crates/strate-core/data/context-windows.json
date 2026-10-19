@@ -1,13 +1,14 @@
 {
-  "$comment": "strate's context window per model, in tokens. No transcript record carries a window size, so context % divides the latest request's depth by this. A dated snapshot (claude-haiku-4-5-20251001) resolves to its base id; a model missing here gets no context %. Re-verify when a model ships.",
-  "verified": "2026-10-06",
-  "source": "Anthropic Models API, max_input_tokens",
+  "$comment": "strate's context window per model, in tokens. No transcript record carries a window size, so context % divides the latest request's depth by this. A dated snapshot (claude-haiku-4-5-20251001) resolves to its base id; a model missing here gets no context %. Re-verify when a model ships. Only the 5.x entries named in the source were re-checked on 2026-10-19; opus-5, sonnet-5 and haiku-4-5 keep their 2026-10-06 Models API values.",
+  "verified": "2026-10-19",
+  "source": "claude-fable-5-1, claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5: https://platform.claude.com/docs/en/models/overview, Compare models, Context window (2026-10-19). Others: Anthropic Models API, max_input_tokens (2026-10-06)",
   "models": {
     "claude-fable-5-1": 1000000,
     "claude-opus-5-5": 1000000,
     "claude-opus-5": 1000000,
     "claude-sonnet-5-5": 1000000,
     "claude-sonnet-5": 1000000,
+    "claude-haiku-5-5": 1000000,
     "claude-haiku-4-5": 200000
   }
 }
