@@ -434,6 +434,8 @@ mod tests {
     #[test]
     fn context_pct_divides_by_the_model_window_and_never_guesses() {
         assert_eq!(context_window("claude-opus-5-5"), Some(1_000_000));
+        assert_eq!(context_window("claude-haiku-5-5"), Some(1_000_000));
+        assert_eq!(context_window("claude-haiku-5-5-20261001"), Some(1_000_000));
         assert_eq!(context_window("claude-haiku-4-5-20251001"), Some(200_000));
         assert_eq!(context_window("claude-lorem-1"), None);
         // 200006 / 1000000 = 20.0006%
@@ -442,6 +444,9 @@ mod tests {
         // 50008 / 200000 = 25.004%
         let pct = context_pct(50_008, "claude-haiku-4-5-20251001").expect("known");
         assert!((pct - 25.004).abs() < 1e-9, "{pct}");
+        // 250010 / 1000000 = 25.001%
+        let pct = context_pct(250_010, "claude-haiku-5-5").expect("known");
+        assert!((pct - 25.001).abs() < 1e-9, "{pct}");
         assert_eq!(context_pct(1000, "claude-lorem-1"), None);
         assert_eq!(context_pct(1000, SYNTHETIC), None);
     }
@@ -449,11 +454,12 @@ mod tests {
     #[test]
     fn the_windows_table_carries_its_verification() {
         let table: Value = serde_json::from_str(WINDOWS_JSON).expect("json");
-        assert_eq!(table["verified"], "2026-10-06");
+        assert_eq!(table["verified"], "2026-10-19");
+        let source = table["source"].as_str().expect("a source");
+        assert!(source.contains("max_input_tokens"), "{source}");
         assert!(
-            table["source"]
-                .as_str()
-                .is_some_and(|s| s.contains("max_input_tokens"))
+            source.contains("platform.claude.com/docs/en/models/overview"),
+            "{source}"
         );
     }
 }
