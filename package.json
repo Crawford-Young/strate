@@ -28,7 +28,7 @@
   "dependencies": {
     "@crawfordyoung/ui": "^0.31.0",
     "@tanstack/react-table": "^8.21.3",
-    "@tauri-apps/api": "^2.12.1",
+    "@tauri-apps/api": "^2.12.4",
     "@xyflow/react": "^12.12.0",
     "elkjs": "^0.12.0",
     "lucide-react": "^1.52.0",
