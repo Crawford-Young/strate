@@ -88,9 +88,6 @@ export interface LiveGraph {
   edges: GraphEdge[]
 }
 
-/** How the Audit tree's top level groups the cells. The view reads `hierarchy` only (#54). */
-export type GroupBy = 'hierarchy' | 'day' | 'pr' | 'agent_type' | 'model'
-
 /** What auditRollup sums: the cells on local days `from..=to`. */
 export interface AuditFilter {
   /** Local day, `YYYY-MM-DD`. */
@@ -99,11 +96,9 @@ export interface AuditFilter {
   to: string
   /** Repo slugs, `''` for Unlinked windows; empty means every window. */
   repos: string[]
-  groupBy: GroupBy
 }
 
-export type NodeKind =
-  'root' | 'group' | 'repo' | 'unlinked' | 'epic' | 'issue' | 'pr' | 'session' | 'agent'
+export type NodeKind = 'root' | 'repo' | 'unlinked' | 'epic' | 'issue' | 'pr' | 'session' | 'agent'
 
 export interface Tokens {
   input: number
@@ -157,9 +152,8 @@ export interface Slice {
 
 export interface AuditNode {
   /**
-   * `group` is a value of the group-by: a day, `<repo>#<pr>` (the PR's own
-   * repo), an agent type or a model. `session` is a `/clear` chain's windows in one
-   * workstream; a director's unit nests under the director's row.
+   * `session` is a `/clear` chain's windows in one workstream; a director's unit nests under
+   * the director's row.
    */
   kind: NodeKind
   /** Unique among its siblings. */
@@ -389,7 +383,7 @@ export const auditRollup = (filter: AuditFilter) => invoke<Audit>('audit_rollup'
 export const auditTimeline = (filter: AuditFilter, path: AuditPath) =>
   invoke<TimelineDay[]>('audit_timeline', { filter, path })
 
-/** The performance read under `filter` (its `groupBy` is ignored); rejects on a bad day. */
+/** The performance read under `filter`; rejects on a bad day. */
 export const auditPerformance = (filter: AuditFilter) =>
   invoke<Performance>('audit_performance', { filter })
 

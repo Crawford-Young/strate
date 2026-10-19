@@ -11,7 +11,7 @@ export function useAudit(
   active: boolean,
   version: number,
 ): { audit: Audit | null; error: string | null; pending: boolean } {
-  const key = JSON.stringify([filter.from, filter.to, filter.repos, filter.groupBy])
+  const key = JSON.stringify([filter.from, filter.to, filter.repos])
   const { value, error, pending } = useCachedRead(key, active, version, () => auditRollup(filter))
   return { audit: value, error, pending }
 }

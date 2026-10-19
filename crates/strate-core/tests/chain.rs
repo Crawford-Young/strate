@@ -14,8 +14,8 @@ use strate_core::hooks::{Hook, HookEvent};
 use strate_core::registry::{RegistryEntry, RegistryEvent, parse_snapshot};
 use strate_core::store::Store;
 use strate_core::store::views::{
-    self, AgentState, AuditFilter, AuditNode, GraphAgent, GraphEdge, GroupBy, LiveGraph, Metrics,
-    NodeKind, SpanKind, Workstream, audit, audit_timeline,
+    self, AgentState, AuditFilter, AuditNode, GraphAgent, GraphEdge, LiveGraph, Metrics, NodeKind,
+    SpanKind, Workstream, audit, audit_timeline,
 };
 
 /// director-chain's third and last link.
@@ -71,17 +71,16 @@ fn build(t: &Temp) -> (Store, Connection) {
     (store, reader)
 }
 
-fn oct8(group_by: GroupBy) -> AuditFilter {
+fn oct8() -> AuditFilter {
     AuditFilter {
         from: "2026-10-08".into(),
         to: "2026-10-08".into(),
         repos: vec![],
-        group_by,
     }
 }
 
 fn tree(db: &Connection) -> AuditNode {
-    audit(db, &oct8(GroupBy::Hierarchy)).expect("audit").root
+    audit(db, &oct8()).expect("audit").root
 }
 
 /// The children of `node` of `kind`, by label.
@@ -265,22 +264,11 @@ fn each_cell_counts_once_whatever_the_nesting() {
     let (_store, db) = build(&t);
     // 8 links of 3 processes, 2 opus requests each plus L2's SendMessage;
     // 8 subagents.
-    for group_by in [
-        GroupBy::Hierarchy,
-        GroupBy::Day,
-        GroupBy::Pr,
-        GroupBy::AgentType,
-        GroupBy::Model,
-    ] {
-        let root = audit(&db, &oct8(group_by)).expect("audit").root;
-        check_sums(&root);
-        let m = &root.metrics;
-        assert!(
-            close(17.0 * OPUS + 8.0 * SONNET, m.cost_usd),
-            "{group_by:?}"
-        );
-        assert_eq!((m.sessions, m.agents), (8, 8), "{group_by:?}");
-    }
+    let root = tree(&db);
+    check_sums(&root);
+    let m = &root.metrics;
+    assert!(close(17.0 * OPUS + 8.0 * SONNET, m.cost_usd));
+    assert_eq!((m.sessions, m.agents), (8, 8));
 }
 
 #[test]
@@ -299,7 +287,7 @@ fn a_nested_rows_timeline_is_its_own_cells() {
         (NodeKind::Session, director.key.clone()),
         (NodeKind::Session, unit.key.clone()),
     ];
-    let days = audit_timeline(&db, &oct8(GroupBy::Hierarchy), &path).expect("timeline");
+    let days = audit_timeline(&db, &oct8(), &path).expect("timeline");
     assert_eq!(days.len(), 1);
     let total = |kind| -> i64 {
         days[0]
@@ -511,7 +499,6 @@ fn oct2(db: &Connection) -> AuditNode {
         from: "2026-10-02".into(),
         to: "2026-10-02".into(),
         repos: vec![],
-        group_by: GroupBy::Hierarchy,
     };
     audit(db, &f).expect("audit").root
 }
@@ -880,7 +867,6 @@ fn oct2_in(db: &Connection, repos: &[&str]) -> AuditNode {
         from: "2026-10-02".into(),
         to: "2026-10-02".into(),
         repos: repos.iter().map(|r| r.to_string()).collect(),
-        group_by: GroupBy::Hierarchy,
     };
     audit(db, &f).expect("audit").root
 }

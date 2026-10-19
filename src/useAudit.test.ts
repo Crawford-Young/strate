@@ -8,11 +8,13 @@ vi.mock('./api', () => ({ auditRollup: vi.fn() }))
 
 const rollupMock = vi.mocked(auditRollup)
 
-const week: AuditFilter = { from: '2026-10-07', to: '2026-10-13', repos: [], groupBy: 'hierarchy' }
-const byDay: AuditFilter = { ...week, groupBy: 'day' }
+const week: AuditFilter = { from: '2026-10-07', to: '2026-10-13', repos: [] }
+const lorem: AuditFilter = { ...week, repos: ['lorem'] }
+/** The filter's repo, `all` for every repo. */
+const repo = (filter: AuditFilter) => filter.repos[0] ?? 'all'
 // Each read answers with a tree naming its filter and how many reads came before it.
 const answer = (filter: AuditFilter) =>
-  Promise.resolve(audit([node('repo', `${filter.groupBy}#${rollupMock.mock.calls.length}`)]))
+  Promise.resolve(audit([node('repo', `${repo(filter)}#${rollupMock.mock.calls.length}`)]))
 const shown = (result: { current: ReturnType<typeof useAudit> }) =>
   result.current.audit?.root.children[0]?.key
 
@@ -51,18 +53,18 @@ describe('useAudit', () => {
     expect(result.current).toEqual({ audit: null, error: null, pending: true })
     await settle()
     expect(rollupMock).toHaveBeenCalledExactlyOnceWith(week)
-    expect(shown(result)).toBe('hierarchy#1')
+    expect(shown(result)).toBe('all#1')
     expect(result.current.pending).toBe(false)
   })
 
   it('keeps showing the last rollup that landed while a new filter is first read', async () => {
     const { result, rerender } = setup(week, true)
     await settle()
-    rerender({ filter: byDay, active: true })
-    expect(shown(result)).toBe('hierarchy#1')
+    rerender({ filter: lorem, active: true })
+    expect(shown(result)).toBe('all#1')
     expect(result.current.pending).toBe(true)
     await settle()
-    expect(shown(result)).toBe('day#2')
+    expect(shown(result)).toBe('lorem#2')
     expect(result.current.pending).toBe(false)
   })
 
@@ -75,7 +77,7 @@ describe('useAudit', () => {
     rerender({ filter: week, active: true })
     await settle()
     expect(rollupMock).toHaveBeenCalledTimes(1)
-    expect(shown(result)).toBe('hierarchy#1')
+    expect(shown(result)).toBe('all#1')
   })
 
   it('rereads the shown filter at once when the version moves, and never on its own', async () => {
@@ -87,18 +89,18 @@ describe('useAudit', () => {
     expect(result.current.pending).toBe(true)
     await settle()
     expect(rollupMock).toHaveBeenCalledTimes(2)
-    expect(shown(result)).toBe('hierarchy#2')
+    expect(shown(result)).toBe('all#2')
     expect(result.current.pending).toBe(false)
   })
 
   it('serves a filter seen before from its cache, without a read', async () => {
     const { result, rerender } = setup(week, true)
     await settle()
-    rerender({ filter: byDay, active: true })
+    rerender({ filter: lorem, active: true })
     await settle()
-    expect(shown(result)).toBe('day#2')
+    expect(shown(result)).toBe('lorem#2')
     rerender({ filter: { ...week }, active: true })
-    expect(shown(result)).toBe('hierarchy#1')
+    expect(shown(result)).toBe('all#1')
     await settle()
     expect(rollupMock).toHaveBeenCalledTimes(2)
   })
@@ -106,16 +108,16 @@ describe('useAudit', () => {
   it('shows a stale cached filter while it rereads', async () => {
     const { result, rerender, bump } = setup(week, true)
     await settle()
-    rerender({ filter: byDay, active: true })
+    rerender({ filter: lorem, active: true })
     await settle()
     act(() => bump())
     await settle()
     expect(rollupMock).toHaveBeenCalledTimes(3)
     rerender({ filter: week, active: true })
-    expect(shown(result)).toBe('hierarchy#1')
+    expect(shown(result)).toBe('all#1')
     await settle()
     expect(rollupMock).toHaveBeenCalledTimes(4)
-    expect(shown(result)).toBe('hierarchy#4')
+    expect(shown(result)).toBe('all#4')
   })
 
   it('rereads a filter that went stale while hidden as soon as it is shown again', async () => {
@@ -128,7 +130,7 @@ describe('useAudit', () => {
     rerender({ filter: week, active: true })
     await settle()
     expect(rollupMock).toHaveBeenCalledTimes(2)
-    expect(shown(result)).toBe('hierarchy#2')
+    expect(shown(result)).toBe('all#2')
   })
 
   it('keeps a newer rollup when an older read of the same filter lands after it', async () => {
@@ -139,15 +141,15 @@ describe('useAudit', () => {
     const { result, rerender, bump } = setup(week, true)
     await settle()
     // Away to another filter while the first read hangs, a version bump, then back: a new read.
-    rerender({ filter: byDay })
+    rerender({ filter: lorem })
     await settle()
     act(() => bump())
     await settle()
     rerender({ filter: week })
     await settle()
-    expect(shown(result)).toBe('hierarchy#4')
+    expect(shown(result)).toBe('all#4')
     await act(async () => landOld())
-    expect(shown(result)).toBe('hierarchy#4')
+    expect(shown(result)).toBe('all#4')
     expect(result.current.pending).toBe(false)
     await settle()
     expect(rollupMock).toHaveBeenCalledTimes(4)
@@ -175,7 +177,7 @@ describe('useAudit', () => {
     async function queued() {
       let land!: () => void
       rollupMock.mockImplementationOnce(
-        (f) => new Promise((r) => (land = () => r(audit([node('repo', f.groupBy)])))),
+        (f) => new Promise((r) => (land = () => r(audit([node('repo', repo(f))])))),
       )
       const hook = setup(week, true)
       await settle()
@@ -213,9 +215,9 @@ describe('useAudit', () => {
     const { result, rerender } = setup(week, true)
     await settle()
     expect(result.current).toEqual({ audit: null, error: 'bad day', pending: true })
-    rerender({ filter: byDay, active: true })
+    rerender({ filter: lorem, active: true })
     await settle()
     expect(result.current.error).toBeNull()
-    expect(shown(result)).toBe('day#2')
+    expect(shown(result)).toBe('lorem#2')
   })
 })

@@ -29,15 +29,13 @@
 //! `director-<repo>` name names when the GitHub cache or a window name
 //! knows it. The outermost row places a nest. Any other window that is
 //! unnamed, has a fallback name or has a name that doesn't parse sits
-//! under "Unlinked". Any other group-by puts one Group
-//! node per value (local day, PR, agent type, model) above that hierarchy;
-//! the PR group and the headline read a unit's own window, wherever its
+//! under "Unlinked". The headline reads a unit's own window, wherever its
 //! row nests, and so does the repo filter (see [`AuditFilter`]).
 //!
 //! Every node sums the cells under it. $, tokens, agent-hours (subagent
 //! wall) and the counts are additive at every level, and so are a node's $
 //! and agent-hours split by local day, agent type and model (#54): the
-//! slice for a key is what that key's Group node holds on the same path.
+//! slice for a key is what the node holds of that key's cells.
 //! Sessions, agents and rotations count once, on the first cell in the
 //! filter of each window or subagent: a window across midnight is a session
 //! on its first day. Active and waiting come from the orchestrator cells,
@@ -73,17 +71,6 @@ pub use performance::{
 };
 pub use timeline::{SpanKind, TimelineDay, TimelineMark, TimelineSpan, audit_timeline};
 
-/// How the tree's top level groups the cells.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum GroupBy {
-    Hierarchy,
-    Day,
-    Pr,
-    AgentType,
-    Model,
-}
-
 /// What [`audit`] rolls up: the cells on local days `from..=to`
 /// (`YYYY-MM-DD`) of windows in `repos` (repo slugs, `""` for the windows
 /// in none; empty: every window). A window is in the repo its name parses
@@ -99,16 +86,12 @@ pub struct AuditFilter {
     pub to: String,
     #[serde(default)]
     pub repos: Vec<String>,
-    pub group_by: GroupBy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeKind {
     Root,
-    /// A value of the group-by: a day, `<repo>#<pr>` (the PR's own repo), an
-    /// agent type or a model (`""`: none).
-    Group,
     Repo,
     Unlinked,
     Epic,
@@ -188,8 +171,7 @@ pub struct AuditNode {
     pub kind: NodeKind,
     /// Unique among its siblings: a repo slug, an issue or PR number, a
     /// Session row's `<process root>/<workstream id>` (`session:<id>` for a
-    /// session with no window), an agent id (`""`: the orchestrator) or a
-    /// group value.
+    /// session with no window) or an agent id (`""`: the orchestrator).
     pub key: String,
     pub label: String,
     /// An epic, issue or PR read from the GitHub cache. False on an issue
@@ -200,7 +182,7 @@ pub struct AuditNode {
 }
 
 /// The issues closed as completed and the merged PRs with work in the
-/// filter, whatever the group-by.
+/// filter.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Headline {
@@ -245,7 +227,7 @@ pub fn audit(conn: &Connection, filter: &AuditFilter) -> Result<Audit> {
     let gh = Gh::load(conn)?;
     let cells = Cells::load(conn, &gh, filter)?;
     Ok(Audit {
-        root: tree::tree(filter.group_by, &cells, &gh),
+        root: tree::tree(&cells, &gh),
         headline: headline::headline(conn, &gh, &cells)?,
         github_errors: gh::github_errors(conn)?,
         repos: cells.repos.iter().cloned().collect(),

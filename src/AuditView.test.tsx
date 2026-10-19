@@ -243,7 +243,6 @@ describe('controls', () => {
       from: '2026-10-07',
       to: '2026-10-13',
       repos: [],
-      groupBy: 'hierarchy',
     })
     expect(screen.getByRole('radio', { name: '7d' })).toHaveAttribute('aria-checked', 'true')
     expect(chip('All repos')).toHaveAttribute('aria-pressed', 'true')
@@ -739,7 +738,7 @@ describe('row detail', () => {
     selectFix()
     expect(await within(detail()).findByText('#11 closed')).toBeInTheDocument()
     expect(timelineMock).toHaveBeenLastCalledWith(
-      { from: '2026-10-07', to: '2026-10-13', repos: [], groupBy: 'hierarchy' },
+      { from: '2026-10-07', to: '2026-10-13', repos: [] },
       [
         ['repo', 'acme/web'],
         ['epic', '10'],

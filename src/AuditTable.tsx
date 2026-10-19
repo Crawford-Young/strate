@@ -66,8 +66,7 @@ const samePath = (a: AuditPath | null, b: AuditPath) => JSON.stringify(a) === JS
 
 /**
  * A row id is its node path as JSON, so expanded rows stay put when a refresh inserts or
- * reorders siblings, an id from another grouping simply matches nothing, and no key can read
- * as two steps (a slug may hold `/` or `:`).
+ * reorders siblings, and no key can read as two steps (a slug may hold `/` or `:`).
  */
 const rowId = (n: AuditNode, _index: number, parent?: Row<AuditNode>): string =>
   JSON.stringify([...(parent ? (JSON.parse(parent.id) as AuditPath) : []), [n.kind, n.key]])

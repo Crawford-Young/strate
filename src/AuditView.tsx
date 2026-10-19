@@ -91,8 +91,7 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
     controls.range === 'custom'
       ? controls.custom
       : lastDays(PRESET_DAYS[controls.range], new Date())
-  // Every dimension is a column of the one tree, so it is always the hierarchy.
-  const filter: AuditFilter = { ...days, repos: controls.repos, groupBy: 'hierarchy' }
+  const filter: AuditFilter = { ...days, repos: controls.repos }
   const main = useAudit(filter, !hidden, version)
   const perf = usePerformance(filter, !hidden, version)
   const chart = useMemo(

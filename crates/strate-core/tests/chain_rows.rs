@@ -7,7 +7,7 @@
 use rusqlite::Connection;
 use strate_core::discovery::discover;
 use strate_core::store::Store;
-use strate_core::store::views::{self, AuditFilter, AuditNode, GroupBy, NodeKind, audit};
+use strate_core::store::views::{self, AuditFilter, AuditNode, NodeKind, audit};
 
 mod common;
 
@@ -34,7 +34,6 @@ fn tree(db: &Connection, from: &str, to: &str) -> AuditNode {
         from: from.into(),
         to: to.into(),
         repos: vec![],
-        group_by: GroupBy::Hierarchy,
     };
     audit(db, &filter).expect("audit").root
 }

@@ -81,7 +81,6 @@ describe('commands', () => {
       from: '2026-10-01',
       to: '2026-10-31',
       repos: ['demo'],
-      groupBy: 'agent_type',
     }
     const audit: Audit = {
       root: {
@@ -132,7 +131,6 @@ describe('commands', () => {
       from: '2026-10-01',
       to: '2026-10-31',
       repos: [],
-      groupBy: 'hierarchy',
     }
     const path: AuditPath = [
       ['repo', 'demo'],
@@ -159,7 +157,6 @@ describe('commands', () => {
       from: '2026-10-06',
       to: '2026-10-13',
       repos: ['perf'],
-      groupBy: 'hierarchy',
     }
     const tokens = { input: 2000, output: 200, cacheRead: 20000, cacheWrite: 0 }
     const performance: Performance = {

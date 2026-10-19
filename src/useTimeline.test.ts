@@ -11,7 +11,6 @@ const filter: AuditFilter = {
   from: '2026-10-07',
   to: '2026-10-13',
   repos: [],
-  groupBy: 'hierarchy',
 }
 const repo: AuditPath = [['repo', 'acme/web']]
 const issue: AuditPath = [
