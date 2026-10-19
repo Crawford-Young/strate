@@ -154,8 +154,9 @@ at $E2 /work/demo-repo/packages/core feat/9-lorem -
 K=fixtures/cost-home
 K1=5e55f0f0-0000-4000-8000-0000000000f1
 K2=5e55f0f0-0000-4000-8000-0000000000f2
+K3=5e55f0f0-0000-4000-8000-0000000000f3
 rm -rf "$K"
-mkdir -p "$K/projects/-work-cost-repo/$K1/subagents" "$K/projects/-work-cost-other"
+mkdir -p "$K/projects/-work-cost-repo/$K1/subagents" "$K/projects/-work-cost-other" "$K/projects/-work-cost-long"
 TEXT='{"type":"text","text":"Lorem."}'
 THINK='{"type":"thinking","thinking":"Lorem ipsum."}'
 kat() { # sessionId cwd sidechain-fields: the envelope of the records that follow
@@ -218,6 +219,15 @@ kat $K2 /work/cost-other '"isSidechain":false'
   kprompt 09:01:00 k-23
   kreply 09:01:02 k-24 req_d2 claude-haiku-4-5-20251001 "$(ku 8 2000 48000 22 2000 0)" "$TEXT"
 } > "$K/projects/-work-cost-other/$K2.jsonl"
+# K3, 08:00:00..08:01:04: claude-haiku-5-5 (longPrompt over 100000) with a
+# prompt of exactly 100000 (input + cache read + 5m + 1h: base rates), then
+# 100001 (long-prompt rates).
+kat $K3 /work/cost-long '"isSidechain":false'
+{ kprompt 08:00:00 k-31
+  kreply 08:00:04 k-32 req_l1 claude-haiku-5-5 "$(ku 1000 9000 90000 100 9000 0)" "$TEXT"
+  kprompt 08:01:00 k-33
+  kreply 08:01:04 k-34 req_l2 claude-haiku-5-5 "$(ku 1001 9000 90000 100 9000 0)" "$TEXT"
+} > "$K/projects/-work-cost-long/$K3.jsonl"
 
 # ---- audit-home: audit rollups (#26); hand values in tests/audit_rollup.rs ----
 # Repo demo (gh JSON: github/audit-home.json): epic #8 over #9 (closed) and #10;

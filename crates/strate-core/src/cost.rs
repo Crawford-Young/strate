@@ -1,8 +1,8 @@
 //! Cost accounting: a port of the cost half of claude-config's
-//! `scripts/audit-lib.mjs` (`priceFor`, `priceUsage`, `depthOf`) over a
-//! byte-for-byte copy of its `prices.json` (`data/prices.json`, checked
-//! against upstream in CI), plus strate's context-window table
-//! (`data/context-windows.json`).
+//! `scripts/audit-lib.mjs` (`priceFor`, `priceUsage` with its `longPrompt`
+//! tier, `depthOf`) over a byte-for-byte copy of its `prices.json`
+//! (`data/prices.json`, checked against upstream in CI), plus strate's
+//! context-window table (`data/context-windows.json`).
 //!
 //! Every request is priced on its own; deduplication (one row per
 //! `requestId`, the record with the most output) is the store's job.
@@ -20,14 +20,31 @@ const MTOK: f64 = 1e6;
 /// interrupted turn, an API error). It is never priced or attributed.
 pub const SYNTHETIC: &str = "<synthetic>";
 
-/// $ per million tokens for one model.
+/// $ per million tokens, per token class.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ModelPrice {
+pub struct Rates {
     pub input: f64,
     pub output: f64,
     pub cache_write_5m: f64,
     pub cache_write_1h: f64,
     pub cache_read: f64,
+}
+
+/// One model's prices: its base rates, and the tier that replaces them
+/// for a request whose prompt is over `over` tokens (`longPrompt`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelPrice {
+    pub base: Rates,
+    pub long_prompt: Option<LongPrompt>,
+}
+
+/// A model's `longPrompt` tier.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LongPrompt {
+    /// Prompt tokens a request must be strictly over to get these rates.
+    pub over: f64,
+    /// The base rates with the tier's own spread over them.
+    pub rates: Rates,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,21 +123,39 @@ pub(crate) fn truthy(v: &Value) -> bool {
 impl Prices {
     fn parse(json: &str) -> Option<Self> {
         let json: Value = serde_json::from_str(json).ok()?;
+        // A model's `exception` (a price Claude Code charges that differs
+        // from the published one) is never read: it feeds only audit.mjs's
+        // cost-state price check, which strate does not run, so strate
+        // prices every request at the published rates.
         let models = json["models"]
             .as_object()?
             .iter()
             .map(|(id, p)| {
                 let rate = |key: &str| p[key].as_f64();
-                Some((
-                    id.clone(),
-                    ModelPrice {
-                        input: rate("input")?,
-                        output: rate("output")?,
-                        cache_write_5m: rate("cacheWrite5m")?,
-                        cache_write_1h: rate("cacheWrite1h")?,
-                        cache_read: rate("cacheRead")?,
-                    },
-                ))
+                let base = Rates {
+                    input: rate("input")?,
+                    output: rate("output")?,
+                    cache_write_5m: rate("cacheWrite5m")?,
+                    cache_write_1h: rate("cacheWrite1h")?,
+                    cache_read: rate("cacheRead")?,
+                };
+                // `{ ...base, ...longRates }`: a rate the tier omits stays
+                // at base, and a tier without `over` never applies.
+                let tier = &p["longPrompt"];
+                let long_prompt = tier["over"].as_f64().map(|over| {
+                    let rate = |key: &str, base: f64| tier[key].as_f64().unwrap_or(base);
+                    LongPrompt {
+                        over,
+                        rates: Rates {
+                            input: rate("input", base.input),
+                            output: rate("output", base.output),
+                            cache_write_5m: rate("cacheWrite5m", base.cache_write_5m),
+                            cache_write_1h: rate("cacheWrite1h", base.cache_write_1h),
+                            cache_read: rate("cacheRead", base.cache_read),
+                        },
+                    }
+                });
+                Some((id.clone(), ModelPrice { base, long_prompt }))
             })
             .collect::<Option<_>>()?;
         Some(Self {
@@ -135,10 +170,11 @@ impl Prices {
     }
 
     /// `priceUsage`: one request's $, `None` when its model is unpriced
-    /// (never folded in as $0). Same operation order as audit-lib, so a
-    /// request's $ matches it bit for bit.
+    /// (never folded in as $0), at the long-prompt rates when its prompt is
+    /// over the model's `longPrompt.over`. Same operation order as
+    /// audit-lib, so a request's $ matches it bit for bit.
     pub fn price(&self, usage: &Usage, model: &str) -> Option<f64> {
-        let p = self.model(model)?;
+        let p = self.model(model)?.rates_for(usage);
         Some(
             (usage.input as f64 * p.input
                 + usage.output as f64 * p.output
@@ -148,6 +184,17 @@ impl Prices {
                 / MTOK
                 + usage.web_search_requests as f64 * self.web_search_per_1k / 1000.0,
         )
+    }
+}
+
+impl ModelPrice {
+    /// The long-prompt rates for a request whose prompt is strictly over
+    /// the tier's `over`, else the base rates.
+    fn rates_for(&self, usage: &Usage) -> &Rates {
+        match &self.long_prompt {
+            Some(tier) if usage.prompt() as f64 > tier.over => &tier.rates,
+            _ => &self.base,
+        }
     }
 }
 
@@ -183,6 +230,13 @@ impl Usage {
     pub fn depth(&self) -> u64 {
         self.input + self.cache_read + self.cache_creation
     }
+
+    /// The prompt audit-lib's `longPrompt` threshold reads: input + cache
+    /// read + the two priced write tiers (not the write total, which a
+    /// tier split may not sum to).
+    fn prompt(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write_5m + self.cache_write_1h
+    }
 }
 
 #[cfg(test)]
@@ -195,12 +249,15 @@ mod tests {
         let p = prices();
         let haiku = p.model("claude-haiku-4-5").expect("haiku");
         assert_eq!(p.model("claude-haiku-4-5-20251001"), Some(haiku));
-        assert_eq!(haiku.input, 1.0);
+        assert_eq!(haiku.base.input, 1.0);
         // Not 8 digits after the base id: no match.
         assert_eq!(p.model("claude-haiku-4-5-2025"), None);
         assert_eq!(p.model("claude-haiku-4-5-preview"), None);
         // claude-opus-5-5 is its own entry, not a snapshot of claude-opus-5.
-        assert_eq!(p.model("claude-opus-5-5").expect("opus 5.5").input, 4.0);
+        assert_eq!(
+            p.model("claude-opus-5-5").expect("opus 5.5").base.input,
+            4.0
+        );
         assert_eq!(p.model("claude-lorem-1"), None);
         assert_eq!(p.model(SYNTHETIC), None);
         let usage = Usage {
@@ -260,6 +317,97 @@ mod tests {
         // (20*2 + 30*10 + 30000*0.2 + 400*2.5) / 1e6 = 7340 / 1e6
         let usd = prices().price(&usage, "claude-sonnet-5").expect("priced");
         assert!((usd - 0.00734).abs() < 1e-12, "{usd}");
+    }
+
+    /// A Haiku 5.5 request whose prompt (input + cache read + both write
+    /// tiers) is `input` + 90000 + 9000 + 0 tokens, and 100 output.
+    fn haiku_5_5(input: u64) -> Usage {
+        Usage::from_json(&json!({
+            "input_tokens": input,
+            "cache_creation_input_tokens": 9000,
+            "cache_read_input_tokens": 90000,
+            "output_tokens": 100,
+            "cache_creation": {"ephemeral_5m_input_tokens": 9000, "ephemeral_1h_input_tokens": 0}
+        }))
+    }
+
+    #[test]
+    fn a_prompt_over_the_long_prompt_threshold_is_priced_at_the_long_prompt_rates() {
+        let p = prices();
+        // claude-haiku-5-5, base ($/MTok: input 0.1, output 0.5, read 0.01,
+        // 5m 0.125), over 100000 prompt tokens: input 0.5, output 2.5,
+        // read 0.05, 5m 0.625. At exactly 100000 the base rates hold:
+        // (1000*0.1 + 100*0.5 + 90000*0.01 + 9000*0.125) / 1e6 = 2175 / 1e6
+        let at = p
+            .price(&haiku_5_5(1000), "claude-haiku-5-5")
+            .expect("priced");
+        assert!((at - 0.002175).abs() < 1e-12, "{at}");
+        // 100001 is over: every token class at the long-prompt rate.
+        // (1001*0.5 + 100*2.5 + 90000*0.05 + 9000*0.625) / 1e6 = 10875.5 / 1e6
+        let over = p
+            .price(&haiku_5_5(1001), "claude-haiku-5-5")
+            .expect("priced");
+        assert!((over - 0.0108755).abs() < 1e-12, "{over}");
+        // A dated snapshot gets its base id's tier too.
+        let snapshot = p.price(&haiku_5_5(1001), "claude-haiku-5-5-20261001");
+        assert_eq!(snapshot, Some(over));
+    }
+
+    #[test]
+    fn the_long_prompt_threshold_counts_the_priced_write_tiers_not_the_write_total() {
+        // audit-lib's prompt is input + cache read + 5m + 1h: a tier split
+        // under the total (100 unsplit) leaves this one at 99901, not over.
+        let usage = Usage::from_json(&json!({
+            "input_tokens": 1001,
+            "cache_creation_input_tokens": 9000,
+            "cache_read_input_tokens": 90000,
+            "cache_creation": {"ephemeral_5m_input_tokens": 8900, "ephemeral_1h_input_tokens": 0}
+        }));
+        assert_eq!(usage.depth(), 100_001);
+        // (1001*0.1 + 90000*0.01 + 8900*0.125) / 1e6 = 2112.6 / 1e6
+        let usd = prices().price(&usage, "claude-haiku-5-5").expect("priced");
+        assert!((usd - 0.0021126).abs() < 1e-12, "{usd}");
+    }
+
+    #[test]
+    fn a_long_prompt_tier_replaces_only_the_rates_it_names() {
+        // audit-lib spreads the tier over the base rates: a rate the tier
+        // omits stays at base, and a tier without `over` never applies.
+        let p = Prices::parse(
+            r#"{"models": {
+                "claude-lorem-1": {"input": 1, "output": 2, "cacheWrite5m": 3, "cacheWrite1h": 4,
+                    "cacheRead": 5, "longPrompt": {"over": 10, "input": 100}},
+                "claude-lorem-2": {"input": 1, "output": 2, "cacheWrite5m": 3, "cacheWrite1h": 4,
+                    "cacheRead": 5, "longPrompt": {"input": 100}}
+            }}"#,
+        )
+        .expect("parses");
+        let usage = Usage {
+            input: 11,
+            output: 1,
+            ..Usage::default()
+        };
+        // (11*100 + 1*2) / 1e6
+        assert_eq!(p.price(&usage, "claude-lorem-1"), Some(1102.0 / MTOK));
+        // (11*1 + 1*2) / 1e6
+        assert_eq!(p.price(&usage, "claude-lorem-2"), Some(13.0 / MTOK));
+    }
+
+    #[test]
+    fn sonnet_5_5_is_priced_at_its_published_cache_read_not_its_exception() {
+        // prices.json's Sonnet 5.5 `exception` (cacheRead 0.2, what older
+        // Claude Code charged) feeds only audit.mjs's cost-state check.
+        let usage = Usage {
+            cache_read: 1_000_000,
+            ..Usage::default()
+        };
+        let usd = prices().price(&usage, "claude-sonnet-5-5").expect("priced");
+        assert!((usd - 0.1).abs() < 1e-12, "{usd}");
+        let table: Value = serde_json::from_str(PRICES_JSON).expect("json");
+        assert_eq!(
+            table["models"]["claude-sonnet-5-5"]["exception"]["price"]["cacheRead"],
+            0.2
+        );
     }
 
     #[test]
