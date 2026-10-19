@@ -1,5 +1,7 @@
 [install]
 minimumReleaseAge = 86400
+# Our own package, published from component-library's CI with provenance.
+minimumReleaseAgeExcludes = ["@crawfordyoung/ui"]
 
 [run]
 bun = true
