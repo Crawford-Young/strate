@@ -553,6 +553,40 @@ mod tests {
     }
 
     #[test]
+    fn a_v18_teammate_typed_by_its_name_reads_teammate_after_upgrade() {
+        // A build before #86 stored each teammate's name as its type. One
+        // whose meta.json is gone is never rescanned, so the upgrade itself
+        // retypes it; a typed teammate and a subagent are left alone.
+        let dir = test_dir("store-v18-teammate-type");
+        let db = dir.join("strate.db");
+        let mut v18 = Connection::open(&db).expect("v18 db");
+        migrate::migrate(&mut v18, &migrate::MIGRATIONS[..18]).expect("v18");
+        v18.execute_batch(
+            "INSERT INTO sessions (session_id, path) VALUES ('s1', '/p/s1.jsonl');
+             INSERT INTO agents (session_id, agent_id, kind, name, agent_type) VALUES
+                 ('s1', 'a1', 'teammate', 'lorem-mate', 'lorem-mate'),
+                 ('s1', 'a2', 'teammate', 'ipsum-mate', 'reviewer'),
+                 ('s1', 'a3', 'subagent', 'recon', 'recon');",
+        )
+        .expect("v18 rows");
+        drop(v18);
+
+        let store = Store::open_in(&db, "UTC").expect("upgrade");
+        let types: Vec<(String, String)> = store
+            .conn
+            .prepare("SELECT agent_id, agent_type FROM agents ORDER BY agent_id")
+            .expect("types")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("rows")
+            .collect::<Result<_>>()
+            .expect("types");
+        let want = [("a1", "teammate"), ("a2", "reviewer"), ("a3", "recon")];
+        assert_eq!(types, want.map(|(a, t)| (a.to_string(), t.to_string())));
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
     fn the_writer_runs_wal_with_synchronous_normal_and_foreign_keys() {
         let dir = test_dir("store-pragmas");
         let store = Store::open(dir.join("strate.db")).expect("open");

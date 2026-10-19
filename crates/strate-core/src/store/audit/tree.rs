@@ -21,20 +21,13 @@ pub(crate) fn tree(group_by: GroupBy, cells: &Cells, gh: &Gh) -> AuditNode {
     root.finish().0
 }
 
-/// `cell`'s agent type: `orchestrator`, `teammate`, or its subagent's type
-/// when known.
+/// `cell`'s agent type: `orchestrator`, or its subagent's or teammate's
+/// stored type when known.
 fn agent_type<'a>(cell: &'a Cell, cells: &'a Cells) -> Option<&'a str> {
     let Some(id) = &cell.agent_id else {
         return Some("orchestrator");
     };
-    let agent = cells.agent(cell, id)?;
-    // Interim: a teammate's stored type is its own name (strate#86), one
-    // series per teammate, so every teammate reads as one type until the
-    // real type is stored.
-    if agent.teammate {
-        return Some("teammate");
-    }
-    agent.agent_type.as_deref()
+    cells.agent(cell, id)?.agent_type.as_deref()
 }
 
 /// A cell's key in each split; `""` where it has none.

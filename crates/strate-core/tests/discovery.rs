@@ -300,6 +300,9 @@ fn teammate_links_to_its_team_not_a_dispatch_edge() {
     );
     let meta = mate.meta.as_ref().expect("meta");
     assert_eq!(meta.name.as_deref(), Some("demo-reviewer"));
+    // A teammate's agentType is its name; its type is spawnedAgentType (#86).
+    assert_eq!(meta.agent_type.as_deref(), Some("demo-reviewer"));
+    assert_eq!(meta.spawned_agent_type.as_deref(), Some("reviewer"));
     assert_eq!(meta.spawn_depth, Some(0));
     assert_eq!(meta.tool_use_id, None);
 }

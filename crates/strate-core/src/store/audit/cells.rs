@@ -836,8 +836,6 @@ fn linked_pr(prs: &[GhPr], links: &[PrLink], repo: &str) -> Option<i64> {
 pub(crate) struct Agent {
     pub(crate) label: String,
     pub(crate) agent_type: Option<String>,
-    /// A teammate (`agents.kind`), not a dispatched subagent.
-    pub(crate) teammate: bool,
     pub(crate) run_ms: Option<i64>,
 }
 
@@ -851,8 +849,7 @@ impl Agent {
     ) -> Result<HashMap<(String, String), Self>> {
         conn.prepare_cached(
             "SELECT session_id, agent_id,
-                 coalesce(name, description, agent_type), agent_type, run_ms,
-                 kind = 'teammate'
+                 coalesce(name, description, agent_type), agent_type, run_ms
              FROM agents
              WHERE agent_id IS NOT NULL AND session_id IN (
                  SELECT session_id FROM audit_cells
@@ -867,7 +864,6 @@ impl Agent {
                     label: r.get::<_, Option<String>>(2)?.unwrap_or(agent_id),
                     agent_type: r.get(3)?,
                     run_ms: r.get(4)?,
-                    teammate: r.get(5)?,
                 },
             ))
         })?
@@ -880,7 +876,6 @@ impl Agent {
             label: agent_id.to_string(),
             agent_type: None,
             run_ms: None,
-            teammate: false,
         }
     }
 }

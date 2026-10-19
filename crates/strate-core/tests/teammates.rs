@@ -13,7 +13,7 @@ use strate_core::discovery::discover;
 use strate_core::hooks::{Hook, HookEvent};
 use strate_core::registry::{RegistryEvent, parse_snapshot};
 use strate_core::store::Store;
-use strate_core::store::views::{self, AgentState};
+use strate_core::store::views::{self, AgentState, AuditFilter, GroupBy};
 use strate_core::tail::Batch;
 use strate_core::time::parse_timestamp;
 
@@ -127,6 +127,59 @@ fn working(names: &[&str]) -> Vec<(String, AgentState)> {
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+#[test]
+fn a_teammate_is_typed_as_it_was_spawned_else_teammate() {
+    // spawnedAgentType, else customAgentType; neither: `teammate` (#86).
+    let t = Temp::new("teammate-types");
+    let (_store, db) = build(&t, cold());
+    let types: Vec<(String, String)> = db
+        .prepare("SELECT name, agent_type FROM agents WHERE kind = 'teammate' ORDER BY agent_id")
+        .expect("prepare")
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .expect("query")
+        .map(|r| r.expect("row"))
+        .collect();
+    let pair = |n: &str, ty: &str| (n.to_string(), ty.to_string());
+    assert_eq!(
+        types,
+        [
+            pair("lorem-mate", "implementer"),
+            pair("ipsum-mate", "general-purpose"),
+            pair("dolor-mate", "reviewer"),
+            pair("amet-mate", "teammate"),
+        ]
+    );
+}
+
+#[test]
+fn the_performance_agents_table_shows_teammates_by_their_spawned_type() {
+    let t = Temp::new("teammate-performance");
+    let (_store, db) = build(&t, cold());
+    let filter = AuditFilter {
+        from: "2026-10-09".into(),
+        to: "2026-10-09".into(),
+        repos: vec![],
+        group_by: GroupBy::Hierarchy,
+    };
+    let p = views::performance(&db, &filter).expect("performance");
+    let mut rows: Vec<(&str, bool, i64)> = p
+        .agents
+        .iter()
+        .map(|a| (a.agent_type.as_str(), a.orchestrator, a.dispatches))
+        .collect();
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        [
+            ("general-purpose", false, 1),
+            ("implementer", false, 1),
+            ("orchestrator", true, 0),
+            ("reviewer", false, 1),
+            ("teammate", false, 1),
+        ]
+    );
 }
 
 #[test]

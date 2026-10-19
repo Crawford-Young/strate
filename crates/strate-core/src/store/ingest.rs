@@ -389,6 +389,17 @@ pub(super) fn graph(conn: &Connection, g: &Graph) -> Result<()> {
             Some(&path),
         )?;
         let meta = sub.meta.clone().unwrap_or_default();
+        // A teammate's meta `agentType` is its name, so it takes the type it
+        // was spawned as, else `teammate` (#86). Every scan rewrites it, so a
+        // store whose teammates were typed by name is corrected on the next
+        // (migration 0019 retypes those whose meta is gone).
+        let agent_type = match sub.link {
+            Link::Teammate { .. } => Some(
+                meta.spawned_agent_type
+                    .unwrap_or_else(|| "teammate".to_string()),
+            ),
+            _ => meta.agent_type,
+        };
         conn.prepare_cached(
             "UPDATE agents SET kind = ?2, agent_type = coalesce(?3, agent_type),
                  description = coalesce(?4, description), spawn_depth = coalesce(?5, spawn_depth),
@@ -399,7 +410,7 @@ pub(super) fn graph(conn: &Connection, g: &Graph) -> Result<()> {
         .execute(params![
             id,
             kind,
-            meta.agent_type,
+            agent_type,
             meta.description,
             meta.spawn_depth.map(|d| d as i64),
             meta.team_name,

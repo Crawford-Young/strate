@@ -56,8 +56,9 @@ echo '{"agentType":"Explore","description":"Sit amet task","requestNonInteractiv
 # a1000000000000004: orphan jsonl, no meta
 # key set: minimal, toolUseId unresolvable
 echo '{"agentType":"general-purpose","description":"Consectetur task","spawnDepth":1,"toolUseId":"toolu_01ZZZZZZZZZZZZZZZZZZZZZZ"}' > "$DA/agent-a1000000000000005.meta.json"
-# key set: teammate
-echo '{"agentType":"reviewer","color":"blue","description":"Adipiscing task","model":"claude-sonnet-5","name":"demo-reviewer","permissionMode":"default","planModeRequired":false,"requestNonInteractive":false,"requestShape":"teammate","spawnDepth":0,"taskKind":"lorem","teamName":"demo-team"}' > "$DA/agent-a1000000000000006.meta.json"
+# key set: teammate. Its agentType is its name; the type it was spawned as is
+# spawnedAgentType, and customAgentType when that type is a custom agent (#86).
+echo '{"agentType":"demo-reviewer","color":"blue","customAgentType":"reviewer","description":"Adipiscing task","model":"claude-sonnet-5","name":"demo-reviewer","permissionMode":"default","planModeRequired":false,"requestNonInteractive":false,"requestShape":"teammate","spawnDepth":0,"spawnedAgentType":"reviewer","taskKind":"in_process_teammate","teamName":"demo-team"}' > "$DA/agent-a1000000000000006.meta.json"
 
 ENV_B="\"isSidechain\":false,\"timestamp\":\"2026-09-20T09:00:00.000Z\",\"userType\":\"external\",\"entrypoint\":\"cli\",\"cwd\":\"/work/.worktrees/demo-repo-7\",\"sessionId\":\"$SB\",\"version\":\"2.1.263\",\"gitBranch\":\"feat/7-lorem\""
 {
@@ -728,13 +729,18 @@ aat $TL /work/team-repo '"isSidechain":false'
   areply $TT:07:00 tl-05 req_tl-05 $OPUS "$UO" "$(ktool toolu_tl-05 SendMessage '{"to":"ipsum-mate","message":"Lorem ipsum.","summary":"Lorem"}')"
   tnotice $TT:09:00 tl-06 "[{\"type\":\"text\",\"text\":\"$(tmsg amet-mate '' "$(tidle amet-mate 03:00.020)")\"}]"
 } > "$TP/$TL.jsonl"
-tmate() { # agentId name: a teammate's meta
-  echo "{\"agentType\":\"general-purpose\",\"description\":\"Lorem task\",\"name\":\"$2\",\"spawnDepth\":0,\"requestShape\":\"teammate\",\"requestNonInteractive\":false,\"model\":\"$SONNET\",\"teamName\":\"team-lorem\",\"color\":\"blue\"}" > "$TP/$TL/subagents/agent-$1.meta.json"
+tmate() { # agentId name [type keys]: a teammate's meta, its agentType its name (#86)
+  echo "{\"agentType\":\"$2\",\"description\":\"Lorem task\",\"name\":\"$2\",\"spawnDepth\":0,\"requestShape\":\"teammate\",\"requestNonInteractive\":false,\"model\":\"$SONNET\",\"teamName\":\"team-lorem\",\"color\":\"blue\",\"taskKind\":\"in_process_teammate\"${3:+,$3}}" > "$TP/$TL/subagents/agent-$1.meta.json"
 }
 tturn() { # start end uuid-prefix: a teammate's prompt at `start`, its reply at `end`
   atask "$TT:$1" "$3-1"; areply "$TT:$2" "$3-2" "req_$3-2" $SONNET "$US" "$TEXT"
 }
-for m in 1:lorem-mate 2:ipsum-mate 3:dolor-mate 4:amet-mate; do tmate "a700000000000000${m%%:*}" "${m#*:}"; done
+# Their types: lorem-mate both keys, ipsum-mate a built-in type (no
+# customAgentType), dolor-mate only customAgentType, amet-mate neither.
+tmate a7000000000000001 lorem-mate "\"customAgentType\":\"implementer\",\"spawnedAgentType\":\"implementer\""
+tmate a7000000000000002 ipsum-mate "\"spawnedAgentType\":\"general-purpose\""
+tmate a7000000000000003 dolor-mate "\"customAgentType\":\"reviewer\""
+tmate a7000000000000004 amet-mate
 aat $TL /work/team-repo '"isSidechain":true,"agentId":"a7000000000000001"'
 tturn 01:00 05:00 t1 > "$TP/$TL/subagents/agent-a7000000000000001.jsonl"
 aat $TL /work/team-repo '"isSidechain":true,"agentId":"a7000000000000002"'

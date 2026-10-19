@@ -779,6 +779,11 @@ fn fixture_ingest_produces_the_expected_sessions_agents_and_edges() {
         Some("demo-reviewer")
     );
     assert_eq!(
+        agent_text(&conn, SA, Some("a1000000000000006"), "agent_type").as_deref(),
+        Some("reviewer"),
+        "a teammate's type is the type it was spawned as, not its name (#86)"
+    );
+    assert_eq!(
         agent_text(&conn, SA, Some("a1000000000000005"), "unresolved").as_deref(),
         Some("tool_use_not_found")
     );
@@ -956,6 +961,36 @@ fn re_ingesting_the_fixture_is_idempotent() {
     store.ingest_graph(&graph).expect("graph again");
     tail_all(&root, Offsets::new(), |b| store.ingest(b).expect("replay"));
     assert_eq!(counts(&conn), first);
+}
+
+#[test]
+fn a_teammate_typed_by_its_name_takes_its_spawned_type_on_the_next_scan() {
+    // A store from before #86 holds each teammate's name as its type;
+    // discovery runs on every start, so the next scan corrects it.
+    let tmp = Temp::new("teammate-type-rescan");
+    let root = fixture(&tmp);
+    let mut store = Store::open(tmp.db()).expect("open");
+    ingest_root(&mut store, &root);
+    Connection::open(tmp.db())
+        .expect("writer")
+        .execute(
+            "UPDATE agents SET agent_type = name WHERE kind = 'teammate'",
+            [],
+        )
+        .expect("an older build's type");
+    let conn = reader(&tmp.db());
+    let mate = Some("a1000000000000006");
+    assert_eq!(
+        agent_text(&conn, SA, mate, "agent_type").as_deref(),
+        Some("demo-reviewer")
+    );
+    store
+        .ingest_graph(&discover(&root).expect("discover"))
+        .expect("scan");
+    assert_eq!(
+        agent_text(&conn, SA, mate, "agent_type").as_deref(),
+        Some("reviewer")
+    );
 }
 
 #[test]
