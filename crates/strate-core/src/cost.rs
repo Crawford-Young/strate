@@ -13,6 +13,13 @@ use serde_json::Value;
 
 /// The vendored price list, verbatim.
 pub const PRICES_JSON: &str = include_str!("../data/prices.json");
+/// The version of strate's pricing logic (how `price` turns usage and
+/// [`PRICES_JSON`] into $), stored beside the price list as meta
+/// `pricing_logic`. Bump it on ANY change to the pricing code in this
+/// module (a tier, a rounding, a rate lookup) that prices a record
+/// differently: a store accounted under an older value re-prices every
+/// stored event once on its next open. A `prices.json` change needs no bump.
+pub const PRICING_LOGIC_VERSION: &str = "1";
 const WINDOWS_JSON: &str = include_str!("../data/context-windows.json");
 const MTOK: f64 = 1e6;
 
