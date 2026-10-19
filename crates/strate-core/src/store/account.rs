@@ -253,13 +253,14 @@ fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
 const ROLLUP_VERSION: &str = "4";
 
 /// Recomputes every rollup and audit cell unless the store was last
-/// accounted at the vendored prices, in `zone` (an IANA name) and at
-/// [`ROLLUP_VERSION`]. A new price list or rollup version also re-reads
-/// every event's accounting fields from `raw` and rebuilds `directs` from
-/// them. A store from before v3 (no prices) or v6 (no zone) is filled here
-/// too.
+/// accounted at the vendored prices, at [`cost::PRICING_LOGIC_VERSION`], in
+/// `zone` (an IANA name) and at [`ROLLUP_VERSION`]. A new price list,
+/// pricing-logic version or rollup version also re-reads every event's
+/// accounting fields from `raw` and rebuilds `directs` from them. A store
+/// from before v3 (no prices) or v6 (no zone) is filled here too.
 pub(super) fn refresh(conn: &Connection, zone: &str) -> Result<()> {
-    let repriced = meta(conn, "prices")?.as_deref() != Some(cost::PRICES_JSON);
+    let repriced = meta(conn, "prices")?.as_deref() != Some(cost::PRICES_JSON)
+        || meta(conn, "pricing_logic")?.as_deref() != Some(cost::PRICING_LOGIC_VERSION);
     let rezoned = meta(conn, "tz")?.as_deref() != Some(zone);
     let reversioned = meta(conn, "rollup")?.as_deref() != Some(ROLLUP_VERSION);
     if !repriced && !rezoned && !reversioned {
@@ -276,6 +277,7 @@ pub(super) fn refresh(conn: &Connection, zone: &str) -> Result<()> {
         .collect::<Result<_>>()?;
     rollup(conn, ids.iter().map(String::as_str))?;
     set_meta(conn, "rollup", ROLLUP_VERSION)?;
+    set_meta(conn, "pricing_logic", cost::PRICING_LOGIC_VERSION)?;
     set_meta(conn, "prices", cost::PRICES_JSON)
 }
 
