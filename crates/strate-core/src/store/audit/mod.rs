@@ -165,8 +165,8 @@ pub struct Metrics {
     pub progress: Option<Progress>,
     /// By local day.
     pub by_day: Vec<Slice>,
-    /// By agent type: `orchestrator`, `teammate`, a subagent's type, or
-    /// `""` (unknown).
+    /// By agent type: `orchestrator`, a subagent's or teammate's type
+    /// (`teammate` for one spawned with none recorded), or `""` (unknown).
     pub by_agent_type: Vec<Slice>,
     /// By model (`""`: a cell with no requests).
     pub by_model: Vec<Slice>,

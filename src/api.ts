@@ -142,7 +142,7 @@ export interface Metrics {
   progress: Progress | null
   /** By local day. */
   byDay: Slice[]
-  /** By agent type: `orchestrator`, `teammate`, a subagent's type, or `''` (unknown). */
+  /** By agent type: `orchestrator`, a subagent's or teammate's type (`teammate` when none is recorded), or `''` (unknown). */
   byAgentType: Slice[]
   /** By model (`''`: a cell with no requests). */
   byModel: Slice[]

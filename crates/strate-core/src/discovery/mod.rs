@@ -65,7 +65,11 @@ pub struct SubagentNode {
 /// and teammates. Absent stays `None`; nothing is inherited or guessed.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct SubagentMeta {
+    /// `agentType`: a dispatched subagent's type, but a teammate's name.
     pub agent_type: Option<String>,
+    /// The type a teammate was spawned as: `spawnedAgentType`, else
+    /// `customAgentType`, which only a custom agent type sets (#86).
+    pub spawned_agent_type: Option<String>,
     pub description: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,

@@ -239,6 +239,7 @@ fn read_meta(
     let text = |key: &str| map.get(key).and_then(Value::as_str).map(str::to_string);
     Some(SubagentMeta {
         agent_type: text("agentType"),
+        spawned_agent_type: text("spawnedAgentType").or_else(|| text("customAgentType")),
         description: text("description"),
         model: text("model"),
         effort: map.get("effort").and_then(scalar_text),

@@ -656,10 +656,10 @@ fn nodes(node: &AuditNode) -> usize {
 }
 
 #[test]
-fn teammates_split_as_one_teammate_type() {
-    // teams-home: a lead and four teammates, typed `general-purpose` in
-    // their meta (a real store holds each one's name there, strate#86);
-    // the splits and the group-by read them all as `teammate`.
+fn teammates_split_by_the_type_they_were_spawned_as() {
+    // teams-home: a lead and four teammates, each meta's agentType its name.
+    // Each splits under its spawned type (spawnedAgentType, else
+    // customAgentType), and the one with neither under `teammate` (#86).
     let t = Temp::new("teammates");
     drop(build_without_gh(&t, "teams-home"));
     let db = Store::open_reader(t.db()).expect("reader");
@@ -668,15 +668,28 @@ fn teammates_split_as_one_teammate_type() {
     let root = day(GroupBy::Hierarchy).root;
     let types = split(&root.metrics, GroupBy::AgentType);
     let keys: Vec<_> = types.iter().map(|s| s.0).collect();
-    assert_eq!(keys, ["orchestrator", "teammate"]);
-    assert_eq!(types[1].2, root.metrics.agent_ms, "every teammate's wall");
+    let expected = [
+        "general-purpose",
+        "implementer",
+        "orchestrator",
+        "reviewer",
+        "teammate",
+    ];
+    assert_eq!(keys, expected);
+    let mates: i64 = types
+        .iter()
+        .filter(|s| s.0 != "orchestrator")
+        .map(|s| s.2)
+        .sum();
+    assert_eq!(mates, root.metrics.agent_ms, "every teammate's wall");
+    assert!(types.iter().all(|s| s.1 > 0.0), "each type has its $");
     let groups: Vec<_> = day(GroupBy::AgentType)
         .root
         .children
         .iter()
         .map(|c| c.key.clone())
         .collect();
-    assert_eq!(groups, ["orchestrator", "teammate"]);
+    assert_eq!(groups, expected);
 }
 
 #[test]
