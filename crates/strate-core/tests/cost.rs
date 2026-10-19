@@ -18,6 +18,7 @@ use strate_core::tail::{Batch, Checkpoint, FileIdentity, TailEvent};
 
 const K1: &str = "5e55f0f0-0000-4000-8000-0000000000f1";
 const K2: &str = "5e55f0f0-0000-4000-8000-0000000000f2";
+const K3: &str = "5e55f0f0-0000-4000-8000-0000000000f3";
 const SUB: &str = "a4000000000000001";
 
 mod common;
@@ -336,6 +337,27 @@ fn unpriced_requests_are_counted_never_priced_and_synthetic_is_neither() {
 }
 
 #[test]
+fn a_prompt_over_the_long_prompt_threshold_is_stored_at_the_long_prompt_rates() {
+    let t = Temp::new("long-prompt");
+    let db = cold(&t);
+    let usd = |key: &str| -> f64 {
+        db.query_row(
+            "SELECT cost_usd FROM requests WHERE request_key = ?1",
+            [key],
+            |r| r.get(0),
+        )
+        .expect(key)
+    };
+    // claude-haiku-5-5, prompt 1000 + 90000 + 9000 = 100000, not over:
+    // (1000*0.1 + 100*0.5 + 90000*0.01 + 9000*0.125) / 1e6
+    assert!((usd("req_l1") - 0.002175).abs() < 1e-12);
+    // 100001, over: (1001*0.5 + 100*2.5 + 90000*0.05 + 9000*0.625) / 1e6
+    assert!((usd("req_l2") - 0.0108755).abs() < 1e-12);
+    let k3: f64 = session_row(&db, "cost_usd", K3);
+    assert!((k3 - 0.0130505).abs() < 1e-12, "{k3}");
+}
+
+#[test]
 fn workstream_cost_is_queryable_through_event_workstreams() {
     let t = Temp::new("workstream");
     let db = cold(&t);
@@ -352,13 +374,21 @@ fn workstream_cost_is_queryable_through_event_workstreams() {
     let names: Vec<(&str, i64)> = rows.iter().map(|(n, _, u)| (n.as_str(), *u)).collect();
     assert_eq!(
         names,
-        vec![("/work/cost-other @ main", 1), ("cost-repo-14", 0)]
+        vec![
+            ("/work/cost-long @ main", 0),
+            ("/work/cost-other @ main", 1),
+            ("cost-repo-14", 0)
+        ]
     );
-    // The named workstream holds K1 and its subagent.
-    let k1: f64 = session_row(&db, "cost_usd", K1);
-    assert!((rows[1].1 - k1).abs() < 1e-12, "{} vs {k1}", rows[1].1);
-    let k2: f64 = session_row(&db, "cost_usd", K2);
-    assert!((rows[0].1 - k2).abs() < 1e-12, "{} vs {k2}", rows[0].1);
+    // Each workstream holds one session; the named one, K1 and its subagent.
+    for (row, sid) in [(0, K3), (1, K2), (2, K1)] {
+        let usd: f64 = session_row(&db, "cost_usd", sid);
+        assert!(
+            (rows[row].1 - usd).abs() < 1e-12,
+            "{} vs {usd}",
+            rows[row].1
+        );
+    }
 }
 
 /// Every rollup, with $ to 9 places: sums over the same requests may add

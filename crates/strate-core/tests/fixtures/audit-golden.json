@@ -1,13 +1,13 @@
 {
-  "pricesVerified": "2026-10-08",
+  "pricesVerified": "2026-10-14",
   "totals": {
-    "requests": 9,
-    "usd": 0.491692,
+    "requests": 11,
+    "usd": 0.5047425000000001,
     "tokens": {
-      "input": 274,
-      "output": 304,
-      "cacheRead": 312000,
-      "cacheWrite5m": 3200,
+      "input": 2275,
+      "output": 504,
+      "cacheRead": 492000,
+      "cacheWrite5m": 21200,
       "cacheWrite1h": 50200
     }
   },
@@ -21,13 +21,19 @@
     {
       "sessionId": "5e55f0f0-0000-4000-8000-0000000000f1",
       "requests": 7,
-      "usd": 0.484274,
+      "usd": 0.48427400000000004,
       "subagentUsd": 0.00223
     },
     {
       "sessionId": "5e55f0f0-0000-4000-8000-0000000000f2",
       "requests": 2,
       "usd": 0.007418,
+      "subagentUsd": 0
+    },
+    {
+      "sessionId": "5e55f0f0-0000-4000-8000-0000000000f3",
+      "requests": 2,
+      "usd": 0.0130505,
       "subagentUsd": 0
     }
   ],
@@ -52,6 +58,16 @@
         "modelMs": 5000,
         "toolsMs": 0,
         "userMs": 57000,
+        "otherMs": 0
+      },
+      {
+        "sessionId": "5e55f0f0-0000-4000-8000-0000000000f3",
+        "wallMs": 64000,
+        "activeMs": 64000,
+        "idleMs": 0,
+        "modelMs": 8000,
+        "toolsMs": 0,
+        "userMs": 56000,
         "otherMs": 0
       }
     ],
