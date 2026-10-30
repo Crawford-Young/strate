@@ -5,7 +5,6 @@ import {
   PREFS_KEY,
   columnsLayout,
   loadPrefs,
-  rowsLayout,
   savePrefs,
   withLayout,
   type LayoutPrefs,
@@ -21,19 +20,11 @@ function memory(initial?: string) {
   }
 }
 
-const open: LayoutPrefs = {
-  harness: { open: true, size: 25 },
-  console: { open: true, size: 40 },
-  terminal: { open: true, size: 20 },
-}
+const open: LayoutPrefs = { console: { open: true, size: 40 } }
 
 describe('defaults', () => {
-  it('are Harness 30%, console 32%, terminal 35%, all closed', () => {
-    expect(DEFAULT_PREFS).toEqual({
-      harness: { open: false, size: 30 },
-      console: { open: false, size: 32 },
-      terminal: { open: false, size: 35 },
-    })
+  it('are the console closed at 32%', () => {
+    expect(DEFAULT_PREFS).toEqual({ console: { open: false, size: 32 } })
   })
 })
 
@@ -61,85 +52,89 @@ describe('loadPrefs', () => {
     expect(loadPrefs(memory('{not json'))).toEqual(DEFAULT_PREFS)
   })
 
-  it('keeps each valid panel and defaults the rest', () => {
-    const stored = JSON.stringify({
-      harness: { open: true, size: 22 },
-      console: { open: 'yes', size: 40 },
-      terminal: { open: true, size: 140 },
-    })
-    expect(loadPrefs(memory(stored))).toEqual({
-      ...DEFAULT_PREFS,
-      harness: { open: true, size: 22 },
-    })
-  })
-
-  it('defaults a panel saved below its minimum or past its room', () => {
-    const stored = JSON.stringify({
-      harness: { open: true, size: MIN_SIZE.harness - 1 },
-      console: { open: true, size: 30 },
-      terminal: { open: true, size: 100 - MIN_SIZE.main + 1 },
-    })
-    expect(loadPrefs(memory(stored))).toEqual({
-      ...DEFAULT_PREFS,
-      console: { open: true, size: 30 },
-    })
-  })
-
-  it('defaults everything when Harness and console would squeeze the canvas', () => {
-    const stored = JSON.stringify({
-      harness: { open: false, size: 45 },
-      console: { open: true, size: 100 - MIN_SIZE.canvas - 44 },
-      terminal: { open: true, size: 20 },
-    })
+  it('defaults a console that is not a valid pref', () => {
+    const stored = JSON.stringify({ console: { open: 'yes', size: 40 } })
     expect(loadPrefs(memory(stored))).toEqual(DEFAULT_PREFS)
   })
 
-  it('accepts Harness and console filling all but the canvas minimum', () => {
-    const fit = {
-      harness: { open: true, size: 40 },
-      console: { open: true, size: 100 - MIN_SIZE.canvas - 40 },
-      terminal: { open: false, size: 35 },
-    }
+  it('defaults a console saved below its minimum or past its room', () => {
+    const below = JSON.stringify({ console: { open: true, size: MIN_SIZE.console - 1 } })
+    const past = JSON.stringify({ console: { open: true, size: 100 - MIN_SIZE.canvas + 1 } })
+    expect(loadPrefs(memory(below))).toEqual(DEFAULT_PREFS)
+    expect(loadPrefs(memory(past))).toEqual(DEFAULT_PREFS)
+  })
+
+  it('accepts a console filling all but the canvas minimum', () => {
+    const fit = { console: { open: true, size: 100 - MIN_SIZE.canvas } }
     expect(loadPrefs(memory(JSON.stringify(fit)))).toEqual(fit)
   })
 
-  it('defaults panels stored as anything but an object', () => {
-    const stored = JSON.stringify({ harness: null, console: 5, terminal: 'open' })
-    expect(loadPrefs(memory(stored))).toEqual(DEFAULT_PREFS)
+  it('defaults a console stored as anything but an object', () => {
+    expect(loadPrefs(memory(JSON.stringify({ console: null })))).toEqual(DEFAULT_PREFS)
+    expect(loadPrefs(memory(JSON.stringify({ console: 5 })))).toEqual(DEFAULT_PREFS)
   })
 
   it('defaults everything when the stored value is not an object', () => {
     expect(loadPrefs(memory('null'))).toEqual(DEFAULT_PREFS)
     expect(loadPrefs(memory('[1]'))).toEqual(DEFAULT_PREFS)
   })
-})
 
-describe('default layouts', () => {
-  it('give closed panels no space', () => {
-    expect(columnsLayout(DEFAULT_PREFS)).toEqual({ harness: 0, canvas: 100, console: 0 })
-    expect(rowsLayout(DEFAULT_PREFS)).toEqual({ main: 100, terminal: 0 })
+  // Builds before #106 also saved the Harness and Terminal panels, which are gone.
+  it('restores the console from a layout saved with the old Harness and Terminal panels', () => {
+    const stored = JSON.stringify({
+      harness: { open: true, size: 45 },
+      console: { open: true, size: 40 },
+      terminal: { open: true, size: 20 },
+    })
+    expect(loadPrefs(memory(stored))).toEqual({ console: { open: true, size: 40 } })
   })
 
-  it('give open panels their saved size and the canvas the rest', () => {
-    expect(columnsLayout(open)).toEqual({ harness: 25, canvas: 35, console: 40 })
-    expect(rowsLayout(open)).toEqual({ main: 80, terminal: 20 })
+  it('ignores old Harness and Terminal entries that are garbage', () => {
+    const stored = JSON.stringify({
+      harness: 'open',
+      console: { open: false, size: 28 },
+      terminal: { open: true, size: 140 },
+    })
+    expect(loadPrefs(memory(stored))).toEqual({ console: { open: false, size: 28 } })
+  })
+
+  it('defaults a layout that only holds the old Harness and Terminal panels', () => {
+    const stored = JSON.stringify({
+      harness: { open: true, size: 30 },
+      terminal: { open: true, size: 35 },
+    })
+    expect(loadPrefs(memory(stored))).toEqual(DEFAULT_PREFS)
+  })
+})
+
+describe('columnsLayout', () => {
+  it('gives a closed console no space', () => {
+    expect(columnsLayout(DEFAULT_PREFS)).toEqual({ canvas: 100, console: 0 })
+  })
+
+  it('gives an open console its saved size and the canvas the rest', () => {
+    expect(columnsLayout(open)).toEqual({ canvas: 60, console: 40 })
   })
 })
 
 describe('withLayout', () => {
-  it('records the size of open panels and the open state', () => {
-    const next = withLayout(DEFAULT_PREFS, { harness: 28, canvas: 72, console: 0 })
-    expect(next.harness).toEqual({ open: true, size: 28 })
-    expect(next.console).toEqual({ open: false, size: 32 })
-    expect(next.terminal).toBe(DEFAULT_PREFS.terminal)
+  it('records the size of an open console and its open state', () => {
+    expect(withLayout(DEFAULT_PREFS, { canvas: 72, console: 28 })).toEqual({
+      console: { open: true, size: 28 },
+    })
   })
 
-  it('keeps the last open size when a panel collapses', () => {
-    const next = withLayout(open, { main: 100, terminal: 0 })
-    expect(next.terminal).toEqual({ open: false, size: 20 })
+  it('keeps the last open size when the console collapses', () => {
+    expect(withLayout(open, { canvas: 100, console: 0 })).toEqual({
+      console: { open: false, size: 40 },
+    })
   })
 
   it('returns the same prefs when nothing changed', () => {
-    expect(withLayout(open, { harness: 25, canvas: 35, console: 40 })).toBe(open)
+    expect(withLayout(open, { canvas: 60, console: 40 })).toBe(open)
+  })
+
+  it('ignores a layout that does not name the console', () => {
+    expect(withLayout(open, { canvas: 100 })).toBe(open)
   })
 })

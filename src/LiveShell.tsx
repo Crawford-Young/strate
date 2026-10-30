@@ -1,6 +1,6 @@
-// The live view: the header, then resizable panels (Harness left, canvas centre, console right,
-// terminal below). The console body is #19, Harness content #23, terminals Epic E. It stays mounted
-// while the Audit view shows, `hidden` instead, so its state survives the visit.
+// The live view: the header, then two resizable panels, the canvas centre and the console right.
+// The console opens when a node is selected; its body is #19. Audit is the only full-screen view:
+// while it shows, this view stays mounted, `hidden` instead, so its state survives the visit.
 import {
   Button,
   EmptyState,
@@ -15,7 +15,7 @@ import { liveGraph, needsYou, status, workstreams, type Workstream } from './api
 import { Canvas, agentName } from './Canvas'
 import { Header } from './Header'
 import { useLoad, useStoreVersion } from './hooks'
-import type { Layout } from './layout'
+import { MIN_SIZE, type Layout } from './layout'
 import { usePanels } from './usePanels'
 
 /** The tab and node the user picked; `tab` null means "none yet", so the first live tab shows. */
@@ -102,80 +102,58 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
         waits={waits}
         onGoToTab={pickTab}
         activeKey={activeKey}
-        prefs={panels.prefs}
-        onTogglePanel={panels.toggle}
         auditButtonRef={auditButtonRef}
         onOpenAudit={onOpenAudit}
       />
 
       <ResizablePanelGroup
-        id="strate-rows"
-        orientation="vertical"
-        defaultLayout={panels.rows}
+        id="strate-columns"
+        orientation="horizontal"
+        defaultLayout={panels.columns}
         onLayoutChanged={onLayout}
         className="min-h-0 flex-1"
       >
-        <ResizablePanel id="main" minSize="20%">
-          <ResizablePanelGroup
-            id="strate-columns"
-            orientation="horizontal"
-            defaultLayout={panels.columns}
-            onLayoutChanged={onLayout}
+        <ResizablePanel id="canvas" minSize={`${MIN_SIZE.canvas}%`}>
+          <main
+            ref={canvasRef}
+            tabIndex={-1}
+            className="relative h-full overflow-hidden bg-background outline-none"
           >
-            <ResizablePanel id="harness" panelRef={panels.refs.harness} collapsible minSize="15%">
-              {panels.prefs.harness.open && (
-                <aside aria-label="Harness" className="h-full overflow-auto">
-                  <EmptyState message="Harness arrives in #23." />
-                </aside>
-              )}
-            </ResizablePanel>
-            <ResizableHandle />
-            <ResizablePanel id="canvas" minSize="20%">
-              <main
-                ref={canvasRef}
-                tabIndex={-1}
-                className="relative h-full overflow-hidden bg-background outline-none"
-              >
-                <Canvas
-                  error={error}
-                  status={storeStatus}
-                  active={active}
-                  graph={graph}
-                  selected={agentId}
-                  onSelect={selectAgent}
-                />
-              </main>
-            </ResizablePanel>
-            <ResizableHandle />
-            <ResizablePanel id="console" panelRef={panels.refs.console} collapsible minSize="15%">
-              {panels.prefs.console.open && (
-                <aside aria-label="Console" className="flex h-full flex-col bg-surface">
-                  <div className="flex h-10 flex-none items-center gap-2 border-b border-border px-3">
-                    <h2 className="min-w-0 flex-1 truncate text-sm font-semibold">
-                      {selectedAgent ? agentName(selectedAgent) : 'Console'}
-                    </h2>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      aria-label="Close console"
-                      onClick={closeConsole}
-                      className="size-7"
-                    >
-                      <X aria-hidden className="size-4" />
-                    </Button>
-                  </div>
-                  <EmptyState message="The console arrives in #19." />
-                </aside>
-              )}
-            </ResizablePanel>
-          </ResizablePanelGroup>
+            <Canvas
+              error={error}
+              status={storeStatus}
+              active={active}
+              graph={graph}
+              selected={agentId}
+              onSelect={selectAgent}
+            />
+          </main>
         </ResizablePanel>
         <ResizableHandle />
-        <ResizablePanel id="terminal" panelRef={panels.refs.terminal} collapsible minSize="10%">
-          {panels.prefs.terminal.open && (
-            <section aria-label="Terminal" className="h-full overflow-auto bg-surface">
-              <EmptyState message="Terminal arrives in Epic E." />
-            </section>
+        <ResizablePanel
+          id="console"
+          panelRef={panels.refs.console}
+          collapsible
+          minSize={`${MIN_SIZE.console}%`}
+        >
+          {panels.prefs.console.open && (
+            <aside aria-label="Console" className="flex h-full flex-col bg-surface">
+              <div className="flex h-10 flex-none items-center gap-2 border-b border-border px-3">
+                <h2 className="min-w-0 flex-1 truncate text-sm font-semibold">
+                  {selectedAgent ? agentName(selectedAgent) : 'Console'}
+                </h2>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Close console"
+                  onClick={closeConsole}
+                  className="size-7"
+                >
+                  <X aria-hidden className="size-4" />
+                </Button>
+              </div>
+              <EmptyState message="The console arrives in #19." />
+            </aside>
           )}
         </ResizablePanel>
       </ResizablePanelGroup>

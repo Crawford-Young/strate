@@ -168,12 +168,6 @@ pub struct GraphAgent {
     pub context_tokens: Option<i64>,
     /// That depth over the model's window; `None` for an unknown window.
     pub context_pct: Option<f64>,
-    /// The context percentage at which the agent is nudged: its own gear,
-    /// else the orchestrator's, else the built-in 80.
-    pub nudge_pct: u8,
-    /// The context percentage at which the agent is stopped: its own gear,
-    /// else the orchestrator's, else the built-in 95.
-    pub hard_stop_pct: u8,
     /// The dispatching or team-lead agent, or for a unit's orchestrator the
     /// director's drawn orchestrator, when it is drawn too.
     pub parent: Option<i64>,
@@ -640,7 +634,6 @@ fn session_agents(
                  WHERE p.child = a.id AND p.kind IN ('dispatch', 'teammate')),
              (SELECT p.kind FROM edges AS p
                  WHERE p.child = a.id AND p.kind IN ('dispatch', 'teammate')),
-             ge.nudge_pct, ge.hard_stop_pct,
              CASE WHEN a.hook_state = 'idle' THEN a.hook_at_ms END,
              CASE WHEN a.kind = 'teammate' OR a.hook_state = 'idle' THEN
                  (SELECT CAST(round(max(unixepoch(e.timestamp, 'subsec')) * 1000) AS INTEGER)
@@ -649,7 +642,6 @@ fn session_agents(
                     AND e.type IN ('user', 'assistant'))
              END
          FROM agents AS a
-         JOIN gear_effective AS ge ON ge.agent = a.id
          LEFT JOIN segments AS g ON g.id = a.segment_id
          LEFT JOIN workstream_roots AS r ON r.id = g.workstream_id
          WHERE a.session_id = ?1
@@ -670,8 +662,8 @@ fn session_agents(
                     "teammate" => name.as_ref().and_then(|n| notices.get(n)).copied(),
                     _ => None,
                 };
-                let idle = notice.max(r.get(17)?);
-                let finished = r.get::<_, bool>(12)? || rests(idle, r.get(18)?);
+                let idle = notice.max(r.get(15)?);
+                let finished = r.get::<_, bool>(12)? || rests(idle, r.get(16)?);
                 let hook: Option<String> = r.get(10)?;
                 (
                     name,
@@ -695,8 +687,6 @@ fn session_agents(
                 cost_usd: r.get(7)?,
                 context_tokens: r.get(8)?,
                 context_pct: r.get(9)?,
-                nudge_pct: r.get(15)?,
-                hard_stop_pct: r.get(16)?,
                 parent: None,
             },
             edge,
@@ -1537,8 +1527,6 @@ mod tests {
             cost_usd: None,
             context_tokens: None,
             context_pct: None,
-            nudge_pct: 80,
-            hard_stop_pct: 95,
             parent: None,
         };
         assert_eq!(
@@ -1556,12 +1544,10 @@ mod tests {
                 "contextTokens",
                 "costUsd",
                 "description",
-                "hardStopPct",
                 "id",
                 "kind",
                 "model",
                 "name",
-                "nudgePct",
                 "parent",
                 "state"
             ]

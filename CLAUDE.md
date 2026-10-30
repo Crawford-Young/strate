@@ -18,7 +18,7 @@ Every `strate-core` wave is also checked against the real `~/.claude` with a pro
 
 - This repo is PUBLIC. Transcript fixtures are scrubbed or synthetic, never raw `~/.claude` content. `crates/strate-core/tests/fixtures/` is synthetic: real field names, placeholder values only (lorem text, `/work/...` cwds), and no real paths, prompts, emails or keys. Change it by editing `generate.sh` and re-running it, not by pasting real transcripts.
 - The agent registry is `claude agents --json`, never `sessions/<pid>.json`.
-- Layout is the user's call: Harness left, console right, terminal bottom, Audit the only full-screen view. Don't assume otherwise; ask.
+- Layout is the user's call: canvas centre, console right (opens on node select), Audit the only full-screen view. Don't assume otherwise; ask.
 - UI comes from `@crawfordyoung/ui`; new pieces land in the library first.
 - happy-dom has no layout, so the real resizable group never reports a layout or applies `resize`/`collapse`. App tests swap in `tests/resizable-mock.tsx`, and graph tests swap in `tests/xyflow-mock.tsx` for React Flow (which never measures nodes) plus in-process `elk.bundled.js` for `./elk`; check real panel and graph behaviour in `bun run tauri dev`.
 - Dev server port 1420 is strict (`vite.config.ts` and Tauri `devUrl`); don't let it fall back.

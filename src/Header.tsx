@@ -1,15 +1,12 @@
 // The top bar: the app name, one tab per live orchestrator, then the needs-you chip (while anything
-// waits), the panel toggles and the Audit button on the right.
+// waits) and the Audit button on the right.
 // Must render inside a `Tabs` (the strip is a TabsList).
-import { Button, TabsList, Toggle } from '@crawfordyoung/ui'
-import { ChartColumnStacked, SlidersVertical, Terminal } from 'lucide-react'
-import { useEffect, useRef, type ReactNode, type RefObject } from 'react'
+import { Button, TabsList } from '@crawfordyoung/ui'
+import { ChartColumnStacked } from 'lucide-react'
+import { useEffect, useRef, type RefObject } from 'react'
 import type { NeedsYou, Workstream } from './api'
 import { NeedsYouChip } from './NeedsYouChip'
 import { OrchestratorTab } from './OrchestratorTab'
-import type { LayoutPrefs } from './layout'
-
-type TogglePanel = 'harness' | 'terminal'
 
 interface HeaderProps {
   /** Every workstream, live or not. */
@@ -20,8 +17,6 @@ interface HeaderProps {
   onGoToTab: (id: number) => void
   /** The selected tab's value, as the `Tabs` sees it. */
   activeKey: string | null
-  prefs: LayoutPrefs
-  onTogglePanel: (id: TogglePanel) => void
   /** Focus returns here when the Audit view closes. */
   auditButtonRef: RefObject<HTMLButtonElement | null>
   onOpenAudit: () => void
@@ -33,8 +28,6 @@ export function Header({
   waits,
   onGoToTab,
   activeKey,
-  prefs,
-  onTogglePanel,
   auditButtonRef,
   onOpenAudit,
 }: HeaderProps) {
@@ -45,19 +38,6 @@ export function Header({
       ?.querySelector('[role="tab"][aria-selected="true"]')
       ?.scrollIntoView({ block: 'nearest', inline: 'nearest' })
   }, [activeKey, liveSessions.length])
-
-  const panelToggle = (id: TogglePanel, label: string, icon: ReactNode) => (
-    <Toggle
-      variant="outline"
-      size="sm"
-      pressed={prefs[id].open}
-      onPressedChange={() => onTogglePanel(id)}
-      className="gap-1.5"
-    >
-      {icon}
-      {label}
-    </Toggle>
-  )
 
   return (
     <header className="flex h-12 flex-none items-stretch gap-1 border-b border-border bg-surface px-3">
@@ -89,8 +69,6 @@ export function Header({
             onGoToTab={onGoToTab}
           />
         )}
-        {panelToggle('harness', 'Harness', <SlidersVertical aria-hidden className="size-3.5" />)}
-        {panelToggle('terminal', 'Terminal', <Terminal aria-hidden className="size-3.5" />)}
         <Button
           ref={auditButtonRef}
           variant="outline"

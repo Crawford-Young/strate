@@ -22,6 +22,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
     include_str!("0017_idle_notices.sql"),
     include_str!("0018_registry_wait_start.sql"),
     include_str!("0019_teammate_types.sql"),
+    include_str!("0020_drop_gear.sql"),
 ];
 
 /// Applies every migration past the db's `user_version`, each in its own
