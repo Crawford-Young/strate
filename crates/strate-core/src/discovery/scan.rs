@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
@@ -163,8 +163,9 @@ fn scan_session(project: &Path, dir_name: &str, session_id: &str, g: &mut Graph)
 
     // Links resolve only after every transcript in the session is read, so
     // a nested subagent finds a parent subagent listed after it.
+    let siblings: HashSet<String> = pending.iter().map(|(id, ..)| id.clone()).collect();
     for (agent_id, owner, path, meta) in pending {
-        let link = resolve_link(meta.as_ref(), &owner, &tool_uses, &g.teams);
+        let link = resolve_link(meta.as_ref(), &owner, &tool_uses, &g.teams, &siblings);
         g.subagents.push(SubagentNode {
             session_id: session_id.to_string(),
             agent_id,
@@ -245,6 +246,7 @@ fn read_meta(
         effort: map.get("effort").and_then(scalar_text),
         spawn_depth: map.get("spawnDepth").and_then(Value::as_u64),
         tool_use_id: text("toolUseId"),
+        parent_agent_id: text("parentAgentId"),
         name: text("name"),
         team_name: text("teamName"),
     })
@@ -260,25 +262,50 @@ pub(crate) fn scalar_text(value: &Value) -> Option<String> {
     }
 }
 
+/// How `owner` (a subagent) attaches, from its meta: the agent whose
+/// transcript holds its `toolUseId`, else its team, else the sibling (one of
+/// `siblings`, its session's subagent ids) its `parentAgentId` names.
 fn resolve_link(
     meta: Option<&SubagentMeta>,
     owner: &AgentRef,
     tool_uses: &HashMap<String, AgentRef>,
     teams: &[TeamNode],
+    siblings: &HashSet<String>,
 ) -> Link {
     let Some(meta) = meta else {
         return Link::Unresolved(Unresolved::NoMeta);
     };
-    if let Some(tool_use_id) = &meta.tool_use_id {
-        return match tool_uses.get(tool_use_id) {
-            Some(parent) if parent != owner => Link::Dispatch {
-                parent: parent.clone(),
-                tool_use_id: tool_use_id.clone(),
-            },
-            _ => Link::Unresolved(Unresolved::ToolUseNotFound {
-                tool_use_id: tool_use_id.clone(),
-            }),
+    let found = meta
+        .tool_use_id
+        .as_ref()
+        .and_then(|id| tool_uses.get(id).filter(|p| *p != owner).map(|p| (id, p)));
+    if let Some((tool_use_id, parent)) = found {
+        return Link::Dispatch {
+            parent: parent.clone(),
+            tool_use_id: tool_use_id.clone(),
         };
+    }
+    let spawner = match (owner, &meta.parent_agent_id, &meta.team_name) {
+        (
+            AgentRef::Subagent {
+                session_id,
+                agent_id,
+            },
+            Some(parent),
+            None,
+        ) if parent != agent_id && siblings.contains(parent) => Some(AgentRef::Subagent {
+            session_id: session_id.clone(),
+            agent_id: parent.clone(),
+        }),
+        _ => None,
+    };
+    if let Some(parent) = spawner {
+        return Link::ParentAgent { parent };
+    }
+    if let Some(tool_use_id) = &meta.tool_use_id {
+        return Link::Unresolved(Unresolved::ToolUseNotFound {
+            tool_use_id: tool_use_id.clone(),
+        });
     }
     match &meta.team_name {
         Some(team_name) => Link::Teammate {
@@ -396,10 +423,69 @@ mod tests {
         ));
     }
 
+    fn siblings() -> HashSet<String> {
+        HashSet::from(["a".to_string(), "b".to_string()])
+    }
+
     #[test]
     fn meta_without_tool_use_id_or_team_is_unresolved() {
-        let link = resolve_link(Some(&meta(None, None)), &sub("a"), &HashMap::new(), &[]);
+        let link = resolve_link(
+            Some(&meta(None, None)),
+            &sub("a"),
+            &HashMap::new(),
+            &[],
+            &siblings(),
+        );
         assert_eq!(link, Link::Unresolved(Unresolved::NoToolUseId));
+    }
+
+    fn parented(tool_use_id: Option<&str>, team: Option<&str>, parent: &str) -> SubagentMeta {
+        SubagentMeta {
+            parent_agent_id: Some(parent.to_string()),
+            ..meta(tool_use_id, team)
+        }
+    }
+
+    #[test]
+    fn a_parent_agent_id_links_a_subagent_whose_tool_use_places_it_nowhere() {
+        let link = |m: &SubagentMeta, tool_uses: &HashMap<String, AgentRef>| {
+            resolve_link(Some(m), &sub("a"), tool_uses, &[], &siblings())
+        };
+        let none = HashMap::new();
+        for m in [
+            parented(None, None, "b"),
+            parented(Some("toolu_gone"), None, "b"),
+        ] {
+            assert_eq!(link(&m, &none), Link::ParentAgent { parent: sub("b") });
+        }
+        // A tool_use that resolves wins.
+        let session = AgentRef::Session {
+            session_id: "s".to_string(),
+        };
+        let tool_uses = HashMap::from([("toolu_x".to_string(), session.clone())]);
+        assert_eq!(
+            link(&parented(Some("toolu_x"), None, "b"), &tool_uses),
+            Link::Dispatch {
+                parent: session,
+                tool_use_id: "toolu_x".to_string(),
+            }
+        );
+        // Itself, or no subagent of the session: as without it.
+        assert_eq!(
+            link(&parented(None, None, "a"), &none),
+            Link::Unresolved(Unresolved::NoToolUseId)
+        );
+        assert_eq!(
+            link(&parented(Some("toolu_gone"), None, "zz"), &none),
+            Link::Unresolved(Unresolved::ToolUseNotFound {
+                tool_use_id: "toolu_gone".to_string(),
+            })
+        );
+        // A teammate keeps its team link.
+        assert!(matches!(
+            link(&parented(None, Some("t"), "b"), &none),
+            Link::Teammate { .. }
+        ));
     }
 
     #[test]
@@ -409,6 +495,7 @@ mod tests {
             &sub("a"),
             &HashMap::new(),
             &[],
+            &siblings(),
         );
         assert_eq!(
             link,
@@ -427,6 +514,7 @@ mod tests {
             &sub("a"),
             &tool_uses,
             &[],
+            &siblings(),
         );
         assert_eq!(
             link,

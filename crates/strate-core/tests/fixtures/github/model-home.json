@@ -1,0 +1,14 @@
+{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"CURSOR-M"},"nodes":[
+{"number":105,"title":"Epic: lorem model","state":"OPEN","stateReason":null,"createdAt":"2026-10-18T09:00:00Z","closedAt":null,"parent":null,
+ "subIssuesSummary":{"total":2,"completed":0},"closedByPullRequestsReferences":{"nodes":[]}},
+{"number":107,"title":"Ipsum charges","state":"OPEN","stateReason":null,"createdAt":"2026-10-18T10:00:00Z","closedAt":null,"parent":{"number":105,"repository":{"nameWithOwner":"example/strate"}},
+ "subIssuesSummary":{"total":0,"completed":0},
+ "closedByPullRequestsReferences":{"nodes":[
+   {"number":120,"state":"OPEN","createdAt":"2026-10-20T08:00:00Z","mergedAt":null,"url":"https://github.com/example/strate/pull/120","headRefName":"feat/agent-model"}]}},
+{"number":108,"title":"Dolor lanes","state":"OPEN","stateReason":null,"createdAt":"2026-10-18T11:00:00Z","closedAt":null,"parent":{"number":105,"repository":{"nameWithOwner":"example/strate"}},
+ "subIssuesSummary":{"total":0,"completed":0},
+ "closedByPullRequestsReferences":{"nodes":[
+   {"number":120,"state":"OPEN","createdAt":"2026-10-20T08:00:00Z","mergedAt":null,"url":"https://github.com/example/strate/pull/120","headRefName":"feat/agent-model"}]}},
+{"number":110,"title":"Sit tickets","state":"OPEN","stateReason":null,"createdAt":"2026-10-18T12:00:00Z","closedAt":null,"parent":null,
+ "subIssuesSummary":{"total":0,"completed":0},"closedByPullRequestsReferences":{"nodes":[]}}
+]}}}}

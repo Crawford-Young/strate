@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use super::cells::{Cell, Cells, Place, Share, Time, Window};
+use super::cells::{Cell, Cells, Place, Share, Time};
 use super::gh::{Gh, GhPr};
 use super::{AuditNode, Metrics, NodeKind, Progress, Slice, Tokens};
 
@@ -43,9 +43,8 @@ struct Keys<'a> {
 /// How a node's elapsed time ends.
 #[derive(Clone, Copy)]
 enum End {
-    /// Its own windows' (a session or agent): its elapsed is the time they
-    /// cover, while the span it reports up covers its children's too, so a
-    /// row nested under a director's counts in the spans above it.
+    /// Its own spans' (a Session row or agent): its elapsed is the time
+    /// they cover, while the span it reports up covers its children's too.
     Own,
     /// Closed or merged at.
     Closed(i64),
@@ -64,7 +63,7 @@ pub(crate) struct Step {
     /// Sorts siblings of one kind.
     order: String,
     end: End,
-    /// The windows it spans, each once.
+    /// The sessions or runs it spans, each once.
     spans: Vec<(i64, i64)>,
     elapsed: Option<i64>,
     progress: Option<Progress>,
@@ -82,8 +81,9 @@ impl Step {
     }
 
     /// Another cell's copy of this step: a Session row (or its
-    /// orchestrator) spans each of its windows, and sorts by the earliest.
-    /// Every other step's copies are the same.
+    /// orchestrator) spans each of its sessions and subagent runs, and
+    /// sorts and is labelled by its earliest session. Every other step's
+    /// copies are the same.
     fn widen(&mut self, other: &Self) {
         for span in &other.spans {
             if !self.spans.contains(span) {
@@ -92,6 +92,7 @@ impl Step {
         }
         if other.order < self.order {
             self.order.clone_from(&other.order);
+            self.label.clone_from(&other.label);
         }
     }
 
@@ -110,7 +111,7 @@ impl Step {
     }
 
     /// An epic or issue node from the cache. One the cache doesn't hold is
-    /// `<repo> #N`, open: first window to last activity.
+    /// `<repo> #N`, open: first session to last activity.
     fn issue(kind: NodeKind, gh: &Gh, repo: &str, number: i64) -> Self {
         let cached = gh.issue(repo, number);
         let mut step = Self::new(
@@ -134,31 +135,33 @@ impl Step {
     }
 }
 
-/// `cell`'s path from the root: the place of its outermost Session row
-/// (Repo > Epic > Issue > PR, a director's Repo alone, or Unlinked), its
-/// Session rows (a unit's under its director's; see [`Cells::rows`]) and its
-/// Agent node. The tree adds the cell to every node on it; the cells under a
-/// node are those whose path passes through that node's `(kind, key)` steps.
+/// `cell`'s path from the root: its Session row's place (see
+/// [`place_steps`]), the Session row and its Agent node. The tree adds the
+/// cell to every node on it; the cells under a node are those whose path
+/// passes through that node's `(kind, key)` steps.
 pub(crate) fn path(cell: &Cell, cells: &Cells, gh: &Gh) -> Vec<Step> {
-    let rows = cells.rows(cell);
-    let mut steps = Vec::with_capacity(6 + rows.len());
-    steps.extend(place_steps(rows[0], gh));
-    steps.extend(rows.into_iter().map(window_step));
+    let mut steps = place_steps(&cells.row_of(cell).place, gh);
+    steps.push(session_step(cell, cells));
     steps.push(agent_step(cell, cells));
     steps
 }
 
-/// The steps a window's row is placed by: Repo > Epic > Issue > PR; a
-/// director's Repo alone, its Session row beside the repo's issues; or
-/// Unlinked. An issue sits under each of its epics, outermost first; an
-/// epic's own window goes under its "Direct work" Issue node, beside its
-/// sub-issues.
-fn place_steps(window: &Window, gh: &Gh) -> Vec<Step> {
-    let repo_step =
-        |repo: &String| Step::new(NodeKind::Repo, repo.clone(), repo.clone(), repo.clone());
-    let (repo, issue, pr) = match (&window.place, &window.director_repo) {
-        (Place::Unlinked, Some(repo)) => return vec![repo_step(repo)],
-        (Place::Unlinked, None) => {
+/// The steps a Session row is placed by: Unlinked; a Topic; a Repo; Repo >
+/// Epic for an epic; Repo > Epic > Issue > PR for an issue (an issue sits
+/// under each of its epics, outermost first, and an epic's own issue work
+/// under its "Direct work" Issue node, beside its sub-issues); Repo > PR
+/// for a PR the cache doesn't hold.
+fn place_steps(place: &Place, gh: &Gh) -> Vec<Step> {
+    let repo_step = |repo: &str| {
+        Step::new(
+            NodeKind::Repo,
+            repo.to_string(),
+            repo.to_string(),
+            repo.to_string(),
+        )
+    };
+    let (repo, issue, pr) = match place {
+        Place::Unlinked => {
             return vec![Step::new(
                 NodeKind::Unlinked,
                 String::new(),
@@ -166,7 +169,25 @@ fn place_steps(window: &Window, gh: &Gh) -> Vec<Step> {
                 String::new(),
             )];
         }
-        (Place::Linked { repo, issue, pr }, _) => (repo, *issue, *pr),
+        Place::Topic(topic) => {
+            return vec![Step::new(
+                NodeKind::Topic,
+                topic.clone(),
+                topic.clone(),
+                topic.clone(),
+            )];
+        }
+        Place::Repo(repo) => return vec![repo_step(repo)],
+        Place::Epic { repo, number } => {
+            let mut steps = vec![repo_step(repo)];
+            for epic in epics_over(gh, repo, *number) {
+                steps.push(Step::issue(NodeKind::Epic, gh, repo, epic));
+            }
+            steps.push(Step::issue(NodeKind::Epic, gh, repo, *number));
+            return steps;
+        }
+        Place::Pr { repo, number } => return vec![repo_step(repo), uncached_pr_step(*number)],
+        Place::Issue { repo, issue, pr } => (repo, *issue, *pr),
     };
     let mut steps = Vec::with_capacity(4);
     steps.push(repo_step(repo));
@@ -209,12 +230,7 @@ fn epics_over(gh: &Gh, repo: &str, issue: i64) -> Vec<i64> {
 /// PR `number` closing `repo`#`issue`: closed at its merge, open while
 /// GitHub says so.
 fn pr_step(gh: &Gh, repo: &str, issue: i64, number: i64) -> Step {
-    let mut step = Step::new(
-        NodeKind::Pr,
-        number.to_string(),
-        format!("PR #{number}"),
-        format!("{number:020}"),
-    );
+    let mut step = uncached_pr_step(number);
     step.end = match gh.pr(repo, issue, number) {
         Some(GhPr {
             merged_at: Some(at),
@@ -227,23 +243,41 @@ fn pr_step(gh: &Gh, repo: &str, issue: i64, number: i64) -> Step {
     step
 }
 
-/// A window's Session row, sorted by its start, over the window's span
-/// when it holds a cell in the filter.
-fn window_step(window: &Window) -> Step {
-    let start = window.span.map_or(0, |s| s.0);
+/// PR `number` as a charge names it, the cache holding nothing of it:
+/// open, first session to last activity.
+fn uncached_pr_step(number: i64) -> Step {
     let mut step = Step::new(
-        NodeKind::Session,
-        window.row.clone(),
-        window.label.clone(),
-        format!("{start:020}/{}", window.row),
+        NodeKind::Pr,
+        number.to_string(),
+        format!("PR #{number}"),
+        format!("{number:020}"),
     );
-    step.end = End::Own;
-    step.spans.extend(window.span.filter(|_| window.in_filter));
+    step.end = End::Open;
     step
 }
 
-/// `cell`'s Agent node: the orchestrator over its window's span, or a
-/// subagent over its run.
+/// `cell`'s Session row, sorted and labelled by its earliest session: over
+/// its session for an orchestrator cell, over its run for a subagent's.
+fn session_step(cell: &Cell, cells: &Cells) -> Step {
+    let session = cells.session(cell);
+    let row = &cells.row_of(cell).key;
+    let start = session.start.unwrap_or(0);
+    let mut step = Step::new(
+        NodeKind::Session,
+        row.clone(),
+        session.label.clone(),
+        format!("{start:020}/{row}"),
+    );
+    step.end = End::Own;
+    step.spans.extend(match &cell.agent_id {
+        None => session.span,
+        Some(id) => cells.agent(cell, id).and_then(|a| a.span),
+    });
+    step
+}
+
+/// `cell`'s Agent node: the orchestrator over its session, or a subagent
+/// over its run.
 fn agent_step(cell: &Cell, cells: &Cells) -> Step {
     let mut step = match &cell.agent_id {
         None => {
@@ -253,13 +287,14 @@ fn agent_step(cell: &Cell, cells: &Cells) -> Step {
                 "orchestrator".into(),
                 String::new(),
             );
-            step.spans.extend(cells.window(cell).span);
+            step.spans.extend(cells.session(cell).span);
             step
         }
         Some(id) => {
             let agent = cells.agent(cell, id);
             let label = agent.map_or_else(|| id.clone(), |a| a.label.clone());
             let mut step = Step::new(NodeKind::Agent, id.clone(), label, id.clone());
+            step.spans.extend(agent.and_then(|a| a.span));
             step.elapsed = agent.and_then(|a| a.run_ms);
             step
         }
@@ -371,7 +406,6 @@ impl Node {
         m.wait_ms += wait_ms;
         m.sessions += s.sessions;
         m.agents += s.agents;
-        m.rotations += s.rotations;
     }
 
     /// The finished node, its span and whether it is open.

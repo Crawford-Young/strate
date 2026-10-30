@@ -54,7 +54,6 @@ const METRICS: [header: string, value: (n: AuditNode) => Cell][] = [
   ['Cache write tokens', (n) => n.metrics.tokens.cacheWrite],
   ['Sessions', (n) => n.metrics.sessions],
   ['Agents', (n) => n.metrics.agents],
-  ['Rotations', (n) => n.metrics.rotations],
   ['Progress completed', (n) => n.metrics.progress?.completed ?? null],
   ['Progress total', (n) => n.metrics.progress?.total ?? null],
 ]

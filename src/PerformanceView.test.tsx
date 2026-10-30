@@ -43,7 +43,7 @@ const twoDays = outcome({
     }),
   ],
   unlinkedUsd: 220,
-  unlinkedWorkstreams: 10,
+  unlinkedCharges: 10,
   openUsd: 134,
   openIssues: 9,
 })
@@ -104,11 +104,7 @@ describe('outcome', () => {
 
   it('shows the spend with no outcome, and the median elapsed over the range', () => {
     show()
-    expect(tile('No linked outcome')).toEqual([
-      '$220.00',
-      '10 workstreams',
-      'no <repo>-<issue> name',
-    ])
+    expect(tile('No linked outcome')).toEqual(['$220.00', '10 unlinked', 'no <repo>-<issue> name'])
     expect(tile('Spent on open issues')).toEqual(['$134.00', '9 issues', 'not yet an outcome'])
     expect(tile('Median elapsed')).toEqual(['1d 4h', 'range: first window to close'])
   })

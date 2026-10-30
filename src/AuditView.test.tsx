@@ -94,7 +94,6 @@ const tree: Audit = audit(
       tokens: { input: 1000, output: 200, cacheRead: 3000, cacheWrite: 300 },
       sessions: 3,
       agents: 5,
-      rotations: 1,
       waitMs: 30 * 60_000,
       elapsedMs: 90 * 60_000,
     }),
@@ -580,7 +579,6 @@ describe('tree table', () => {
       'Tokens',
       'Sessions',
       'Agents',
-      'Rotations',
       'Progress',
     ])
   })
@@ -604,7 +602,6 @@ describe('tree table', () => {
       '4.5k',
       '3',
       '5',
-      '1',
       '—',
     ])
   })
@@ -664,7 +661,7 @@ describe('tree table', () => {
       .getAllByRole('cell')
       .map((c) => c.textContent)
     expect(epic[1]).toBe('2d 0h · open')
-    expect(epic[13]).toBe('1/2')
+    expect(epic[12]).toBe('1/2')
   })
 
   it('selects a row by its path', async () => {

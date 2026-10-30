@@ -1,27 +1,30 @@
-//! The `audit_cells` in a filter, with the `/rename` windows and subagents
-//! they belong to, each resolved once.
+//! The `audit_cells` in a filter, with the charges, sessions, Session rows
+//! and subagents they belong to, each resolved once.
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use rusqlite::{Connection, OptionalExtension, Row};
+use rusqlite::{Connection, Row};
 
 use super::gh::{Gh, GhPr};
 use super::{AuditFilter, Tokens};
-use crate::names::{ParsedName, is_director, parse_name};
+use crate::charge::{Charge, ChargeKind};
 use crate::store::Result;
 use crate::time::parse_timestamp;
 
-/// The cells in a filter, with the windows and subagents they belong to.
+/// The cells in a filter, with what they belong to.
 pub(crate) struct Cells {
     /// In day order, the orchestrator's first.
     pub(crate) list: Vec<Cell>,
-    /// The repos the range's windows are filed under, whatever the repo
+    /// The repos the range's cells are charged in, whatever the repo
     /// filter.
     pub(crate) repos: BTreeSet<String>,
-    /// Some window in the range is filed under none.
+    /// Some cell in the range is in no repo.
     pub(crate) unlinked: bool,
-    windows: Windows,
+    charges: Charges,
+    rows: Vec<SessionRow>,
+    row_index: HashMap<RowKey, usize>,
+    sessions: HashMap<String, Session>,
     agents: HashMap<(String, String), Agent>,
 }
 
@@ -30,11 +33,8 @@ pub(crate) struct Cell {
     pub(crate) session_id: String,
     /// `None`: the orchestrator.
     pub(crate) agent_id: Option<String>,
-    /// Its index in [`Cells`]' windows; see [`Cells::window`].
-    window: usize,
-    /// Its `segments` row (`None`: a session with no window, or a
-    /// subagent whose start no window holds).
-    pub(crate) segment: Option<i64>,
+    /// Its index in [`Cells`]' Session rows; see [`Cells::row`].
+    row: usize,
     pub(crate) day: String,
     pub(crate) model: Option<String>,
     pub(crate) share: Share,
@@ -53,7 +53,6 @@ pub(crate) struct Share {
     pub(crate) own: Time,
     pub(crate) sessions: i64,
     pub(crate) agents: i64,
-    pub(crate) rotations: i64,
 }
 
 /// Active time and time waiting on you.
@@ -69,7 +68,6 @@ pub(crate) struct Time {
 struct CellRow {
     session_id: String,
     agent_id: Option<String>,
-    segment_id: Option<i64>,
     day: String,
     model: Option<String>,
     /// The subagent's wall time in the cell.
@@ -85,7 +83,6 @@ impl CellRow {
         Ok(Self {
             session_id: r.get("session_id")?,
             agent_id: r.get("agent_id")?,
-            segment_id: r.get("segment_id")?,
             day: r.get("day")?,
             model: r.get("model")?,
             wall_ms: r.get("wall_ms")?,
@@ -107,61 +104,60 @@ impl CellRow {
 }
 
 impl Cells {
-    /// Cells come in day order, the orchestrator's first, so a window or
+    /// Cells come in day order, the orchestrator's first, so a session or
     /// subagent counts on its first cell in the filter. Idle-only cells are
-    /// left out: they add nothing, and would show a window on a day it only
-    /// sat open.
+    /// left out: they add nothing, and would show a session on a day it
+    /// only sat open.
     pub(crate) fn load(conn: &Connection, gh: &Gh, filter: &AuditFilter) -> Result<Self> {
         let (from, to) = (day(&filter.from)?, day(&filter.to)?);
         let mut out = Self {
             list: Vec::new(),
             repos: BTreeSet::new(),
             unlinked: false,
-            windows: Windows {
-                named: Named::load_all(conn, from, to)?,
-                ..Windows::default()
-            },
+            charges: Charges::load(conn)?,
+            rows: Vec::new(),
+            row_index: HashMap::new(),
+            sessions: HashMap::new(),
             agents: Agent::load_all(conn, from, to)?,
         };
+        let mut seen_sessions: HashSet<(String, Option<i64>)> = HashSet::new();
         let mut seen_agents: HashSet<(String, String)> = HashSet::new();
         // A cell with a NULL day (a request with no usable timestamp) is in
         // no range: `day BETWEEN` is never true for NULL.
         let mut stmt = conn.prepare_cached(
-            "SELECT session_id, agent_id, segment_id, day, model, wall_ms, active_ms, wait_ms,
-                 ask_ms, cost_usd, unpriced, input_tokens, output_tokens, cache_read_tokens,
+            "SELECT session_id, agent_id, day, model, wall_ms, active_ms, wait_ms, ask_ms,
+                 cost_usd, unpriced, input_tokens, output_tokens, cache_read_tokens,
                  cache_write_tokens
              FROM audit_cells WHERE day BETWEEN ?1 AND ?2
                  AND NOT (active_ms = 0 AND wait_ms = 0 AND cost_usd IS NULL AND unpriced = 0
                      AND input_tokens + output_tokens + cache_read_tokens
                          + cache_write_tokens = 0
                      AND (agent_id IS NULL OR wall_ms = 0))
-             ORDER BY day, agent_id IS NOT NULL, agent_id, session_id, segment_id, model, id",
+             ORDER BY day, agent_id IS NOT NULL, agent_id, session_id, model, id",
         )?;
         let mut rows = stmt.query([from, to])?;
         while let Some(r) = rows.next()? {
             let row = CellRow::read(r)?;
-            let window = out.windows.get(conn, gh, &row.session_id, row.segment_id)?;
-            let w = &mut out.windows.list[window];
-            let filed = w.filed_under();
-            match filed {
+            let charge = out.charges.of(&row.session_id, row.agent_id.as_deref());
+            let at = out.row(conn, gh, &row.session_id, charge)?;
+            match out.rows[at].place.repo() {
                 Some(repo) if !out.repos.contains(repo) => {
-                    out.repos.insert(repo.clone());
+                    out.repos.insert(repo.to_string());
                 }
                 Some(_) => {}
                 None => out.unlinked = true,
             }
-            let slug = filed.map_or("", String::as_str);
+            let slug = out.rows[at].place.repo().unwrap_or("");
             if !filter.repos.is_empty() && !filter.repos.iter().any(|r| r == slug) {
                 continue;
             }
-            let first_in_window = !std::mem::replace(&mut w.in_filter, true);
+            let first_in_row = seen_sessions.insert((row.session_id.clone(), charge));
             let mut share = Share {
                 cost_usd: row.cost_usd,
                 unpriced: row.unpriced,
                 tokens: row.tokens,
                 own: row.own,
-                sessions: first_in_window.into(),
-                rotations: (first_in_window && w.rotation).into(),
+                sessions: first_in_row.into(),
                 ..Share::default()
             };
             match &row.agent_id {
@@ -178,8 +174,7 @@ impl Cells {
             out.list.push(Cell {
                 session_id: row.session_id,
                 agent_id: row.agent_id,
-                window,
-                segment: row.segment_id,
+                row: at,
                 day: row.day,
                 model: row.model,
                 share,
@@ -188,19 +183,54 @@ impl Cells {
         Ok(out)
     }
 
-    /// The window `cell` belongs to.
-    pub(crate) fn window(&self, cell: &Cell) -> &Window {
-        &self.windows.list[cell.window]
+    /// The index of the Session row of `session_id`'s chain in `charge`,
+    /// placed once.
+    fn row(
+        &mut self,
+        conn: &Connection,
+        gh: &Gh,
+        session_id: &str,
+        charge: Option<i64>,
+    ) -> Result<usize> {
+        let chain = self.session_of(conn, session_id)?.chain.clone();
+        let key = (chain, charge);
+        if let Some(&at) = self.row_index.get(&key) {
+            return Ok(at);
+        }
+        let charge = charge.and_then(|id| self.charges.by_id.get(&id));
+        let place = match charge {
+            Some(c) if c.kind == ChargeKind::Issue => {
+                let links = row_links(conn, self.charges.row_sessions(&key))?;
+                place(gh, Some(c), &links)
+            }
+            c => place(gh, c, &[]),
+        };
+        let charge = charge.map(Charge::key).unwrap_or_default();
+        self.rows.push(SessionRow {
+            key: format!("{}/{charge}", key.0),
+            charge,
+            place,
+        });
+        self.row_index.insert(key, self.rows.len() - 1);
+        Ok(self.rows.len() - 1)
     }
 
-    /// The Session rows `cell` sits under, outermost first, each shown by
-    /// one of its windows: a unit's row nests under its director's, which
-    /// may nest under its own director. The last is `cell`'s own window;
-    /// the first places them all.
-    pub(crate) fn rows(&self, cell: &Cell) -> Vec<&Window> {
-        let mut rows: Vec<&Window> = self.windows.up(cell.window).collect();
-        rows.reverse();
-        rows
+    /// Session `session_id`, read once.
+    fn session_of(&mut self, conn: &Connection, session_id: &str) -> Result<&Session> {
+        Ok(match self.sessions.entry(session_id.to_string()) {
+            Entry::Occupied(found) => found.into_mut(),
+            Entry::Vacant(slot) => slot.insert(Session::load(conn, session_id)?),
+        })
+    }
+
+    /// The Session row `cell` belongs to.
+    pub(crate) fn row_of(&self, cell: &Cell) -> &SessionRow {
+        &self.rows[cell.row]
+    }
+
+    /// The session `cell` is from. [`Cells::load`] read every cell's.
+    pub(crate) fn session(&self, cell: &Cell) -> &Session {
+        &self.sessions[&cell.session_id]
     }
 
     /// The subagent `agent_id` of `cell`'s session. [`Cells::load`] gives
@@ -209,6 +239,32 @@ impl Cells {
     pub(crate) fn agent(&self, cell: &Cell, agent_id: &str) -> Option<&Agent> {
         self.agents
             .get(&(cell.session_id.clone(), agent_id.to_string()))
+    }
+
+    /// The repo of the agent `agent_id` (`None`: the orchestrator) of
+    /// `session_id`'s effective charge; `None` for a topic or no charge.
+    pub(crate) fn repo_of(&self, session_id: &str, agent_id: Option<&str>) -> Option<&str> {
+        let charge = self.charges.of(session_id, agent_id)?;
+        self.charges.by_id.get(&charge).and_then(charge_repo)
+    }
+
+    /// Each issue's first start: of the earliest session with an agent
+    /// charged to it, to its PR (closing it) or, for an epic, to it.
+    pub(crate) fn issue_starts(&self, gh: &Gh) -> HashMap<(String, i64), i64> {
+        let mut out: HashMap<(String, i64), i64> = HashMap::new();
+        for (id, &start) in &self.charges.first {
+            let Some(c) = self.charges.by_id.get(id) else {
+                continue;
+            };
+            let place = place(gh, Some(c), &[]);
+            let Some((repo, issue, _)) = place.issue() else {
+                continue;
+            };
+            out.entry((repo.to_string(), issue))
+                .and_modify(|s| *s = (*s).min(start))
+                .or_insert(start);
+        }
+        out
     }
 }
 
@@ -222,460 +278,211 @@ pub(crate) fn day(s: &str) -> Result<&str> {
     }
 }
 
-/// Where a window's work belongs: its Session row's place.
+/// The repo a charge is in: none for a topic.
+fn charge_repo(c: &Charge) -> Option<&str> {
+    match c.kind {
+        ChargeKind::Topic => None,
+        _ => c.repo.as_deref(),
+    }
+}
+
+/// A Session row's chain and charge (`None`: Unlinked).
+type RowKey = (String, Option<i64>);
+
+/// Every agent's effective charge, read once: `agent_charges` is a
+/// recursive view over every agent, so it is read whole, never per cell.
+struct Charges {
+    /// Per agent (session, agent id; `None`: the orchestrator), its charge
+    /// (`None`: Unlinked).
+    agents: HashMap<(String, Option<String>), Option<i64>>,
+    by_id: HashMap<i64, Charge>,
+    /// Per (chain, charge), its sessions and their starts.
+    rows: HashMap<RowKey, Vec<(Option<i64>, String)>>,
+    /// Per charge, the earliest start of a session with an agent in it.
+    first: HashMap<i64, i64>,
+}
+
+impl Charges {
+    fn load(conn: &Connection) -> Result<Self> {
+        let effective: HashMap<i64, Option<i64>> = conn
+            .prepare_cached("SELECT agent, charge FROM agent_charges")?
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<_>>()?;
+        let mut out = Self {
+            agents: HashMap::new(),
+            by_id: HashMap::new(),
+            rows: HashMap::new(),
+            first: HashMap::new(),
+        };
+        let mut stmt = conn.prepare_cached(
+            "SELECT a.id, a.session_id, a.agent_id, ifnull(s.process_root, a.session_id),
+                 s.started_at
+             FROM agents AS a LEFT JOIN sessions AS s ON s.session_id = a.session_id",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut seen: HashSet<(String, Option<i64>, String)> = HashSet::new();
+        while let Some(r) = rows.next()? {
+            let session: String = r.get(1)?;
+            let chain: String = r.get(3)?;
+            let started: Option<String> = r.get(4)?;
+            let start = started.as_deref().and_then(parse_timestamp);
+            let charge = effective.get(&r.get(0)?).copied().flatten();
+            out.agents.insert((session.clone(), r.get(2)?), charge);
+            if seen.insert((chain.clone(), charge, session.clone())) {
+                out.rows
+                    .entry((chain, charge))
+                    .or_default()
+                    .push((start, session));
+            }
+            if let (Some(c), Some(start)) = (charge, start) {
+                out.first
+                    .entry(c)
+                    .and_modify(|s| *s = (*s).min(start))
+                    .or_insert(start);
+            }
+        }
+        let mut stmt = conn.prepare_cached("SELECT id, kind, repo, number, topic FROM charges")?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let kind: String = r.get(1)?;
+            let Some(kind) = ChargeKind::parse(&kind) else {
+                continue;
+            };
+            let charge = Charge {
+                kind,
+                repo: r.get(2)?,
+                number: r.get::<_, Option<i64>>(3)?.map(|n| n as u64),
+                topic: r.get(4)?,
+            };
+            out.by_id.insert(r.get(0)?, charge);
+        }
+        Ok(out)
+    }
+
+    /// The effective charge of agent `agent_id` of `session_id`; `None`
+    /// (Unlinked) for an agent with no row, as `charge_costs` reads it.
+    fn of(&self, session_id: &str, agent_id: Option<&str>) -> Option<i64> {
+        self.agents
+            .get(&(session_id.to_string(), agent_id.map(str::to_string)))
+            .copied()
+            .flatten()
+    }
+
+    /// The sessions of Session row `key` (a chain in a charge), newest
+    /// first: by start (none last), then id.
+    fn row_sessions(&self, key: &RowKey) -> Vec<&str> {
+        let mut sessions: Vec<&(Option<i64>, String)> = self
+            .rows
+            .get(key)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+        sessions.sort_by(|a, b| {
+            (
+                a.0.is_none(),
+                std::cmp::Reverse(a.0),
+                std::cmp::Reverse(&a.1),
+            )
+                .cmp(&(
+                    b.0.is_none(),
+                    std::cmp::Reverse(b.0),
+                    std::cmp::Reverse(&b.1),
+                ))
+        });
+        sessions.into_iter().map(|(_, s)| s.as_str()).collect()
+    }
+}
+
+/// Where a Session row's work belongs, by its charge.
 #[derive(Clone)]
 pub(crate) enum Place {
+    /// No charge.
     Unlinked,
-    Linked {
+    Topic(String),
+    Repo(String),
+    Epic {
+        repo: String,
+        number: i64,
+    },
+    /// An issue, or a PR the cache knows the issue of, with that PR.
+    Issue {
         repo: String,
         issue: i64,
         pr: Option<i64>,
     },
+    /// A PR the cache doesn't hold.
+    Pr {
+        repo: String,
+        number: i64,
+    },
 }
 
-/// A `/rename` window (or a session with none).
-pub(crate) struct Window {
-    /// Its Session row: `<chain>/<workstream>`, the chain its session's
-    /// process root (every `/clear` link of one process shares it) and the
-    /// workstream its merge-resolved name, so a chain's windows in one
-    /// workstream are one row; `session:<id>` for a session with no window.
-    pub(crate) row: String,
-    pub(crate) label: String,
-    /// The repo its name parses to, linked or not.
-    pub(crate) repo: Option<String>,
-    /// Named `-sN`, any N: a rotation is a `-sN` window, not "windows - 1".
-    rotation: bool,
-    /// Where its name puts it.
+impl Place {
+    /// The repo it is in; `None` for a topic or no charge.
+    pub(crate) fn repo(&self) -> Option<&str> {
+        match self {
+            Place::Unlinked | Place::Topic(_) => None,
+            Place::Repo(repo)
+            | Place::Epic { repo, .. }
+            | Place::Issue { repo, .. }
+            | Place::Pr { repo, .. } => Some(repo),
+        }
+    }
+
+    /// The issue it is work on (an epic is one too), and that work's PR:
+    /// what can close or merge as an outcome.
+    pub(crate) fn issue(&self) -> Option<(&str, i64, Option<i64>)> {
+        match self {
+            Place::Issue { repo, issue, pr } => Some((repo, *issue, *pr)),
+            Place::Epic { repo, number } => Some((repo, *number, None)),
+            _ => None,
+        }
+    }
+}
+
+/// A Session row: a `/clear` chain's sessions within one charge.
+pub(crate) struct SessionRow {
+    /// `<chain>/<charge key>`, `<chain>/` with no charge.
+    pub(crate) key: String,
+    /// Its charge key, `""` with none.
+    pub(crate) charge: String,
     pub(crate) place: Place,
-    /// A row whose name gives no place but whose units or `director-<repo>`
-    /// name do (#63): the repo the tree puts it under, at repo level with
-    /// no issue (see [`Windows::director_repo`]).
-    pub(crate) director_repo: Option<String>,
-    /// Its start to the next window's start, or to the session's last
-    /// activity.
-    pub(crate) span: Option<(i64, i64)>,
-    /// Holds a cell in the filter. A director's window that holds none (it
-    /// sent a unit's first message outside the range) shows its row, but
-    /// adds no time to it.
-    pub(crate) in_filter: bool,
 }
 
-impl Window {
-    /// The repo the repo filter reads it by: its name's, else the one its
-    /// row is placed under.
-    fn filed_under(&self) -> Option<&String> {
-        self.repo.as_ref().or(self.director_repo.as_ref())
-    }
-}
-
-/// Every window the filter's cells touch, and their directors', resolved
-/// once.
-#[derive(Default)]
-struct Windows {
-    list: Vec<Window>,
-    index: HashMap<(String, Option<i64>), usize>,
-    sessions: HashMap<String, Session>,
-    /// The filter's segments by id, read in one query.
-    named: HashMap<i64, Named>,
-    /// Per Session row, the director's window it nests under (see
-    /// [`launched_from`]); `None` while it resolves.
-    directors: HashMap<String, Option<usize>>,
-    /// Per Session row with a director, whether it tops a cycle of rows
-    /// that direct each other (see [`Windows::tops_cycle`]).
-    tops: HashMap<String, bool>,
-    /// Per Session row, its place (see [`Windows::row_place`]).
-    places: HashMap<String, Place>,
-    /// Per Session row whose name gives no place, its director repo (see
-    /// [`Windows::director_repo`]).
-    director_repos: HashMap<String, Option<String>>,
-    /// The repos a `director-<repo>` name can name, read once when needed.
-    known_repos: Option<HashSet<String>>,
-}
-
-impl Windows {
-    /// The index in `list` of the window `segment` of `session_id` (`None`:
-    /// the session's cells with no window).
-    fn get(
-        &mut self,
-        conn: &Connection,
-        gh: &Gh,
-        session_id: &str,
-        segment: Option<i64>,
-    ) -> Result<usize> {
-        let key = (session_id.to_string(), segment);
-        if let Some(&i) = self.index.get(&key) {
-            return Ok(i);
-        }
-        let session = match self.sessions.entry(session_id.to_string()) {
-            Entry::Occupied(found) => found.into_mut(),
-            Entry::Vacant(slot) => slot.insert(Session::load(conn, session_id)?),
-        };
-        // A director's window may have no cells in the filter.
-        let named = match segment.map(|id| (id, self.named.remove(&id))) {
-            Some((_, Some(named))) => Some(named),
-            Some((id, None)) => Named::load(conn, id)?,
-            None => None,
-        };
-        // With no window, the session's id and start.
-        let named = named.unwrap_or_else(|| Named {
-            name: session_id.to_string(),
-            fallback: true,
-            start: session.start,
-            next: None,
-            workstream: None,
-        });
-        let parsed = if named.fallback {
-            None
-        } else {
-            parse_name(&named.name)
-        };
-        let end = named.next.or(session.last);
-        let unit = segment.and(named.workstream);
-        let chain = session.chain.clone();
-        let (row, place, director_repo) = match unit {
-            Some(workstream) => {
-                let row = format!("{chain}/{workstream}");
-                let place = self.row_place(conn, gh, &row, parsed.as_ref(), &chain, workstream)?;
-                let director_repo = match parsed {
-                    Some(_) => None,
-                    None => self.director_repo(conn, &chain, workstream, &named.name)?,
-                };
-                (row, place, director_repo)
-            }
-            // No window: a fallback name, so Unlinked.
-            None => (format!("session:{session_id}"), Place::Unlinked, None),
-        };
-        self.list.push(Window {
-            row: row.clone(),
-            place,
-            director_repo,
-            repo: parsed.as_ref().map(|p| p.repo.clone()),
-            rotation: parsed.is_some_and(|p| p.rotation.is_some()),
-            label: named.name,
-            span: named.start.map(|s| (s, end.unwrap_or(s).max(s))),
-            in_filter: false,
-        });
-        let at = self.list.len() - 1;
-        self.index.insert(key, at);
-        if let Some(workstream) = unit {
-            self.resolve_director(conn, gh, &row, &chain, workstream)?;
-        }
-        Ok(at)
-    }
-
-    /// The place of Session row `row` (`chain`'s windows in `workstream`,
-    /// all named `parsed`), read once per row: every window of a row sits
-    /// in one place, so a row never splits into two nodes with one key. Its
-    /// PR is the one the newest `github_links` entry of any of those
-    /// sessions names (see [`row_links`]), whichever window's transcript
-    /// holds the link.
-    fn row_place(
-        &mut self,
-        conn: &Connection,
-        gh: &Gh,
-        row: &str,
-        parsed: Option<&ParsedName>,
-        chain: &str,
-        workstream: i64,
-    ) -> Result<Place> {
-        if let Some(found) = self.places.get(row) {
-            return Ok(found.clone());
-        }
-        let found = place(gh, parsed, &row_links(conn, chain, workstream)?);
-        self.places.insert(row.to_string(), found.clone());
-        Ok(found)
-    }
-
-    /// Where Session row `chain`'s windows in `workstream`, named `name`
-    /// (which gives no place), sits (#63), read once per row: under the one
-    /// repo all its units' rows (see [`unit_rows`]) that name one work in,
-    /// each by its name, or for a unit whose name gives no place, where it
-    /// sits in turn (a unit placed nowhere, such as one named by a pasted
-    /// launch line, is skipped); with those in several repos, or none (a
-    /// row with no units too), under the known repo a `director-<repo>`
-    /// name names ([`Windows::named_repo`]). `None` when neither places it.
-    /// A unit row that tops its cycle ([`Windows::tops_cycle`]) doesn't nest
-    /// here, so the walk down never meets a row twice.
-    fn director_repo(
-        &mut self,
-        conn: &Connection,
-        chain: &str,
-        workstream: i64,
-        name: &str,
-    ) -> Result<Option<String>> {
-        let row = format!("{chain}/{workstream}");
-        if let Some(found) = self.director_repos.get(&row) {
-            return Ok(found.clone());
-        }
-        let units = unit_rows(conn, chain, workstream)?;
-        let mut repos = Vec::with_capacity(units.len());
-        for unit in units {
-            if self.tops_cycle(conn, &unit.chain, unit.workstream)? {
-                continue;
-            }
-            let repo = match unit.parsed {
-                Some(p) => Some(p.repo),
-                None => self.director_repo(conn, &unit.chain, unit.workstream, &unit.name)?,
-            };
-            repos.extend(repo);
-        }
-        let found = match repos.split_first() {
-            Some((first, rest)) if rest.iter().all(|r| r == first) => Some(first.clone()),
-            _ => self.named_repo(conn, name)?,
-        };
-        self.director_repos.insert(row, found.clone());
-        Ok(found)
-    }
-
-    /// The repo a `director-<repo>` name names, when the store knows it:
-    /// a repo the GitHub cache holds or a window name parses to (in any
-    /// case, as the cache or name spells it).
-    fn named_repo(&mut self, conn: &Connection, name: &str) -> Result<Option<String>> {
-        let Some((_, scope)) = name.split_once('-').filter(|_| is_director(name)) else {
-            return Ok(None);
-        };
-        let known = match &mut self.known_repos {
-            Some(known) => known,
-            empty => empty.insert(known_repos(conn)?),
-        };
-        Ok(known
-            .iter()
-            .find(|r| r.eq_ignore_ascii_case(scope))
-            .cloned())
-    }
-
-    /// Records the director's window Session row `row` (`chain`'s windows
-    /// in `workstream`) nests under (see [`launched_from`]), once per row:
-    /// none for a row that tops its cycle ([`Windows::tops_cycle`]). The
-    /// row is marked `None` while its director resolves, so resolving its
-    /// director's row, and up, reads it once.
-    fn resolve_director(
-        &mut self,
-        conn: &Connection,
-        gh: &Gh,
-        row: &str,
-        chain: &str,
-        workstream: i64,
-    ) -> Result<()> {
-        if self.directors.contains_key(row) {
-            return Ok(());
-        }
-        self.directors.insert(row.to_string(), None);
-        let director = match launched_from(conn, chain, workstream)? {
-            Some(_) if self.tops_cycle(conn, chain, workstream)? => None,
-            Some((parent, segment)) => Some(self.get(conn, gh, &parent, segment)?),
-            None => None,
-        };
-        self.directors.insert(row.to_string(), director);
-        Ok(())
-    }
-
-    /// Whether Session row `chain`'s windows in `workstream` tops a cycle
-    /// of rows that direct each other, read once per row. `directs` refuses
-    /// only a cycle of sessions, so rows, each a chain's sessions, can still
-    /// form one (one row's link directing another row, whose session
-    /// directed the first row's next link), and a row can direct itself.
-    /// The rule, a function of the data whatever order the rows resolve in:
-    /// the cycle's earliest-started row is the director, and the rest keep
-    /// their links, so all nest under it. Earliest is by the row's first
-    /// window's start ([`row_start`]; no start sorts last), then its row
-    /// key. That row nests under none of the cycle, so the nest has no loop.
-    fn tops_cycle(&mut self, conn: &Connection, chain: &str, workstream: i64) -> Result<bool> {
-        let row = format!("{chain}/{workstream}");
-        if let Some(&found) = self.tops.get(&row) {
-            return Ok(found);
-        }
-        let start = (chain.to_string(), workstream);
-        let mut cycle = vec![start.clone()];
-        let mut at = director_row(conn, chain, workstream)?;
-        // Up to a row with no director, or a cycle above this row (which
-        // isn't on it), or back to this row.
-        while let Some(next) = at.take_if(|next| !cycle.contains(next)) {
-            at = director_row(conn, &next.0, next.1)?;
-            cycle.push(next);
-        }
-        if at != Some(start) {
-            self.tops.insert(row, false);
-            return Ok(false);
-        }
-        let mut earliest = Vec::with_capacity(cycle.len());
-        for (chain, workstream) in &cycle {
-            let start = row_start(conn, chain, *workstream)?;
-            earliest.push((start.is_none(), start, format!("{chain}/{workstream}")));
-        }
-        let top = earliest.iter().min().map(|e| e.2.clone());
-        for (_, _, key) in earliest {
-            let tops = Some(&key) == top.as_ref();
-            self.tops.insert(key, tops);
-        }
-        Ok(self.tops[&row])
-    }
-
-    /// Window `at`, then the director's window its row nests under, and up.
-    /// Every cycle of rows has one row on top ([`Windows::tops_cycle`]), so
-    /// the walk ends.
-    fn up(&self, at: usize) -> impl Iterator<Item = &Window> {
-        std::iter::successors(Some(&self.list[at]), |w| {
-            self.directors
-                .get(&w.row)
-                .copied()
-                .flatten()
-                .map(|d| &self.list[d])
-        })
-    }
-}
-
-/// Where a unit's Session row (`chain`'s windows in `workstream`) was
-/// launched from: of its sessions with a window there that a director
-/// messaged first (`directs`), the earliest's director session, and the
-/// window of the message it sent (`None`: no window). The director's own
-/// record is in the window live at its offset, a subagent's in that
-/// subagent's window. `None` when no director messaged one.
-fn launched_from(
-    conn: &Connection,
-    chain: &str,
-    workstream: i64,
-) -> Result<Option<(String, Option<i64>)>> {
-    conn.prepare_cached(LAUNCHED_FROM_SQL)?
-        .query_row(rusqlite::params![chain, workstream], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })
-        .optional()
-}
-
-/// [`launched_from`]'s query.
-const LAUNCHED_FROM_SQL: &str = "SELECT x.parent, CASE WHEN e.agent_id IS NULL THEN (
-             SELECT g.id FROM segments AS g
-             WHERE g.session_id = e.session_id AND g.start_offset <= e.byte_offset
-             ORDER BY g.start_offset DESC LIMIT 1
-         ) ELSE (
-             SELECT a.segment_id FROM agents AS a
-             WHERE a.session_id = e.session_id AND a.agent_id = e.agent_id
-         ) END
-     FROM directs AS x
-     JOIN sessions AS c ON c.session_id = x.child
-     JOIN events AS e ON e.sent_msg_id = x.msg_id AND e.session_id = x.parent
-     WHERE (c.process_root = ?1 OR c.process_root IS NULL AND c.session_id = ?1)
-       AND EXISTS (SELECT 1 FROM segments AS g
-           JOIN workstream_roots AS r ON r.id = g.workstream_id
-           WHERE g.session_id = x.child AND r.root = ?2)
-     ORDER BY c.started_at IS NULL, c.started_at, x.child, e.id
-     LIMIT 1";
-
-/// The Session row (chain and workstream) of the window a unit's Session
-/// row (`chain`'s windows in `workstream`) was [`launched_from`]; `None`
-/// when no director messaged it, or messaged it from no window.
-fn director_row(conn: &Connection, chain: &str, workstream: i64) -> Result<Option<(String, i64)>> {
-    let Some((parent, Some(segment))) = launched_from(conn, chain, workstream)? else {
-        return Ok(None);
+/// Where work charged `charge` belongs: a PR charge under the issue it
+/// closes when the cache holds one; an issue under the PR its row links
+/// (`links`, newest first), else the issue's only PR.
+fn place(gh: &Gh, charge: Option<&Charge>, links: &[PrLink]) -> Place {
+    let Some(c) = charge else {
+        return Place::Unlinked;
     };
-    let (chain, workstream): (Option<String>, Option<i64>) = conn
-        .prepare_cached(
-            "SELECT (SELECT ifnull(process_root, session_id) FROM sessions WHERE session_id = ?1),
-                 (SELECT r.root FROM segments AS g
-                  JOIN workstream_roots AS r ON r.id = g.workstream_id WHERE g.id = ?2)",
-        )?
-        .query_row(rusqlite::params![parent, segment], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?;
-    Ok(chain.zip(workstream))
-}
-
-/// When Session row `chain`'s windows in `workstream` starts: its first
-/// window's start, `None` when no window has one.
-fn row_start(conn: &Connection, chain: &str, workstream: i64) -> Result<Option<i64>> {
-    let starts: Vec<Option<String>> = conn
-        .prepare_cached(ROW_START_SQL)?
-        .query_map(rusqlite::params![chain, workstream], |r| r.get(0))?
-        .collect::<Result<_>>()?;
-    Ok(starts
-        .iter()
-        .filter_map(|s| s.as_deref().and_then(parse_timestamp))
-        .min())
-}
-
-/// [`row_start`]'s query.
-const ROW_START_SQL: &str = "SELECT g.started_at FROM segments AS g
-     JOIN sessions AS s ON s.session_id = g.session_id
-     JOIN workstream_roots AS r ON r.id = g.workstream_id
-     WHERE (s.process_root = ?1 OR s.process_root IS NULL AND s.session_id = ?1)
-         AND r.root = ?2";
-
-/// A unit's Session row, as [`unit_rows`] reads it.
-struct UnitRow {
-    chain: String,
-    workstream: i64,
-    /// Its merge-resolved name.
-    name: String,
-    /// What that name says, unless it is a cwd/branch fallback.
-    parsed: Option<ParsedName>,
-}
-
-/// The unit rows that nest under Session row `chain`'s windows in
-/// `workstream`: each row (unit chain and workstream) of a session one of
-/// `chain`'s sessions directed whose [`launched_from`] is a window of
-/// that row, in chain and workstream order.
-fn unit_rows(conn: &Connection, chain: &str, workstream: i64) -> Result<Vec<UnitRow>> {
-    let candidates: Vec<(String, i64, String, bool)> = conn
-        .prepare_cached(UNIT_ROWS_SQL)?
-        .query_map([chain], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })?
-        .collect::<Result<_>>()?;
-    let mut out = Vec::new();
-    for (unit_chain, unit_workstream, name, fallback) in candidates {
-        if (unit_chain.as_str(), unit_workstream) == (chain, workstream) {
-            continue;
+    let numbered = c.repo.clone().zip(c.number.map(|n| n as i64));
+    match (c.kind, numbered) {
+        (ChargeKind::Topic, _) => c.topic.clone().map_or(Place::Unlinked, Place::Topic),
+        (ChargeKind::Repo, _) => c.repo.clone().map_or(Place::Unlinked, Place::Repo),
+        (ChargeKind::Epic, Some((repo, number))) => Place::Epic { repo, number },
+        (ChargeKind::Issue, Some((repo, issue))) => {
+            let prs = gh.prs(&repo, issue);
+            let only = match prs {
+                [only] => Some(only.number),
+                _ => None,
+            };
+            Place::Issue {
+                pr: linked_pr(prs, links, &repo).or(only),
+                repo,
+                issue,
+            }
         }
-        let director = director_row(conn, &unit_chain, unit_workstream)?;
-        if director.is_some_and(|(c, w)| c == chain && w == workstream) {
-            out.push(UnitRow {
-                chain: unit_chain,
-                workstream: unit_workstream,
-                parsed: (!fallback).then(|| parse_name(&name)).flatten(),
-                name,
-            });
-        }
+        (ChargeKind::Pr, Some((repo, number))) => match gh.closed_by(&repo, number) {
+            Some(issue) => Place::Issue {
+                repo,
+                issue,
+                pr: Some(number),
+            },
+            None => Place::Pr { repo, number },
+        },
+        // A numbered kind with no number: the parser never makes one.
+        _ => Place::Unlinked,
     }
-    Ok(out)
-}
-
-/// [`unit_rows`]' query: each row (chain and workstream) of a session
-/// `?1`'s sessions directed, with its merge-resolved name.
-const UNIT_ROWS_SQL: &str = "SELECT DISTINCT ifnull(c.process_root, c.session_id), r.root, w.name,
-         w.fallback
-     FROM directs AS x
-     JOIN sessions AS p ON p.session_id = x.parent
-     JOIN sessions AS c ON c.session_id = x.child
-     JOIN segments AS g ON g.session_id = x.child
-     JOIN workstream_roots AS r ON r.id = g.workstream_id
-     JOIN workstreams AS w ON w.id = r.root
-     WHERE (p.process_root = ?1 OR p.process_root IS NULL AND p.session_id = ?1)
-     ORDER BY 1, 2";
-
-/// Every repo a `director-<repo>` name can name: the GitHub cache's, and
-/// those window names parse to.
-fn known_repos(conn: &Connection) -> Result<HashSet<String>> {
-    let mut known: HashSet<String> = conn
-        .prepare_cached("SELECT slug FROM gh_repos")?
-        .query_map([], |r| r.get(0))?
-        .collect::<Result<_>>()?;
-    let names: Vec<String> = conn
-        .prepare_cached("SELECT name FROM workstreams WHERE fallback = 0")?
-        .query_map([], |r| r.get(0))?
-        .collect::<Result<_>>()?;
-    known.extend(names.iter().filter_map(|n| parse_name(n)).map(|p| p.repo));
-    Ok(known)
-}
-
-/// What every window of one session shares.
-struct Session {
-    /// Its process root, else its id: what its `/clear` chain shares.
-    chain: String,
-    /// Its first record.
-    start: Option<i64>,
-    /// Its last activity: the latest record its timeline counts.
-    last: Option<i64>,
 }
 
 /// A PR a session's transcript linked (`github_links`).
@@ -686,135 +493,27 @@ struct PrLink {
     repository: Option<String>,
 }
 
-/// A session's chain, its start and its last activity: the latest record
-/// its timeline counts, read from the `events_session_time` index alone
-/// (v10, #46).
-const SESSION_SQL: &str = "SELECT
-         (SELECT ifnull(process_root, session_id) FROM sessions WHERE session_id = ?1),
-         (SELECT started_at FROM sessions WHERE session_id = ?1),
-         (SELECT max(timestamp) FROM events
-          WHERE session_id = ?1 AND timestamp IS NOT NULL
-            AND ifnull(type, '') NOT IN ('custom-title', 'ai-title', 'cost-state'))";
+/// A session's `github_links`, newest first.
+const LINKS_SQL: &str = "SELECT pr_url, pr_number, pr_repository FROM github_links
+     WHERE session_id = ?1 ORDER BY id DESC";
 
-/// The `github_links` of every session of `chain` with a window in
-/// `workstream` (a Session row's sessions), newest first: the latest
-/// session's first, each session's in link order, newest first.
-fn row_links(conn: &Connection, chain: &str, workstream: i64) -> Result<Vec<PrLink>> {
-    conn.prepare_cached(ROW_LINKS_SQL)?
-        .query_map(rusqlite::params![chain, workstream], |r| {
+/// The `github_links` of `sessions` (newest first), each session's newest
+/// first.
+fn row_links(conn: &Connection, sessions: Vec<&str>) -> Result<Vec<PrLink>> {
+    let mut stmt = conn.prepare_cached(LINKS_SQL)?;
+    let mut out = Vec::new();
+    for session in sessions {
+        for link in stmt.query_map([session], |r| {
             Ok(PrLink {
                 url: r.get(0)?,
                 number: r.get(1)?,
                 repository: r.get(2)?,
             })
-        })?
-        .collect()
-}
-
-/// [`row_links`]' query.
-const ROW_LINKS_SQL: &str = "SELECT l.pr_url, l.pr_number, l.pr_repository
-     FROM github_links AS l JOIN sessions AS s ON s.session_id = l.session_id
-     WHERE (s.process_root = ?1 OR s.process_root IS NULL AND s.session_id = ?1)
-       AND EXISTS (SELECT 1 FROM segments AS g
-           JOIN workstream_roots AS r ON r.id = g.workstream_id
-           WHERE g.session_id = s.session_id AND r.root = ?2)
-     ORDER BY s.started_at IS NULL, s.started_at DESC, s.session_id DESC, l.id DESC";
-
-impl Session {
-    fn load(conn: &Connection, session_id: &str) -> Result<Self> {
-        let (chain, start, last): (Option<String>, Option<String>, Option<String>) = conn
-            .prepare_cached(SESSION_SQL)?
-            .query_row([session_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-        Ok(Self {
-            chain: chain.unwrap_or_else(|| session_id.to_string()),
-            start: start.as_deref().and_then(parse_timestamp),
-            last: last.as_deref().and_then(parse_timestamp),
-        })
+        })? {
+            out.push(link?);
+        }
     }
-}
-
-/// A window's name (merge-resolved) and where it starts and the next one
-/// starts.
-struct Named {
-    name: String,
-    /// A cwd/branch fallback, not a name the user set.
-    fallback: bool,
-    start: Option<i64>,
-    next: Option<i64>,
-    /// Its merge-resolved workstream; `None` for a session with no window.
-    workstream: Option<i64>,
-}
-
-/// Each segment matching `{segments}` with its merge-resolved name and
-/// workstream, and the start of its session's next segment.
-const NAMED_SQL: &str = "SELECT g.id, w.name, w.fallback, g.started_at, g.next, r.root
-     FROM (
-         SELECT id, workstream_id, started_at,
-             lead(started_at) OVER (PARTITION BY session_id ORDER BY start_offset) AS next
-         FROM segments
-         WHERE {segments}
-     ) AS g
-     JOIN workstream_roots AS r ON r.id = g.workstream_id
-     JOIN workstreams AS w ON w.id = r.root";
-
-impl Named {
-    /// Every segment of the sessions with cells on days `from..=to`, by id,
-    /// in one query (one pass over the recursive `workstream_roots`).
-    fn load_all(conn: &Connection, from: &str, to: &str) -> Result<HashMap<i64, Self>> {
-        let sql = NAMED_SQL.replace(
-            "{segments}",
-            "session_id IN (SELECT session_id FROM audit_cells WHERE day BETWEEN ?1 AND ?2)",
-        );
-        conn.prepare_cached(&sql)?
-            .query_map([from, to], Self::read)?
-            .collect()
-    }
-
-    /// Segment `id` alone: a director's window with no cells in the filter.
-    fn load(conn: &Connection, id: i64) -> Result<Option<Self>> {
-        let sql = NAMED_SQL.replace(
-            "{segments}",
-            "session_id = (SELECT session_id FROM segments WHERE id = ?1)",
-        );
-        conn.prepare_cached(&format!("{sql} WHERE g.id = ?1"))?
-            .query_row([id], Self::read)
-            .optional()
-            .map(|found| found.map(|(_, named)| named))
-    }
-
-    fn read(r: &Row) -> Result<(i64, Self)> {
-        let at = |s: Option<String>| s.as_deref().and_then(parse_timestamp);
-        Ok((
-            r.get(0)?,
-            Self {
-                name: r.get(1)?,
-                fallback: r.get(2)?,
-                start: at(r.get(3)?),
-                next: at(r.get(4)?),
-                workstream: r.get(5)?,
-            },
-        ))
-    }
-}
-
-/// Where a window named `parsed` belongs: under its repo and issue, and
-/// under the PR its row links (else the issue's only PR) when the GitHub
-/// cache holds the issue. Only a name that doesn't parse is Unlinked.
-fn place(gh: &Gh, parsed: Option<&ParsedName>, links: &[PrLink]) -> Place {
-    let Some(p) = parsed else {
-        return Place::Unlinked;
-    };
-    let issue = p.issue as i64;
-    let prs = gh.prs(&p.repo, issue);
-    let only = match prs {
-        [only] => Some(only.number),
-        _ => None,
-    };
-    Place::Linked {
-        pr: linked_pr(prs, links, &p.repo).or(only),
-        repo: p.repo.clone(),
-        issue,
-    }
+    Ok(out)
 }
 
 /// The newest of the row's links that names one of `prs`, by URL or by
@@ -832,42 +531,110 @@ fn linked_pr(prs: &[GhPr], links: &[PrLink], repo: &str) -> Option<i64> {
     })
 }
 
+/// A session as its Session row shows it.
+pub(crate) struct Session {
+    /// Its process root, else its id: what its `/clear` chain shares.
+    chain: String,
+    /// Its orchestrator's name, else its registry name, else its id.
+    pub(crate) label: String,
+    /// Its first record.
+    pub(crate) start: Option<i64>,
+    /// Its first record to its last activity: the latest record its
+    /// timeline counts.
+    pub(crate) span: Option<(i64, i64)>,
+}
+
+/// A session's chain, start, last activity (the latest record its timeline
+/// counts, read from the `events_session_time` index alone: v10, #46) and
+/// names.
+const SESSION_SQL: &str = "SELECT
+         (SELECT ifnull(process_root, session_id) FROM sessions WHERE session_id = ?1),
+         (SELECT started_at FROM sessions WHERE session_id = ?1),
+         (SELECT max(timestamp) FROM events
+          WHERE session_id = ?1 AND timestamp IS NOT NULL
+            AND ifnull(type, '') NOT IN ('custom-title', 'ai-title', 'cost-state')),
+         (SELECT name FROM agents WHERE session_id = ?1 AND agent_id IS NULL),
+         (SELECT name FROM registry WHERE session_id = ?1 AND name <> ''
+          ORDER BY gone, last_seen_ms DESC, id DESC LIMIT 1)";
+
+impl Session {
+    fn load(conn: &Connection, session_id: &str) -> Result<Self> {
+        type Read = (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        );
+        let (chain, start, last, name, listed): Read = conn
+            .prepare_cached(SESSION_SQL)?
+            .query_row([session_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?;
+        let start = start.as_deref().and_then(parse_timestamp);
+        let last = last.as_deref().and_then(parse_timestamp);
+        Ok(Self {
+            chain: chain.unwrap_or_else(|| session_id.to_string()),
+            label: name.or(listed).unwrap_or_else(|| session_id.to_string()),
+            start,
+            span: start.map(|s| (s, last.unwrap_or(s).max(s))),
+        })
+    }
+}
+
+/// [`Agent::load_all`]'s query: each subagent's first and last record from
+/// the `events_timeline` index.
+const AGENTS_SQL: &str = "SELECT a.session_id, a.agent_id,
+     coalesce(a.name, a.description, a.agent_type), a.agent_type, a.run_ms,
+     (SELECT min(e.timestamp) FROM events AS e INDEXED BY events_timeline
+      WHERE e.session_id = a.session_id AND e.agent_id = a.agent_id
+        AND e.timestamp IS NOT NULL),
+     (SELECT max(e.timestamp) FROM events AS e INDEXED BY events_timeline
+      WHERE e.session_id = a.session_id AND e.agent_id = a.agent_id
+        AND e.timestamp IS NOT NULL)
+ FROM agents AS a
+ WHERE a.agent_id IS NOT NULL AND a.session_id IN (
+     SELECT session_id FROM audit_cells
+     WHERE day BETWEEN ?1 AND ?2 AND agent_id IS NOT NULL
+ )";
+
 /// A subagent as its node shows it.
 pub(crate) struct Agent {
     pub(crate) label: String,
     pub(crate) agent_type: Option<String>,
     pub(crate) run_ms: Option<i64>,
+    /// Its first record to its last.
+    pub(crate) span: Option<(i64, i64)>,
 }
 
 impl Agent {
     /// Every subagent of the sessions with subagent cells on days
-    /// `from..=to`, by (session, agent id), in one query.
+    /// `from..=to`, by (session, agent id), in one query; each one's first
+    /// and last record from the `events_timeline` index.
     fn load_all(
         conn: &Connection,
         from: &str,
         to: &str,
     ) -> Result<HashMap<(String, String), Self>> {
-        conn.prepare_cached(
-            "SELECT session_id, agent_id,
-                 coalesce(name, description, agent_type), agent_type, run_ms
-             FROM agents
-             WHERE agent_id IS NOT NULL AND session_id IN (
-                 SELECT session_id FROM audit_cells
-                 WHERE day BETWEEN ?1 AND ?2 AND agent_id IS NOT NULL
-             )",
-        )?
-        .query_map([from, to], |r| {
-            let agent_id: String = r.get(1)?;
-            Ok((
-                (r.get(0)?, agent_id.clone()),
-                Self {
-                    label: r.get::<_, Option<String>>(2)?.unwrap_or(agent_id),
-                    agent_type: r.get(3)?,
-                    run_ms: r.get(4)?,
-                },
-            ))
-        })?
-        .collect()
+        conn.prepare_cached(AGENTS_SQL)?
+            .query_map([from, to], |r| {
+                let agent_id: String = r.get(1)?;
+                let at = |i: usize| -> Result<Option<i64>> {
+                    Ok(r.get::<_, Option<String>>(i)?
+                        .as_deref()
+                        .and_then(parse_timestamp))
+                };
+                Ok((
+                    (r.get(0)?, agent_id.clone()),
+                    Self {
+                        label: r.get::<_, Option<String>>(2)?.unwrap_or(agent_id),
+                        agent_type: r.get(3)?,
+                        run_ms: r.get(4)?,
+                        span: at(5)?.zip(at(6)?),
+                    },
+                ))
+            })?
+            .collect()
     }
 
     /// A subagent with cells but no `agents` row.
@@ -876,6 +643,7 @@ impl Agent {
             label: agent_id.to_string(),
             agent_type: None,
             run_ms: None,
+            span: None,
         }
     }
 }
@@ -905,125 +673,36 @@ mod tests {
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
-    /// A Session row's queries find its chain's sessions by the
-    /// process-root index and the session key, then their rows by key: no
-    /// scan of `sessions`, `directs`, `segments` or `github_links` for
-    /// every row (#67). Only `workstream_roots`' merge walk scans, over
-    /// `workstreams`.
+    /// A subagent's first and last record come from the timeline index
+    /// alone: the performance read loads every subagent in the store.
     #[test]
-    fn a_rows_chain_is_read_by_index() {
-        let dir = test_dir("chain-plans");
+    fn a_subagents_run_reads_the_timeline_index() {
+        let dir = test_dir("agents-plan");
         let db = dir.join("strate.db");
         drop(Store::open(&db).expect("open"));
         let conn = Store::open_reader(&db).expect("reader");
-        for (name, sql, chain) in [
-            ("launched_from", LAUNCHED_FROM_SQL, "c"),
-            ("row_start", ROW_START_SQL, "s"),
-            ("unit_rows", UNIT_ROWS_SQL, "p"),
-            ("row_links", ROW_LINKS_SQL, "s"),
-        ] {
-            let found = query_plan(&conn, sql).join("\n");
-            let by_root =
-                format!("SEARCH {chain} USING INDEX sessions_process_root (process_root=?)");
-            assert!(found.contains(&by_root), "{name}: {found}");
-            let scans = found
-                .lines()
-                .filter(|step| step.starts_with("SCAN "))
-                .filter(|step| !["SCAN workstreams", "SCAN r"].contains(step));
-            assert_eq!(scans.count(), 0, "{name}: {found}");
-        }
+        let plan = query_plan(&conn, AGENTS_SQL).join("\n");
+        let by_index =
+            "SEARCH e USING COVERING INDEX events_timeline (session_id=? AND agent_id=?)";
+        assert_eq!(plan.matches(by_index).count(), 2, "{plan}");
         drop(conn);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
-    /// Rows A (`director-alpha`: `z1` at 10:00, then `z2` after a
-    /// `/clear`) and B (`director-beta`: `b1` at 11:00) direct each other:
-    /// `z1` messaged `b1` first, and `b1` messaged `z2`, which `directs`
-    /// allows (it refuses only a cycle of sessions). B also directs C
-    /// (`demo-7`). Session ids sort B's row before A's.
-    const MUTUAL: &str = "
-        INSERT INTO workstreams (id, name) VALUES
-            (1, 'director-alpha'), (2, 'director-beta'), (3, 'demo-7');
-        INSERT INTO sessions (session_id, process_root, started_at) VALUES
-            ('z1', 'z1', '2026-10-07T10:00:00.000Z'), ('z2', 'z1', '2026-10-07T12:00:00.000Z'),
-            ('b1', 'b1', '2026-10-07T11:00:00.000Z'), ('c1', 'c1', '2026-10-07T11:30:00.000Z');
-        INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id) VALUES
-            (1, 'z1', 0, '2026-10-07T10:00:00.000Z', 1),
-            (2, 'z2', 0, '2026-10-07T12:00:00.000Z', 1),
-            (3, 'b1', 0, '2026-10-07T11:00:00.000Z', 2),
-            (4, 'c1', 0, '2026-10-07T11:30:00.000Z', 3);
-        INSERT INTO events (session_id, file, byte_offset, raw, sent_msg_id) VALUES
-            ('z1', 'z1.jsonl', 10, '{}', 'm1'),
-            ('b1', 'b1.jsonl', 10, '{}', 'm2'),
-            ('b1', 'b1.jsonl', 20, '{}', 'm3');
-        INSERT INTO directs (child, parent, msg_id) VALUES
-            ('b1', 'z1', 'm1'), ('z2', 'b1', 'm2'), ('c1', 'b1', 'm3');";
-
-    /// Rows that direct each other nest by the earlier-started row, the
-    /// same way whichever window resolves first.
+    /// A session's links are read by its key: no scan of `github_links`
+    /// for every Session row (#67).
     #[test]
-    fn rows_that_direct_each_other_nest_under_the_earlier_started_whatever_the_order() {
-        let dir = test_dir("audit-mutual");
-        let store = Store::open_in(dir.join("strate.db"), "UTC").expect("open");
-        store.conn.execute_batch(MUTUAL).expect("seed");
-        let gh = Gh::load(&store.conn).expect("gh");
-        let windows = [("z1", 1), ("b1", 3), ("c1", 4)];
-        // Each window's rows, innermost first, and its director repo.
-        let nesting = |order: &[(&str, i64)]| {
-            let mut w = Windows::default();
-            for &(session, segment) in order {
-                w.get(&store.conn, &gh, session, Some(segment))
-                    .expect("window");
-            }
-            windows.map(|(session, segment)| {
-                let at = w.index[&(session.to_string(), Some(segment))];
-                let rows: Vec<String> = w.up(at).map(|x| x.row.clone()).collect();
-                (rows, w.list[at].director_repo.clone())
-            })
-        };
-        let alpha = || "z1/1".to_string();
-        let beta = || "b1/2".to_string();
-        let demo = || Some("demo".to_string());
-        let expected = [
-            (vec![alpha()], demo()),
-            (vec![beta(), alpha()], demo()),
-            (vec!["c1/3".to_string(), beta(), alpha()], None),
-        ];
-        let mut reversed = windows;
-        reversed.reverse();
-        assert_eq!(nesting(&windows), expected, "A's window first");
-        assert_eq!(nesting(&reversed), expected, "C's window first");
-        drop(store);
-        std::fs::remove_dir_all(dir).expect("cleanup");
-    }
-
-    /// A row whose first link directed its next is a cycle of one: it
-    /// tops it, under nothing.
-    #[test]
-    fn a_row_that_directs_itself_nests_under_nothing() {
-        let dir = test_dir("audit-self-directed");
-        let store = Store::open_in(dir.join("strate.db"), "UTC").expect("open");
-        store
-            .conn
-            .execute_batch(
-                "INSERT INTO workstreams (id, name) VALUES (1, 'director-alpha');
-                 INSERT INTO sessions (session_id, process_root, started_at) VALUES
-                     ('z1', 'z1', '2026-10-07T10:00:00.000Z'),
-                     ('z2', 'z1', '2026-10-07T12:00:00.000Z');
-                 INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id)
-                 VALUES (1, 'z1', 0, '2026-10-07T10:00:00.000Z', 1),
-                     (2, 'z2', 0, '2026-10-07T12:00:00.000Z', 1);
-                 INSERT INTO events (session_id, file, byte_offset, raw, sent_msg_id)
-                 VALUES ('z1', 'z1.jsonl', 10, '{}', 'm1');
-                 INSERT INTO directs (child, parent, msg_id) VALUES ('z2', 'z1', 'm1');",
-            )
-            .expect("seed");
-        let gh = Gh::load(&store.conn).expect("gh");
-        let mut w = Windows::default();
-        let at = w.get(&store.conn, &gh, "z2", Some(2)).expect("window");
-        let rows: Vec<&str> = w.up(at).map(|x| x.row.as_str()).collect();
-        assert_eq!(rows, ["z1/1"]);
-        drop(store);
+    fn a_sessions_links_are_read_by_index() {
+        let dir = test_dir("links-plan");
+        let db = dir.join("strate.db");
+        drop(Store::open(&db).expect("open"));
+        let conn = Store::open_reader(&db).expect("reader");
+        let plan = query_plan(&conn, LINKS_SQL).join("\n");
+        assert!(
+            plan.starts_with("SEARCH github_links USING INDEX"),
+            "{plan}"
+        );
+        drop(conn);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 }

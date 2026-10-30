@@ -3,9 +3,9 @@
 //!
 //! The node is resolved as the tree resolves it: the cells in the filter
 //! whose [`path`] passes through the node's steps. Their sessions' events
-//! are replayed into runs cut where the cells are cut (local midnights, and
-//! window starts on the orchestrator's line), so a span sits in exactly one
-//! cell and a cell's time is the sum of its spans.
+//! are replayed into runs cut where the cells are cut (local midnights), so
+//! a span sits in exactly one cell and a cell's time is the sum of its
+//! spans.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -63,9 +63,8 @@ pub struct TimelineDay {
     pub marks: Vec<TimelineMark>,
 }
 
-/// A cell's time: its session, agent (`None`: the orchestrator), window
-/// and day.
-type CellKey<'a> = (&'a str, Option<&'a str>, Option<i64>, &'a str);
+/// A cell's time: its session, agent (`None`: the orchestrator) and day.
+type CellKey<'a> = (&'a str, Option<&'a str>, &'a str);
 
 /// The days in `filter` with work or a mark of the node at `path` (its
 /// steps from the root, which may lead with the root's own). An unknown
@@ -90,12 +89,7 @@ pub fn audit_timeline(
             continue;
         }
         if has_time(cell) {
-            timed.insert((
-                &cell.session_id,
-                cell.agent_id.as_deref(),
-                cell.segment,
-                &cell.day,
-            ));
+            timed.insert((&cell.session_id, cell.agent_id.as_deref(), &cell.day));
         }
         // The node's own step and those under it.
         let at_or_under = &steps[path.len().saturating_sub(1)..];
@@ -111,7 +105,7 @@ pub fn audit_timeline(
             else {
                 continue;
             };
-            let key = (session, run.agent.as_deref(), run.segment, day.as_str());
+            let key = (session, run.agent.as_deref(), day.as_str());
             if timed.contains(&key) {
                 let spans = pieces.into_iter().map(|(start_ms, end_ms)| TimelineSpan {
                     start_ms,

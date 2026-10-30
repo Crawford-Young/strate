@@ -3,35 +3,31 @@
 
 use std::collections::HashMap;
 
-use rusqlite::Connection;
-
 use super::Headline;
-use super::cells::{Cells, Place};
+use super::cells::Cells;
 use super::gh::Gh;
-use crate::names::parse_name;
-use crate::store::Result;
-use crate::time::parse_timestamp;
 
 /// The headline over the cells in the filter: each issue closed as
 /// completed and each merged PR that has work there, with that work's $.
-/// An issue's elapsed is its whole life, from its first window ever.
-pub(crate) fn headline(conn: &Connection, gh: &Gh, cells: &Cells) -> Result<Headline> {
+/// An issue's elapsed is its whole life, from the first session ever
+/// charged to it.
+pub(crate) fn headline(gh: &Gh, cells: &Cells) -> Headline {
     let mut issues: HashMap<(&str, i64), f64> = HashMap::new();
     let mut merged: HashMap<(&str, i64), f64> = HashMap::new();
     for cell in &cells.list {
-        let Place::Linked { repo, issue, pr } = &cells.window(cell).place else {
+        let Some((repo, issue, pr)) = cells.row_of(cell).place.issue() else {
             continue;
         };
         let usd = cell.share.cost_usd.unwrap_or(0.0);
-        *issues.entry((repo, *issue)).or_default() += usd;
+        *issues.entry((repo, issue)).or_default() += usd;
         // A PR closing several issues counts once, with all their $.
-        if let Some(pr) = pr.and_then(|n| gh.pr(repo, *issue, n))
+        if let Some(pr) = pr.and_then(|n| gh.pr(repo, issue, n))
             && pr.merged_at.is_some()
         {
             *merged.entry((&pr.repo, pr.number)).or_default() += usd;
         }
     }
-    let starts = first_windows(conn)?;
+    let starts = cells.issue_starts(gh);
     let mut elapsed = Vec::new();
     let mut closed = Vec::new();
     for ((repo, number), usd) in issues {
@@ -48,7 +44,7 @@ pub(crate) fn headline(conn: &Connection, gh: &Gh, cells: &Cells) -> Result<Head
     let n = elapsed.len();
     let mean =
         |usd: Vec<f64>| (!usd.is_empty()).then(|| usd.iter().sum::<f64>() / usd.len() as f64);
-    Ok(Headline {
+    Headline {
         issues_closed: closed.len() as i64,
         median_elapsed_ms: match n {
             0 => None,
@@ -58,30 +54,5 @@ pub(crate) fn headline(conn: &Connection, gh: &Gh, cells: &Cells) -> Result<Head
         usd_per_closed_issue: mean(closed),
         usd_per_merged_pr: mean(merged.into_values().collect()),
         cloud_uncounted: true,
-    })
-}
-
-/// The start of each issue's first user-named window ever, by (repo, issue).
-fn first_windows(conn: &Connection) -> Result<HashMap<(String, i64), i64>> {
-    let mut stmt = conn.prepare_cached(
-        "SELECT w.name, g.started_at FROM segments AS g
-         JOIN workstream_roots AS r ON r.id = g.workstream_id
-         JOIN workstreams AS w ON w.id = r.root
-         WHERE NOT w.fallback AND g.started_at IS NOT NULL",
-    )?;
-    let mut rows = stmt.query([])?;
-    let mut first: HashMap<(String, i64), i64> = HashMap::new();
-    while let Some(r) = rows.next()? {
-        let (Some(parsed), Some(start)) = (
-            parse_name(&r.get::<_, String>(0)?),
-            parse_timestamp(&r.get::<_, String>(1)?),
-        ) else {
-            continue;
-        };
-        first
-            .entry((parsed.repo, parsed.issue as i64))
-            .and_modify(|s| *s = (*s).min(start))
-            .or_insert(start);
     }
-    Ok(first)
 }

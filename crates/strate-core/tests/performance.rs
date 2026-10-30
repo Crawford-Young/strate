@@ -26,9 +26,9 @@ use strate_core::tail::{Batch, Checkpoint, FileIdentity, TailEvent};
 use strate_core::time::parse_timestamp;
 
 const SID: &str = "5e55e1e1-0000-4000-8000-0000000000e1";
-/// Window perf-1 on 2026-10-05: issue #1's earlier work.
+/// perf-1 again on 2026-10-05: issue #1's earlier work.
 const G2: &str = "5e55e1e1-0000-4000-8000-0000000000e2";
-/// Window perf-3 on 2026-10-13: b7 (no report) and b8 (running).
+/// perf-3 on 2026-10-13: b7 (no report) and b8 (running).
 const G3: &str = "5e55e1e1-0000-4000-8000-0000000000e3";
 /// Never named, G3's /clear successor: Unlinked.
 const G4: &str = "5e55e1e1-0000-4000-8000-0000000000e4";
@@ -279,15 +279,17 @@ fn opening_a_store_from_an_older_rollup_version_backfills_every_column() {
     );
 }
 
-/// Each dispatch's state on perf-1's canvas, in `B` order: `None` once
-/// done, as the canvas leaves a finished worker to the Audit (#81).
+/// Each dispatch's state on perf-1's canvas (its chain's tab, named by its
+/// charge), in `B` order: `None` once done, as the canvas leaves a
+/// finished worker to the Audit (#81).
 fn states(reader: &Connection) -> Vec<Option<AgentState>> {
     let rows = views::workstreams(reader).expect("workstreams");
-    let perf1 = rows.iter().find(|w| w.name == "perf-1").expect("perf-1");
-    let graph = views::live_graph(reader, perf1.id)
-        .expect("query")
-        .expect("a graph");
-    assert_eq!(graph.session_id, SID);
+    let graph = rows
+        .iter()
+        .filter(|w| w.name == "issue_perf-1")
+        .filter_map(|w| views::live_graph(reader, w.id).expect("query"))
+        .find(|g| g.session_id == SID)
+        .expect("perf-1's graph");
     B.iter()
         .map(|b| {
             let agent = graph
@@ -466,7 +468,7 @@ fn a_closed_issue_counts_on_its_close_day_at_its_whole_life_cost() {
     assert_eq!(quiet.spend_usd, 0.0, "a day with nothing is still a point");
 
     assert!(close(o.unlinked_usd, usd(&db, &sessions(&[G4]))));
-    assert_eq!(o.unlinked_workstreams, 1);
+    assert_eq!(o.unlinked_charges, 1);
     assert!(close(o.open_usd, usd(&db, &sessions(&[G3]))));
     assert_eq!(o.open_issues, 1);
 
@@ -702,7 +704,7 @@ fn the_repo_filter_applies_to_every_section() {
     let db = built(&t);
     let p = read(&db, &["perf"]);
     assert_eq!(
-        (p.outcome.unlinked_usd, p.outcome.unlinked_workstreams),
+        (p.outcome.unlinked_usd, p.outcome.unlinked_charges),
         (0.0, 0)
     );
     assert!(close(
@@ -744,8 +746,8 @@ fn the_repo_filter_takes_the_empty_slug_as_unlinked() {
     let p = read(&db, &[""]);
     assert!(p.outcome.unlinked_usd > 0.0);
     assert_eq!(
-        (p.outcome.unlinked_usd, p.outcome.unlinked_workstreams),
-        (all.outcome.unlinked_usd, all.outcome.unlinked_workstreams)
+        (p.outcome.unlinked_usd, p.outcome.unlinked_charges),
+        (all.outcome.unlinked_usd, all.outcome.unlinked_charges)
     );
     assert!(close(
         p.outcome.days.iter().map(|d| d.spend_usd).sum(),
@@ -832,7 +834,7 @@ fn row(day: &str, repo: Option<&str>, ms: i64, prompts: i64) -> (String, Option<
 }
 
 #[test]
-fn permission_waits_count_on_the_day_they_started_in_their_window_repo() {
+fn permission_waits_count_on_the_day_they_started_in_their_charge_repo() {
     let t = Temp::new("permission");
     drop(built(&t));
     let mut store = Store::open_in(t.db(), "UTC").expect("open");
@@ -950,8 +952,8 @@ fn permission_waits_count_on_the_day_they_started_in_their_window_repo() {
 }
 
 #[test]
-fn an_orchestrator_wait_counts_in_the_window_it_started_in() {
-    let t = Temp::new("permission-windows");
+fn a_renamed_sessions_waits_count_under_its_one_charge() {
+    let t = Temp::new("permission-renamed");
     let mut store = Store::open_in(t.db(), "UTC").expect("open");
     let path: Arc<Path> = Path::new("/cfg/projects/-work-x/s-rename.jsonl").into();
     let records = [
@@ -973,23 +975,22 @@ fn an_orchestrator_wait_counts_in_the_window_it_started_in() {
             .collect(),
         checkpoint: None,
     };
-    // Each prompt is answered by the window's next record.
+    // Each prompt is answered by the session's next record.
     store
         .apply_hook(&permission("2026-10-07T10:00:02.000Z", "s-rename", None))
         .expect("alpha");
-    store.ingest(&part(0..3)).expect("alpha window");
+    store.ingest(&part(0..3)).expect("named alpha-1");
     store
         .apply_hook(&permission("2026-10-07T11:00:01.000Z", "s-rename", None))
         .expect("beta");
-    store.ingest(&part(3..6)).expect("beta window");
+    store.ingest(&part(3..6)).expect("renamed beta-2");
     drop(store);
     let db = Connection::open(t.db()).expect("db");
     let p = performance(&db, &filter("2026-10-07", "2026-10-07", &[])).expect("read");
+    // One agent, one charge: its latest name's, beta#2. A rename no
+    // longer splits the session.
     assert_eq!(
         permission_rows(&p),
-        [
-            row("2026-10-07", Some("alpha"), 3_000, 1),
-            row("2026-10-07", Some("beta"), 4_000, 1),
-        ]
+        [row("2026-10-07", Some("beta"), 3_000 + 4_000, 2)]
     );
 }

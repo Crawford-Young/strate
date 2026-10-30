@@ -75,6 +75,9 @@ pub struct SubagentMeta {
     pub effort: Option<String>,
     pub spawn_depth: Option<u64>,
     pub tool_use_id: Option<String>,
+    /// `parentAgentId`: the subagent of the same session that spawned this
+    /// one. Absent when the orchestrator did (observed 2026-10).
+    pub parent_agent_id: Option<String>,
     /// Teammate display name.
     pub name: Option<String>,
     /// Teammate team, matching a [`TeamNode::name`].
@@ -90,6 +93,10 @@ pub enum Link {
         parent: AgentRef,
         tool_use_id: String,
     },
+    /// Dispatch edge from meta `parentAgentId` alone: no `toolUseId`
+    /// resolves, the meta has no `teamName`, and it names another subagent
+    /// of the same session.
+    ParentAgent { parent: AgentRef },
     /// Teammate: meta has `teamName` and no `toolUseId`. `team_dir` is the
     /// `teams/<dir>` whose config `name` matches, when one exists.
     Teammate {

@@ -137,7 +137,7 @@ function OutcomeSection({ headline: h, outcome: o }: { headline: Headline; outco
         <StatTile
           label="No linked outcome"
           value={money(o.unlinkedUsd)}
-          delta={{ label: `${o.unlinkedWorkstreams} workstreams` }}
+          delta={{ label: `${o.unlinkedCharges} unlinked` }}
           hint="no <repo>-<issue> name"
         />
         <StatTile

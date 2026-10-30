@@ -1,10 +1,11 @@
-//! Audit cells (#26): one row per (session, agent, window, local day).
+//! Audit cells (#26): one row per (session, agent, local day, model).
 //! Invariants: the cells sum to the stored session and agent rollups and to
-//! the session's request tokens. Hand-computed cases: a window across local
+//! the session's request tokens. Hand-computed cases: a session across local
 //! midnight in America/Toronto, DST days (25 h and 23 h), a renamed
-//! (2-segment) transcript, a request with no timestamp, a zone change
-//! forcing a recompute, and the row timeline on the DST days. Every
-//! transcript is synthetic and every db lives in a temp dir.
+//! transcript (still one cell per agent and day, #107), a request with no
+//! timestamp, a zone change or an older rollup version forcing a recompute,
+//! and the row timeline on the DST days. Every transcript is synthetic and
+//! every db lives in a temp dir.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -92,7 +93,6 @@ fn tokens(input: u64, output: u64) -> Value {
 #[derive(Debug, Clone, PartialEq)]
 struct Cell {
     agent: Option<String>,
-    window: Option<String>,
     day: Option<String>,
     wall_ms: i64,
     active_ms: i64,
@@ -103,32 +103,28 @@ struct Cell {
     model: Option<String>,
 }
 
-/// The session's cells, each with its window's workstream name, ordered by
-/// agent, day, window start and model.
+/// The session's cells, ordered by agent (the orchestrator first), day and
+/// model.
 fn cells(db: &Connection, sid: &str) -> Vec<Cell> {
     db.prepare(
-        "SELECT c.agent_id, w.name, c.day, c.wall_ms, c.active_ms, c.wait_ms, c.cost_usd,
-             c.unpriced, c.input_tokens, c.output_tokens, c.cache_read_tokens,
-             c.cache_write_tokens, c.model
-         FROM audit_cells AS c
-         LEFT JOIN segments AS s ON s.id = c.segment_id
-         LEFT JOIN workstreams AS w ON w.id = s.workstream_id
-         WHERE c.session_id = ?1
-         ORDER BY c.agent_id IS NOT NULL, c.agent_id, c.day, s.start_offset, c.model",
+        "SELECT agent_id, day, wall_ms, active_ms, wait_ms, cost_usd, unpriced,
+             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, model
+         FROM audit_cells
+         WHERE session_id = ?1
+         ORDER BY agent_id IS NOT NULL, agent_id, day, model",
     )
     .expect("cells")
     .query_map([sid], |r| {
         Ok(Cell {
             agent: r.get(0)?,
-            window: r.get(1)?,
-            day: r.get(2)?,
-            wall_ms: r.get(3)?,
-            active_ms: r.get(4)?,
-            wait_ms: r.get(5)?,
-            cost_usd: r.get(6)?,
-            unpriced: r.get(7)?,
-            tokens: [r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?],
-            model: r.get(12)?,
+            day: r.get(1)?,
+            wall_ms: r.get(2)?,
+            active_ms: r.get(3)?,
+            wait_ms: r.get(4)?,
+            cost_usd: r.get(5)?,
+            unpriced: r.get(6)?,
+            tokens: [r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?],
+            model: r.get(11)?,
         })
     })
     .expect("query")
@@ -336,7 +332,7 @@ fn across_midnight() -> Vec<Value> {
 }
 
 #[test]
-fn a_window_across_local_midnight_splits_into_two_days() {
+fn a_session_across_local_midnight_splits_into_two_days() {
     let t = Temp::new("midnight");
     let mut store = Store::open_in(t.db(), TORONTO).expect("open");
     store
@@ -349,7 +345,6 @@ fn a_window_across_local_midnight_splits_into_two_days() {
     // haiku: $1/M in, $5/M out: (1000 + 1000) / 1e6 and (2000 + 2000) / 1e6.
     let day = |d: &str, cost: f64, input: i64, output: i64| Cell {
         agent: None,
-        window: None,
         day: Some(d.into()),
         wall_ms: 10 * MIN,
         active_ms: 10 * MIN,
@@ -359,10 +354,7 @@ fn a_window_across_local_midnight_splits_into_two_days() {
         tokens: [input, output, 0, 0],
         model: Some(HAIKU.into()),
     };
-    let got: Vec<Cell> = cells(&db, "s1")
-        .into_iter()
-        .map(|c| Cell { window: None, ..c })
-        .collect();
+    let got = cells(&db, "s1");
     assert_eq!(got.len(), 2, "{got:#?}");
     for (got, want) in got.iter().zip([
         day("2026-10-02", 0.002, 1000, 200),
@@ -554,7 +546,7 @@ fn a_dst_days_timeline_sits_on_the_wall_clock() {
 }
 
 #[test]
-fn a_renamed_transcript_splits_per_window_and_a_subagent_keeps_its_own() {
+fn a_renamed_transcript_is_one_cell_per_agent_day_and_model() {
     let t = Temp::new("renamed");
     let mut store = Store::open_in(t.db(), TORONTO).expect("open");
     let cached = json!({"input_tokens": 10, "output_tokens": 20,
@@ -569,7 +561,7 @@ fn a_renamed_transcript_splits_per_window_and_a_subagent_keeps_its_own() {
             HAIKU,
             cached.clone(),
         ),
-        title("demo-9-s2"),
+        title("issue_demo-9"),
         prompt("m3", "2026-10-03T10:10:00.000Z"),
         reply(
             "m4",
@@ -599,28 +591,20 @@ fn a_renamed_transcript_splits_per_window_and_a_subagent_keeps_its_own() {
     let db = reader(&t);
     invariants(&db);
     let got = cells(&db, "s1");
-    type Shape<'a> = (Option<&'a str>, Option<&'a str>, i64, i64, Option<&'a str>);
-    let shape: Vec<Shape> = got
+    let shape: Vec<(Option<&str>, i64, i64, Option<&str>)> = got
         .iter()
-        .map(|c| {
-            (
-                c.agent.as_deref(),
-                c.window.as_deref(),
-                c.wall_ms,
-                c.wait_ms,
-                c.model.as_deref(),
-            )
-        })
+        .map(|c| (c.agent.as_deref(), c.wall_ms, c.wait_ms, c.model.as_deref()))
         .collect();
-    // demo-9 runs 10:00-10:10 (its 10:05-10:10 wait for m3 included);
-    // demo-9-s2 from its first record at 10:10 to 10:15. The subagent
-    // (10:11-10:13) started under demo-9-s2.
+    // The rename cuts nothing: the orchestrator runs 10:00-10:15 as one
+    // timeline, waiting 10:05-10:10 for m3. Its two models tie at one
+    // request each, so the time sits on the latest, claude-lorem-1. The
+    // subagent runs 10:11-10:13.
     assert_eq!(
         shape,
         vec![
-            (None, Some("demo-9"), 10 * MIN, 5 * MIN, Some(HAIKU)),
-            (None, Some("demo-9-s2"), 5 * MIN, 0, Some("claude-lorem-1")),
-            (Some("a9"), Some("demo-9-s2"), 2 * MIN, 0, Some(HAIKU)),
+            (None, 0, 0, Some(HAIKU)),
+            (None, 15 * MIN, 5 * MIN, Some("claude-lorem-1")),
+            (Some("a9"), 2 * MIN, 0, Some(HAIKU)),
         ]
     );
     assert_eq!(got[0].tokens, [10, 20, 300, 40]);
@@ -748,49 +732,28 @@ fn a_model_switch_splits_a_cell_per_model_with_the_time_on_one() {
 }
 
 #[test]
-fn a_regroup_that_drops_a_window_leaves_no_cell_without_one() {
-    let t = Temp::new("regroup");
+fn a_store_accounted_by_an_older_rollup_version_recomputes_its_cells() {
+    let t = Temp::new("rollup-version");
     let mut store = Store::open_in(t.db(), TORONTO).expect("open");
-    let main = vec![
-        title("demo-9"),
-        prompt("m1", "2026-10-03T10:00:00.000Z"),
-        reply(
-            "m2",
-            Some("2026-10-03T10:05:00.000Z"),
-            "req_m1",
-            HAIKU,
-            tokens(1, 1),
-        ),
-        title("demo-9-s2"),
-        prompt("m3", "2026-10-03T10:10:00.000Z"),
-        reply(
-            "m4",
-            Some("2026-10-03T10:15:00.000Z"),
-            "req_m2",
-            HAIKU,
-            tokens(1, 1),
-        ),
-    ];
     store
-        .ingest(&batch(&transcript(&t, "s1", None), main))
+        .ingest(&batch(&transcript(&t, "s1", None), across_midnight()))
         .expect("ingest");
-    // The second title stops counting: a regroup drops its window.
-    Connection::open(t.db())
-        .expect("db")
-        .execute(
-            "UPDATE events SET custom_title = NULL WHERE custom_title = 'demo-9-s2'",
-            params![],
-        )
-        .expect("untitle");
-    store.regroup_all().expect("regroup");
-    let db = reader(&t);
-    let segments: i64 = db
-        .query_row("SELECT count(*) FROM segments", [], |r| r.get(0))
-        .expect("segments");
-    assert_eq!(segments, 1, "the regroup dropped a window");
-    invariants(&db);
-    let windows: Vec<Option<String>> = cells(&db, "s1").into_iter().map(|c| c.window).collect();
-    assert_eq!(windows, vec![Some("demo-9".to_string())]);
+    drop(store);
+    // Accounted by the build that cut cells at /rename windows (rollup 4).
+    let raw = Connection::open(t.db()).expect("db");
+    raw.execute_batch(
+        "UPDATE audit_cells SET wall_ms = -1;
+         UPDATE meta SET value = '4' WHERE key = 'rollup';",
+    )
+    .expect("an older store");
+    drop(raw);
+    drop(Store::open_in(t.db(), TORONTO).expect("reopen"));
+    let walls: Vec<i64> = cells(&reader(&t), "s1")
+        .into_iter()
+        .map(|c| c.wall_ms)
+        .collect();
+    assert_eq!(walls, vec![10 * MIN, 10 * MIN]);
+    invariants(&reader(&t));
 }
 
 #[test]

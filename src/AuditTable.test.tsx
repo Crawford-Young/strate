@@ -101,7 +101,8 @@ describe('level badges', () => {
       ),
     ])
     const unlinked = node('unlinked', '', {}, [], { label: 'Unlinked' })
-    render(table([chain, unlinked]))
+    const topic = node('topic', 'docs', {}, [], { label: 'docs' })
+    render(table([chain, topic, unlinked]))
     fireEvent.click(screen.getByRole('button', { name: 'Expand all' }))
     const level = (name: string) => within(row(name)).getByTestId('level').textContent
     expect(level('acme/web')).toBe('repo')
@@ -110,6 +111,7 @@ describe('level badges', () => {
     expect(level('PR #12')).toBe('PR')
     expect(level('acme-11')).toBe('session')
     expect(level('orchestrator')).toBe('agent')
+    expect(level('docs')).toBe('topic')
     expect(level('Unlinked')).toBe('no issue')
     expect(document.body.textContent).not.toContain('›')
   })

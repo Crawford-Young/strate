@@ -50,7 +50,6 @@ const HEADER = [
   'Cache write tokens',
   'Sessions',
   'Agents',
-  'Rotations',
   'Progress completed',
   'Progress total',
 ]

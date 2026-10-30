@@ -34,6 +34,9 @@ pub struct Pr {
     pub created_at: String,
     pub merged_at: Option<String>,
     pub url: String,
+    /// Its head branch; `None` when not fetched (a row cached before v21,
+    /// until the next refresh).
+    pub head_ref: Option<String>,
 }
 
 /// An issue; with `sub_total > 0` it is an epic over its sub-issues, whose
@@ -88,7 +91,7 @@ const QUERY: &str = "query($owner: String!, $name: String!, $after: String,
         subIssuesSummary { total completed }
         timelineItems(itemTypes: [REOPENED_EVENT], first: 1) { totalCount }
         closedByPullRequestsReferences(first: 10, includeClosedPrs: true) {
-          nodes { number state createdAt mergedAt url }
+          nodes { number state createdAt mergedAt url headRefName }
         }
       }
     }
@@ -207,6 +210,7 @@ struct PrNode {
     created_at: String,
     merged_at: Option<String>,
     url: String,
+    head_ref_name: Option<String>,
 }
 
 impl IssueNode {
@@ -228,6 +232,7 @@ impl IssueNode {
                 created_at: pr.created_at,
                 merged_at: pr.merged_at,
                 url: pr.url,
+                head_ref: pr.head_ref_name,
             })
             .collect();
         Issue {
@@ -390,7 +395,7 @@ pub enum Fetched {
     },
 }
 
-/// `slugs` (from [`Store::window_slugs`]) with the owner hints the store
+/// `slugs` (from [`Store::charge_slugs`]) with the owner hints the store
 /// holds.
 pub fn targets(store: &Store, slugs: &[String]) -> rusqlite::Result<Vec<Target>> {
     slugs

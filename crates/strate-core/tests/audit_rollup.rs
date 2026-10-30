@@ -4,7 +4,9 @@
 //! test (every additive metric of every node is the sum of its children,
 //! and the root is the sum of the cells in the filter), the splits by day,
 //! agent type and model, the date-range and repo filters, Unlinked and the
-//! headline. The row
+//! headline. Each charge kind's path (#107) over a synthetic store, and
+//! `tests/fixtures/model-home`: a subagent charged apart from its
+//! orchestrator, a topic, a messaged session and Unlinked. The row
 //! timeline (`audit_timeline`): hand values for demo-9 across a local
 //! midnight, and a property test (each day's spans sum to every node's
 //! cells that day). A nested epic (#47) over
@@ -18,7 +20,8 @@ use std::path::PathBuf;
 
 use rusqlite::Connection;
 use strate_core::discovery::discover;
-use strate_core::github::{Runner, refresh};
+use strate_core::github::{Runner, fetch_repo, refresh};
+use strate_core::registry::{Kind, RegistryEntry, RegistryEvent};
 use strate_core::store::Store;
 use strate_core::store::views::{
     Audit, AuditFilter, AuditNode, Metrics, NodeKind, SpanKind, TimelineDay, TimelineMark,
@@ -135,13 +138,13 @@ fn the_closed_issue_matches_its_hand_values() {
     let tree = october(&db).root;
     let demo9 = issue(&tree, "9");
     let m = &demo9.metrics;
-    // Two windows, each its own transcript (times Z, Toronto = Z - 4 h):
+    // Two sessions, each its own transcript (times Z, Toronto = Z - 4 h):
     // demo-9 (14:00:00..14:05:20 on Oct 4), relative seconds: prompt 0,
     // req_a1 10 (Agent toolu_a1), result 120, req_a2 130, prompt 310, req_a3
     // 320; its subagent at 20 and 80. Model [0,10] + [120,130] + [310,320],
     // tools [10,120], wait for the 310 prompt since the last work [130,310]
     // = 180 s; no gap over 10 min: active 320 s.
-    // demo-9-s2 (03:50:00..04:05:10 on Oct 5): prompt 0, req_b1 10 (Agent,
+    // issue_demo-9 (03:50:00..04:05:10 on Oct 5): prompt 0, req_b1 10 (Agent,
     // background), result 15, req_b2 25, prompt 900, req_b3 910; its subagent
     // at 20 and 140. Model [0,10] + [15,25] + [900,910], tools [10,15], wait
     // [25,140] (the wait [25,900] loses [140,900] to idle: 760 s > 10 min).
@@ -162,8 +165,8 @@ fn the_closed_issue_matches_its_hand_values() {
         (tk.input, tk.output, tk.cache_read, tk.cache_write),
         (7000, 1000, 70_000, 2000)
     );
-    assert_eq!((m.sessions, m.agents, m.rotations), (2, 2, 1));
-    // First window start Oct 4 14:00:00Z -> closed Oct 5 12:00:00Z = 22 h.
+    assert_eq!((m.sessions, m.agents), (2, 2));
+    // First session start Oct 4 14:00:00Z -> closed Oct 5 12:00:00Z = 22 h.
     assert_eq!(m.elapsed_ms, Some(22 * 3600 * S));
     assert!(!m.open);
     assert_eq!(m.progress, None);
@@ -179,23 +182,22 @@ fn the_closed_issue_matches_its_hand_values() {
 }
 
 #[test]
-fn windows_sit_under_their_pr_or_directly_under_the_issue() {
+fn sessions_sit_under_their_pr_or_directly_under_the_issue() {
     let t = Temp::new("levels");
     let db = build(&t);
     let tree = october(&db).root;
     let demo9 = issue(&tree, "9");
     assert_eq!(demo9.label, "#9 Ipsum rollup");
-    // demo-9-s2 links PR #12; demo-9 falls back to the issue's only PR.
+    // issue_demo-9 links PR #12; demo-9 falls back to the issue's only PR.
     assert_eq!(demo9.children.len(), 1);
     let pr = child(demo9, NodeKind::Pr, "12");
     assert!(!pr.metrics.open, "merged");
-    // First window start Oct 4 14:00:00Z -> merged Oct 5 11:00:00Z.
+    // First session start Oct 4 14:00:00Z -> merged Oct 5 11:00:00Z.
     assert_eq!(pr.metrics.elapsed_ms, Some(21 * 3600 * S));
     let first = labelled(pr, NodeKind::Session, "demo-9");
-    let second = labelled(pr, NodeKind::Session, "demo-9-s2");
+    let second = labelled(pr, NodeKind::Session, "issue_demo-9");
     assert_eq!(first.metrics.elapsed_ms, Some(320 * S));
     assert_eq!(second.metrics.elapsed_ms, Some(910 * S));
-    assert_eq!((first.metrics.rotations, second.metrics.rotations), (0, 1));
 
     // The agent level keeps its own active and waiting time.
     let orchestrator = child(first, NodeKind::Agent, "");
@@ -210,7 +212,7 @@ fn windows_sit_under_their_pr_or_directly_under_the_issue() {
     assert_eq!((sub.metrics.agents, orchestrator.metrics.agents), (1, 0));
     assert_eq!(first.metrics.active_ms, 320 * S, "not 320 + 60");
 
-    // #10 is open with no PR: its window sits directly under it.
+    // #10 is open with no PR: its session sits directly under it.
     let demo10 = issue(&tree, "10");
     let window = labelled(demo10, NodeKind::Session, "demo-10");
     assert!(demo10.metrics.open);
@@ -219,12 +221,12 @@ fn windows_sit_under_their_pr_or_directly_under_the_issue() {
 }
 
 #[test]
-fn an_epic_with_its_own_window_is_one_node_with_direct_work() {
+fn an_epic_with_its_own_session_is_one_node_with_direct_work() {
     let t = Temp::new("epic-direct");
     let db = build(&t);
     let tree = october(&db).root;
     let demo = child(&tree, NodeKind::Repo, "demo");
-    // #8 is an epic, so its window is not an `Issue 8` beside it.
+    // #8 is an epic, so its session is not an `Issue 8` beside it.
     let kinds: Vec<_> = demo
         .children
         .iter()
@@ -310,7 +312,7 @@ fn a_nested_epic_is_one_node_under_its_parent() {
         "nest-3",
     );
 
-    // One opus request per window: #2 holds its own and #3's, #1 also #4's.
+    // One opus request per session: #2 holds its own and #3's, #1 also #4's.
     assert!(close(2.0 * OPUS, two.metrics.cost_usd));
     assert!(close(3.0 * OPUS, one.metrics.cost_usd));
     assert_eq!((two.metrics.sessions, one.metrics.sessions), (2, 3));
@@ -341,13 +343,14 @@ fn a_parent_cycle_in_the_cache_stops_at_the_first_repeat() {
         &t,
         "INSERT INTO sessions (session_id, path, started_at) VALUES
              ('s1', '/p/s1.jsonl', '2026-10-02T10:00:00.000Z');
-         INSERT INTO workstreams (id, name, fallback) VALUES (1, 'ring-1', 0);
-         INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id)
-             VALUES (1, 's1', 0, '2026-10-02T10:00:00.000Z', 1);
-         INSERT INTO audit_cells (session_id, agent_id, segment_id, day, model, wall_ms,
+         INSERT INTO charges (id, key, kind, repo, number) VALUES
+             (1, 'issue_ring-1', 'issue', 'ring', 1);
+         INSERT INTO agents (session_id, kind, own_charge, own_charge_source)
+             VALUES ('s1', 'orchestrator', 1, 'name');
+         INSERT INTO audit_cells (session_id, agent_id, day, model, wall_ms,
              active_ms, wait_ms, cost_usd, unpriced, input_tokens, output_tokens,
              cache_read_tokens, cache_write_tokens) VALUES
-             ('s1', NULL, 1, '2026-10-02', 'm', 1000, 1000, 0, 1.0, 0, 10, 1, 0, 0);
+             ('s1', NULL, '2026-10-02', 'm', 1000, 1000, 0, 1.0, 0, 10, 1, 0, 0);
          INSERT INTO gh_repos (slug, owner, name, fetched_at) VALUES ('ring', 'example', 'ring', 1);
          INSERT INTO gh_issues (repo, number, title, state, created_at, parent, sub_total,
              sub_completed) VALUES
@@ -363,7 +366,7 @@ fn a_parent_cycle_in_the_cache_stops_at_the_first_repeat() {
 }
 
 #[test]
-fn only_unparsed_windows_are_unlinked() {
+fn only_uncharged_sessions_are_unlinked() {
     let t = Temp::new("unlinked");
     let db = build(&t);
     let tree = october(&db).root;
@@ -417,7 +420,7 @@ fn with_no_github_cache_issues_sit_under_their_repo() {
         .iter()
         .map(|c| (c.kind, c.key.as_str()))
         .collect();
-    // With no cache nothing says #8 is an epic: its window is an issue too.
+    // With no cache nothing says #8 is an epic: its session is an issue too.
     assert_eq!(
         kinds,
         [
@@ -429,7 +432,7 @@ fn with_no_github_cache_issues_sit_under_their_repo() {
     let demo9 = child(demo, NodeKind::Issue, "9");
     assert!(!demo9.github);
     assert_eq!(demo9.label, "demo #9");
-    // Both windows directly under the issue, no PR level.
+    // Both sessions directly under the issue, no PR level.
     assert!(demo9.children.iter().all(|c| c.kind == NodeKind::Session));
     // The hand values of the cached build, unchanged.
     let m = &demo9.metrics;
@@ -443,8 +446,8 @@ fn with_no_github_cache_issues_sit_under_their_repo() {
         (tk.input, tk.output, tk.cache_read, tk.cache_write),
         (7000, 1000, 70_000, 2000)
     );
-    assert_eq!((m.sessions, m.agents, m.rotations), (2, 2, 1));
-    // Open: Oct 4 14:00:00Z to demo-9-s2's last record, Oct 5 04:05:10Z.
+    assert_eq!((m.sessions, m.agents), (2, 2));
+    // Open: Oct 4 14:00:00Z to issue_demo-9's last record, Oct 5 04:05:10Z.
     assert!(m.open && m.progress.is_none());
     assert_eq!(m.elapsed_ms, Some((14 * 3600 + 5 * 60 + 10) * S));
     // Nothing is known closed or merged.
@@ -461,8 +464,8 @@ fn a_background_subagents_hours_are_its_own_run() {
     let db = build(&t);
     let tree = october(&db).root;
     let pr = child(issue(&tree, "9"), NodeKind::Pr, "12");
-    // demo-9-s2 launches it async (the string flag): [20,140] s.
-    let second = labelled(pr, NodeKind::Session, "demo-9-s2");
+    // issue_demo-9 launches it async (the string flag): [20,140] s.
+    let second = labelled(pr, NodeKind::Session, "issue_demo-9");
     assert_eq!(child(second, NodeKind::Agent, BG).metrics.agent_ms, 120 * S);
     let t = Temp::new("background-no-flag");
     let db = build_nest(&t);
@@ -479,7 +482,7 @@ fn the_date_range_keeps_the_cells_of_its_local_days() {
     let t = Temp::new("dates");
     let db = build(&t);
     let day = |d: &str| audit(&db, &filter(d, d, &[])).expect("audit").root;
-    // Local midnight is Oct 5 04:00:00Z, 600 s into demo-9-s2: Oct 4 has
+    // Local midnight is Oct 5 04:00:00Z, 600 s into issue_demo-9: Oct 4 has
     // [0,600] (active 600 - idle [140,600] = 140 s, waiting [25,140]),
     // Oct 5 has [600,910] (active 910 - 900 = 10 s, idle the rest).
     let oct4 = day("2026-10-04");
@@ -488,12 +491,12 @@ fn the_date_range_keeps_the_cells_of_its_local_days() {
     assert_eq!(m.agent_ms, 180 * S);
     // Everything but req_b3 (04:05:10Z, Oct 5 local).
     assert!(close(0.018 + 4.0 * OPUS + 2.0 * SONNET, m.cost_usd));
-    assert_eq!((m.sessions, m.rotations), (2, 1));
+    assert_eq!(m.sessions, 2);
     let oct5 = day("2026-10-05");
     let m = &issue(&oct5, "9").metrics;
     assert_eq!((m.active_ms, m.wait_ms, m.agent_ms), (10 * S, 0, 0));
     assert!(close(OPUS, m.cost_usd));
-    assert_eq!((m.sessions, m.agents, m.rotations), (1, 0, 1));
+    assert_eq!((m.sessions, m.agents), (1, 0));
     // #10 and other-3 are Oct 5 only; the unnamed session Oct 4 only.
     assert!(
         child(child(&oct4, NodeKind::Repo, "demo"), NodeKind::Epic, "8")
@@ -781,7 +784,6 @@ fn check_sums(node: &AuditNode, path: &str) {
     assert_eq!(m.agent_ms, sum(|k| k.agent_ms), "{path}: agent ms");
     assert_eq!(m.sessions, sum(|k| k.sessions), "{path}: sessions");
     assert_eq!(m.agents, sum(|k| k.agents), "{path}: agents");
-    assert_eq!(m.rotations, sum(|k| k.rotations), "{path}: rotations");
     // Agents run in parallel: a session is not the sum of its agents.
     if node.kind != NodeKind::Session {
         assert_eq!(m.active_ms, sum(|k| k.active_ms), "{path}: active");
@@ -793,21 +795,26 @@ fn check_sums(node: &AuditNode, path: &str) {
 }
 
 /// The cells in `[from, to]` that are not idle only, summed: $, the 4 token counts, agent ms
-/// (subagent wall), active and waiting (orchestrator cells), windows and
-/// subagents.
+/// (subagent wall), active and waiting (orchestrator cells), sessions (each
+/// session once per effective charge of its agents) and subagents.
 fn cell_totals(db: &Connection, from: &str, to: &str) -> (f64, [i64; 4], [i64; 3], [i64; 2]) {
     db.query_row(
-        "SELECT ifnull(sum(cost_usd), 0), sum(input_tokens), sum(output_tokens),
-             sum(cache_read_tokens), sum(cache_write_tokens),
-             sum(CASE WHEN agent_id IS NOT NULL THEN wall_ms ELSE 0 END),
-             sum(CASE WHEN agent_id IS NULL THEN active_ms ELSE 0 END),
-             sum(CASE WHEN agent_id IS NULL THEN wait_ms ELSE 0 END),
-             count(DISTINCT ifnull('w' || segment_id, session_id)),
-             count(DISTINCT session_id || '/' || agent_id)
-         FROM audit_cells WHERE day BETWEEN ?1 AND ?2
-             AND NOT (active_ms = 0 AND wait_ms = 0 AND cost_usd IS NULL AND unpriced = 0
-                 AND input_tokens + output_tokens + cache_read_tokens + cache_write_tokens = 0
-                 AND (agent_id IS NULL OR wall_ms = 0))",
+        "SELECT ifnull(sum(c.cost_usd), 0), sum(c.input_tokens), sum(c.output_tokens),
+             sum(c.cache_read_tokens), sum(c.cache_write_tokens),
+             sum(CASE WHEN c.agent_id IS NOT NULL THEN c.wall_ms ELSE 0 END),
+             sum(CASE WHEN c.agent_id IS NULL THEN c.active_ms ELSE 0 END),
+             sum(CASE WHEN c.agent_id IS NULL THEN c.wait_ms ELSE 0 END),
+             count(DISTINCT c.session_id || '/' || ifnull(x.charge, '')),
+             count(DISTINCT c.session_id || '/' || c.agent_id)
+         FROM audit_cells AS c
+         LEFT JOIN agents AS a ON a.session_id = c.session_id AND a.agent_id IS c.agent_id
+         LEFT JOIN agent_charges AS x ON x.agent = a.id
+         WHERE c.day BETWEEN ?1 AND ?2
+             AND NOT (c.active_ms = 0 AND c.wait_ms = 0 AND c.cost_usd IS NULL
+                 AND c.unpriced = 0
+                 AND c.input_tokens + c.output_tokens + c.cache_read_tokens
+                     + c.cache_write_tokens = 0
+                 AND (c.agent_id IS NULL OR c.wall_ms = 0))",
         [from, to],
         |r| {
             Ok((
@@ -944,7 +951,6 @@ fn the_filter_and_tree_use_the_webview_shape() {
             "elapsedMs",
             "open",
             "progress",
-            "rotations",
             "sessions",
             "tokens",
             "unpriced",
@@ -974,14 +980,15 @@ fn the_filter_and_tree_use_the_webview_shape() {
         ["children", "github", "key", "kind", "label", "metrics"]
     );
     assert_eq!(root["children"][2]["kind"], "unlinked");
+    assert_eq!(serde_json::json!(NodeKind::Topic), "topic");
 }
 
 #[test]
 fn the_headline_elapsed_is_the_whole_lifetime_whatever_the_range() {
     let t = Temp::new("lifetime");
     let db = build(&t);
-    // Oct 5 holds only demo-9-s2's tail, but #9's elapsed still runs from
-    // its first window ever (Oct 4 14:00:00Z) to the close (Oct 5 12:00:00Z).
+    // Oct 5 holds only issue_demo-9's tail, but #9's elapsed still runs from
+    // its first session ever (Oct 4 14:00:00Z) to the close (Oct 5 12:00:00Z).
     let oct5 = audit(&db, &filter("2026-10-05", "2026-10-05", &[]))
         .expect("audit")
         .headline;
@@ -1022,31 +1029,30 @@ fn synthetic(t: &Temp, sql: &str) -> Connection {
 
 /// Repo `lab`: #1 and #2 closed as completed, both closed by PR #5 of
 /// `lab-ui` (merged), with $1 and $3 of work; #3 closed as not planned,
-/// with $2; #4 not cached, one window Friday to Monday, idle on the
-/// weekend.
+/// with $2; #4 not cached, one session Friday to Monday, idle on the
+/// weekend. Each session's orchestrator is charged its issue.
 const LAB: &str = "
     INSERT INTO sessions (session_id, path, started_at) VALUES
         ('s1', '/p/s1.jsonl', '2026-10-02T10:00:00.000Z'),
         ('s2', '/p/s2.jsonl', '2026-10-02T12:00:00.000Z'),
         ('s3', '/p/s3.jsonl', '2026-10-02T14:00:00.000Z'),
         ('s4', '/p/s4.jsonl', '2026-10-09T20:00:00.000Z');
-    INSERT INTO workstreams (id, name, fallback) VALUES
-        (1, 'lab-1', 0), (2, 'lab-2', 0), (3, 'lab-3', 0), (4, 'lab-4', 0);
-    INSERT INTO segments (id, session_id, start_offset, started_at, workstream_id) VALUES
-        (1, 's1', 0, '2026-10-02T10:00:00.000Z', 1),
-        (2, 's2', 0, '2026-10-02T12:00:00.000Z', 2),
-        (3, 's3', 0, '2026-10-02T14:00:00.000Z', 3),
-        (4, 's4', 0, '2026-10-09T20:00:00.000Z', 4);
-    INSERT INTO audit_cells (session_id, agent_id, segment_id, day, model, wall_ms,
+    INSERT INTO charges (id, key, kind, repo, number) VALUES
+        (1, 'issue_lab-1', 'issue', 'lab', 1), (2, 'issue_lab-2', 'issue', 'lab', 2),
+        (3, 'issue_lab-3', 'issue', 'lab', 3), (4, 'issue_lab-4', 'issue', 'lab', 4);
+    INSERT INTO agents (session_id, kind, own_charge, own_charge_source) VALUES
+        ('s1', 'orchestrator', 1, 'name'), ('s2', 'orchestrator', 2, 'name'),
+        ('s3', 'orchestrator', 3, 'name'), ('s4', 'orchestrator', 4, 'name');
+    INSERT INTO audit_cells (session_id, agent_id, day, model, wall_ms,
         active_ms, wait_ms, cost_usd, unpriced, input_tokens, output_tokens,
         cache_read_tokens, cache_write_tokens) VALUES
-        ('s1', NULL, 1, '2026-10-02', 'm', 1000, 1000, 0, 1.0, 0, 10, 1, 0, 0),
-        ('s2', NULL, 2, '2026-10-02', 'm', 1000, 1000, 0, 3.0, 0, 10, 1, 0, 0),
-        ('s3', NULL, 3, '2026-10-02', 'm', 1000, 1000, 0, 2.0, 0, 10, 1, 0, 0),
-        ('s4', NULL, 4, '2026-10-09', 'm', 3600000, 600000, 0, 0.5, 0, 10, 1, 0, 0),
-        ('s4', NULL, 4, '2026-10-10', NULL, 86400000, 0, 0, NULL, 0, 0, 0, 0, 0),
-        ('s4', NULL, 4, '2026-10-11', NULL, 86400000, 0, 0, NULL, 0, 0, 0, 0, 0),
-        ('s4', NULL, 4, '2026-10-12', 'm', 3600000, 600000, 0, 0.5, 0, 10, 1, 0, 0);
+        ('s1', NULL, '2026-10-02', 'm', 1000, 1000, 0, 1.0, 0, 10, 1, 0, 0),
+        ('s2', NULL, '2026-10-02', 'm', 1000, 1000, 0, 3.0, 0, 10, 1, 0, 0),
+        ('s3', NULL, '2026-10-02', 'm', 1000, 1000, 0, 2.0, 0, 10, 1, 0, 0),
+        ('s4', NULL, '2026-10-09', 'm', 3600000, 600000, 0, 0.5, 0, 10, 1, 0, 0),
+        ('s4', NULL, '2026-10-10', NULL, 86400000, 0, 0, NULL, 0, 0, 0, 0, 0),
+        ('s4', NULL, '2026-10-11', NULL, 86400000, 0, 0, NULL, 0, 0, 0, 0, 0),
+        ('s4', NULL, '2026-10-12', 'm', 3600000, 600000, 0, 0.5, 0, 10, 1, 0, 0);
     INSERT INTO gh_repos (slug, owner, name, fetched_at) VALUES ('lab', 'example', 'lab', 1);
     INSERT INTO gh_issues (repo, number, title, state, state_reason, created_at, closed_at,
         parent, sub_total, sub_completed) VALUES
@@ -1097,12 +1103,272 @@ fn idle_only_days_show_nothing() {
     let weekend = lab(&db, "2026-10-10", "2026-10-11").root;
     assert!(weekend.children.is_empty());
     assert!(weekend.metrics.by_day.is_empty());
-    // Friday to Monday: the window, counted once, with its two working days.
+    // Friday to Monday: the session, counted once, with its two working days.
     let four = lab(&db, "2026-10-09", "2026-10-12").root;
     let days: Vec<_> = four.metrics.by_day.iter().map(|s| s.key.as_str()).collect();
     assert_eq!(days, ["2026-10-09", "2026-10-12"]);
     assert_eq!(four.metrics.sessions, 1);
     assert!(close(1.0, four.metrics.cost_usd));
+}
+
+/// One orchestrator per charge kind, each its own session with one cell on
+/// Oct 2 (session sN costs $N): s1 epic lab#1, s2 repo lab, s3 PR lab#5
+/// (cached: it closes #2, a sub-issue of epic #1), s4 PR lab#9 (not
+/// cached), s5 topic notes, s6 issue lab#2 (its only PR is #5), s7 none.
+const KINDS: &str = "
+    INSERT INTO sessions (session_id, path, started_at) VALUES
+        ('s1', '/p/s1.jsonl', '2026-10-02T10:00:00.000Z'),
+        ('s2', '/p/s2.jsonl', '2026-10-02T11:00:00.000Z'),
+        ('s3', '/p/s3.jsonl', '2026-10-02T12:00:00.000Z'),
+        ('s4', '/p/s4.jsonl', '2026-10-02T13:00:00.000Z'),
+        ('s5', '/p/s5.jsonl', '2026-10-02T14:00:00.000Z'),
+        ('s6', '/p/s6.jsonl', '2026-10-02T15:00:00.000Z'),
+        ('s7', '/p/s7.jsonl', '2026-10-02T16:00:00.000Z');
+    INSERT INTO charges (id, key, kind, repo, number, topic) VALUES
+        (1, 'epic_lab-1', 'epic', 'lab', 1, NULL),
+        (2, 'repo_lab', 'repo', 'lab', NULL, NULL),
+        (3, 'pr_lab-5', 'pr', 'lab', 5, NULL),
+        (4, 'pr_lab-9', 'pr', 'lab', 9, NULL),
+        (5, 'topic_notes', 'topic', NULL, NULL, 'notes'),
+        (6, 'issue_lab-2', 'issue', 'lab', 2, NULL);
+    INSERT INTO agents (session_id, kind, own_charge, own_charge_source) VALUES
+        ('s1', 'orchestrator', 1, 'name'), ('s2', 'orchestrator', 2, 'name'),
+        ('s3', 'orchestrator', 3, 'name'), ('s4', 'orchestrator', 4, 'name'),
+        ('s5', 'orchestrator', 5, 'name'), ('s6', 'orchestrator', 6, 'name'),
+        ('s7', 'orchestrator', NULL, NULL);
+    INSERT INTO audit_cells (session_id, agent_id, day, model, wall_ms, active_ms, wait_ms,
+        cost_usd, unpriced, input_tokens, output_tokens, cache_read_tokens,
+        cache_write_tokens) VALUES
+        ('s1', NULL, '2026-10-02', 'm', 1000, 1000, 0, 1.0, 0, 10, 1, 0, 0),
+        ('s2', NULL, '2026-10-02', 'm', 1000, 1000, 0, 2.0, 0, 10, 1, 0, 0),
+        ('s3', NULL, '2026-10-02', 'm', 1000, 1000, 0, 3.0, 0, 10, 1, 0, 0),
+        ('s4', NULL, '2026-10-02', 'm', 1000, 1000, 0, 4.0, 0, 10, 1, 0, 0),
+        ('s5', NULL, '2026-10-02', 'm', 1000, 1000, 0, 5.0, 0, 10, 1, 0, 0),
+        ('s6', NULL, '2026-10-02', 'm', 1000, 1000, 0, 6.0, 0, 10, 1, 0, 0),
+        ('s7', NULL, '2026-10-02', 'm', 1000, 1000, 0, 7.0, 0, 10, 1, 0, 0);
+    INSERT INTO gh_repos (slug, owner, name, fetched_at) VALUES ('lab', 'example', 'lab', 1);
+    INSERT INTO gh_issues (repo, number, title, state, created_at, parent, sub_total,
+        sub_completed) VALUES
+        ('lab', 1, 'Lorem', 'OPEN', '2026-10-01T00:00:00Z', NULL, 1, 0),
+        ('lab', 2, 'Ipsum', 'OPEN', '2026-10-01T00:00:00Z', 1, 0, 0);
+    INSERT INTO gh_prs (repo, issue, number, state, created_at, merged_at, url) VALUES
+        ('lab', 2, 5, 'OPEN', '2026-10-02T00:00:00Z', NULL, 'https://github.com/example/lab/pull/5');
+";
+
+#[test]
+fn each_charge_kind_places_its_session_on_its_own_path() {
+    use NodeKind::{Agent, Epic, Issue, Pr, Repo, Session, Topic, Unlinked};
+    let t = Temp::new("kinds");
+    let db = synthetic(&t, KINDS);
+    let a = lab(&db, "2026-10-01", "2026-10-31");
+    let root = &a.root;
+    assert_eq!(
+        kinds(root),
+        [(Repo, "lab"), (Topic, "notes"), (Unlinked, "")]
+    );
+    // A repo charge sits right under its repo, and so does a PR the cache
+    // doesn't hold.
+    let repo = child(root, Repo, "lab");
+    assert_eq!(
+        kinds(repo),
+        [(Epic, "1"), (Pr, "9"), (Session, "s2/repo_lab")]
+    );
+    assert!(close(1.0 + 2.0 + 3.0 + 4.0 + 6.0, repo.metrics.cost_usd));
+    // An epic charge sits right under its epic, beside its sub-issues.
+    let epic = child(repo, Epic, "1");
+    assert_eq!(epic.label, "#1 Lorem");
+    assert_eq!(kinds(epic), [(Issue, "2"), (Session, "s1/epic_lab-1")]);
+    assert!(close(1.0 + 3.0 + 6.0, epic.metrics.cost_usd));
+    // A cached PR charge sits under the issue it closes, with that issue's
+    // own work (its only PR), each its own Session row.
+    let pr5 = child(child(epic, Issue, "2"), Pr, "5");
+    assert!(pr5.github);
+    assert_eq!(
+        kinds(pr5),
+        [(Session, "s3/pr_lab-5"), (Session, "s6/issue_lab-2")]
+    );
+    assert!(close(3.0 + 6.0, pr5.metrics.cost_usd));
+    let pr9 = child(repo, Pr, "9");
+    assert_eq!((pr9.label.as_str(), pr9.github), ("PR #9", false));
+    assert!(pr9.metrics.open);
+    assert_eq!(kinds(pr9), [(Session, "s4/pr_lab-9")]);
+    // A topic is a top-level node of its own.
+    let topic = child(root, Topic, "notes");
+    assert_eq!((topic.label.as_str(), topic.github), ("notes", false));
+    assert_eq!(kinds(topic), [(Session, "s5/topic_notes")]);
+    assert!(close(5.0, topic.metrics.cost_usd));
+    let row = child(topic, Session, "s5/topic_notes");
+    assert_eq!(row.label, "s5", "no name: the session id");
+    assert_eq!(kinds(row), [(Agent, "")]);
+    let unlinked = child(root, Unlinked, "");
+    assert_eq!(kinds(unlinked), [(Session, "s7/")]);
+    assert!(close(7.0, unlinked.metrics.cost_usd));
+    assert!(close(28.0, root.metrics.cost_usd));
+    assert_eq!(root.metrics.sessions, 7);
+    check_sums(root, "kinds");
+    assert_eq!(
+        (a.repos.clone(), a.unlinked),
+        (vec!["lab".to_string()], true)
+    );
+}
+
+#[test]
+fn the_repo_filter_reads_each_sessions_charge_repo() {
+    let t = Temp::new("kinds-filter");
+    let db = synthetic(&t, KINDS);
+    let run = |repos: &[&str]| {
+        audit(&db, &filter("2026-10-01", "2026-10-31", repos))
+            .expect("audit")
+            .root
+    };
+    let lab_only = run(&["lab"]);
+    assert_eq!(kinds(&lab_only), [(NodeKind::Repo, "lab")]);
+    assert!(close(16.0, lab_only.metrics.cost_usd));
+    // A topic and no charge are in no repo: the empty slug.
+    let none = run(&[""]);
+    assert_eq!(
+        kinds(&none),
+        [(NodeKind::Topic, "notes"), (NodeKind::Unlinked, "")]
+    );
+    assert!(close(12.0, none.metrics.cost_usd));
+    assert!(close(28.0, run(&["lab", ""]).metrics.cost_usd));
+}
+
+const M1: &str = "5e55f1f1-0000-4000-8000-0000000000d1";
+const M2: &str = "5e55f1f1-0000-4000-8000-0000000000d2";
+const M3: &str = "5e55f1f1-0000-4000-8000-0000000000d3";
+const M4: &str = "5e55f1f1-0000-4000-8000-0000000000d4";
+const M5: &str = "5e55f1f1-0000-4000-8000-0000000000d5";
+const M6: &str = "5e55f1f1-0000-4000-8000-0000000000d6";
+const M7: &str = "5e55f1f1-0000-4000-8000-0000000000d7";
+const MA1: &str = "a8000000000000001";
+const MA2: &str = "a8000000000000002";
+const MA3: &str = "a8000000000000003";
+const MB1: &str = "a8000000000000004";
+
+/// Cold build of `tests/fixtures/model-home` in Toronto, its GitHub cache
+/// (`strate`) and the registry row naming the background process M7.
+fn build_model(t: &Temp) -> Connection {
+    let mut store = build_without_gh(t, "model-home");
+    // Its issues' parents are example/strate's, so fetched as that owner's.
+    let strate =
+        fetch_repo(&mut scripted(&["model-home.json"]), "example", "strate").expect("fetch");
+    store
+        .gh_replace("strate", "example", &strate, 1)
+        .expect("gh");
+    let background = RegistryEvent::Appeared {
+        entry: RegistryEntry {
+            cwd: "/work/bg".into(),
+            kind: Kind::Background,
+            started_at: 1,
+            pid: None,
+            id: Some("bg-lorem".into()),
+            session_id: Some(M7.into()),
+            name: Some("impl_issue_strate-111".into()),
+            status: None,
+            waiting_for: None,
+            state: None,
+        },
+        at_ms: 1_000,
+    };
+    store.apply_registry(&[background]).expect("registry");
+    drop(store);
+    Store::open_reader(t.db()).expect("reader")
+}
+
+#[test]
+fn model_home_files_every_agent_under_its_own_charge() {
+    use NodeKind::{Agent, Epic, Issue, Pr, Repo, Session, Topic, Unlinked};
+    let t = Temp::new("model-home");
+    let db = build_model(&t);
+    let day = filter("2026-10-20", "2026-10-20", &[]);
+    let root = audit(&db, &day).expect("audit").root;
+    assert_eq!(
+        kinds(&root),
+        [(Repo, "strate"), (Topic, "hub"), (Unlinked, "")]
+    );
+    let strate = child(&root, Repo, "strate");
+    assert_eq!(
+        kinds(strate),
+        [(Epic, "105"), (Issue, "110"), (Issue, "111")]
+    );
+    // M1 works #107 by its branch (PR #120's head), with a1, a2 and M2,
+    // which a1 messaged first. Its reviewer a3 is charged PR #120 by name:
+    // it sits under that PR (closing #107, the lowest of its issues) in a
+    // Session row of M1's that holds only it.
+    let pr = child(child(child(strate, Epic, "105"), Issue, "107"), Pr, "120");
+    let (m1, m1_pr, m2) = (
+        format!("{M1}/issue_strate-107"),
+        format!("{M1}/pr_strate-120"),
+        format!("{M2}/issue_strate-107"),
+    );
+    assert_eq!(
+        kinds(pr),
+        [
+            (Session, m1.as_str()),
+            (Session, m1_pr.as_str()),
+            (Session, m2.as_str())
+        ]
+    );
+    let own = child(pr, Session, &m1);
+    assert_eq!(own.label, "manager_epic_strate-105");
+    assert_eq!(kinds(own), [(Agent, ""), (Agent, MA1), (Agent, MA2)]);
+    // Opus $0.008 a request: M1's two dispatches, a1's two; a2 sonnet.
+    assert!(close(4.0 * OPUS + SONNET, own.metrics.cost_usd));
+    let review = child(pr, Session, &m1_pr);
+    assert_eq!(review.label, "manager_epic_strate-105");
+    assert_eq!(kinds(review), [(Agent, MA3)]);
+    assert!(close(SONNET, review.metrics.cost_usd));
+    assert_eq!((review.metrics.sessions, review.metrics.agents), (1, 1));
+    // Its elapsed is a3's run, 10:02:10 to 10:02:20, not M1's session.
+    assert_eq!(review.metrics.elapsed_ms, Some(10 * S));
+    assert!(close(OPUS, child(pr, Session, &m2).metrics.cost_usd));
+    // M3 by name; the background chain M7 -> M8 by its registry name, one
+    // row, an issue the cache doesn't hold.
+    let m3 = child(
+        child(strate, Issue, "110"),
+        Session,
+        &format!("{M3}/issue_strate-110"),
+    );
+    assert!(close(OPUS, m3.metrics.cost_usd));
+    let bg = child(strate, Issue, "111");
+    assert_eq!((bg.label.as_str(), bg.github), ("strate #111", false));
+    let chain = child(bg, Session, &format!("{M7}/issue_strate-111"));
+    assert_eq!(kinds(chain), [(Agent, "")]);
+    assert_eq!(chain.metrics.sessions, 2);
+    assert!(close(2.0 * OPUS, chain.metrics.cost_usd));
+    // director-hub's topic: M4 with b1, and M5, which b1 messaged.
+    let hub = child(&root, Topic, "hub");
+    let (m4, m5) = (format!("{M4}/topic_hub"), format!("{M5}/topic_hub"));
+    assert_eq!(kinds(hub), [(Session, m4.as_str()), (Session, m5.as_str())]);
+    assert_eq!(kinds(child(hub, Session, &m4)), [(Agent, ""), (Agent, MB1)]);
+    assert!(close(3.0 * OPUS, hub.metrics.cost_usd));
+    // M6: unnamed, on a detached HEAD.
+    let unlinked = child(&root, Unlinked, "");
+    assert_eq!(kinds(unlinked), [(Session, format!("{M6}/").as_str())]);
+    // Every request once: 12 opus, 2 sonnet; 9 (session, charge) rows.
+    assert!(close(12.0 * OPUS + 2.0 * SONNET, root.metrics.cost_usd));
+    assert_eq!(root.metrics.sessions, 9);
+    check_sums(&root, "model-home");
+
+    // The reviewer's row draws a3's run alone: 06:02:10 to 06:02:20 EDT.
+    let path = steps(&[
+        (Repo, "strate"),
+        (Epic, "105"),
+        (Issue, "107"),
+        (Pr, "120"),
+        (Session, &m1_pr),
+    ]);
+    let days = audit_timeline(&db, &day, &path).expect("timeline");
+    let at = |s: i64| (6 * 3600 + 2 * 60 + s) * S;
+    assert_eq!(
+        days,
+        [TimelineDay {
+            day: "2026-10-20".into(),
+            spans: vec![span(at(10), at(20), SpanKind::Agent)],
+            marks: vec![],
+        }]
+    );
 }
 
 fn span(start_ms: i64, end_ms: i64, kind: SpanKind) -> TimelineSpan {
@@ -1126,12 +1392,12 @@ fn steps(path: &[(NodeKind, &str)]) -> Vec<(NodeKind, String)> {
 }
 
 #[test]
-fn a_window_across_local_midnight_draws_on_both_days() {
+fn a_session_across_local_midnight_draws_on_both_days() {
     let t = Temp::new("timeline-hand");
     let db = build(&t);
     let tree = october(&db).root;
     let pr = child(issue(&tree, "9"), NodeKind::Pr, "12");
-    let s2 = labelled(pr, NodeKind::Session, "demo-9-s2");
+    let s2 = labelled(pr, NodeKind::Session, "issue_demo-9");
     let oct = filter("2026-10-01", "2026-10-31", &[]);
     let to_pr = [
         (NodeKind::Repo, "demo"),
@@ -1142,7 +1408,7 @@ fn a_window_across_local_midnight_draws_on_both_days() {
     let mut path = steps(&to_pr);
     path.push((NodeKind::Session, s2.key.clone()));
     let days = audit_timeline(&db, &oct, &path).expect("timeline");
-    // demo-9-s2 starts 03:50:00Z Oct 5 = 23:50 EDT Oct 4, 85 800 s after
+    // issue_demo-9 starts 03:50:00Z Oct 5 = 23:50 EDT Oct 4, 85 800 s after
     // that day's local midnight; the next (04:00Z) falls 600 s in, inside
     // the idle [140,900]. Orchestrator: model [0,10], tools [10,15], model
     // [15,25] are one active span; the wait [25,900] is waiting until the

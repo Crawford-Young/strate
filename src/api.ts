@@ -94,7 +94,8 @@ export interface AuditFilter {
   repos: string[]
 }
 
-export type NodeKind = 'root' | 'repo' | 'unlinked' | 'epic' | 'issue' | 'pr' | 'session' | 'agent'
+export type NodeKind =
+  'root' | 'repo' | 'topic' | 'unlinked' | 'epic' | 'issue' | 'pr' | 'session' | 'agent'
 
 export interface Tokens {
   input: number
@@ -119,12 +120,10 @@ export interface Metrics {
   activeMs: number
   /** Waiting on you. */
   waitMs: number
-  /** Windows. */
+  /** Sessions, once per charge. */
   sessions: number
   /** Subagents. */
   agents: number
-  /** Windows named `-sN`. */
-  rotations: number
   /** Null when the node has no start. */
   elapsedMs: number | null
   /** Elapsed runs to the last activity: the issue, epic or PR is open. */
@@ -148,8 +147,7 @@ export interface Slice {
 
 export interface AuditNode {
   /**
-   * `session` is a `/clear` chain's windows in one workstream; a director's unit nests under
-   * the director's row.
+   * `session` is a `/clear` chain within one charge; `topic` is a top-level node per topic charge.
    */
   kind: NodeKind
   /** Unique among its siblings. */
@@ -242,9 +240,10 @@ export interface OutcomeDay {
 export interface Outcome {
   /** Every local day of the range, in order, the quiet ones too. */
   days: OutcomeDay[]
-  /** The range's $ in windows with no `<repo>-<issue>` name. */
+  /** The range's $ on no issue or epic charge. */
   unlinkedUsd: number
-  unlinkedWorkstreams: number
+  /** Charges whose $ is on no issue or epic (Unlinked counting as one). */
+  unlinkedCharges: number
   /** The range's $ on issues not closed (or not in the GitHub cache). */
   openUsd: number
   openIssues: number

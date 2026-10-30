@@ -4,15 +4,18 @@
 //!
 //! - Outcome: per local day of the range, every day, the issues closed as
 //!   completed and the PRs merged on it, each at its whole-life $ and
-//!   orchestrator active time (all its `<repo>-<issue>` work, in the range
-//!   or not), plus the range's spend with no outcome yet.
+//!   orchestrator active time (all the work charged to it, in the range or
+//!   not), plus the range's spend with no outcome yet.
 //! - Agents: per agent type and model, each dispatch with a cell in the
 //!   range once, by outcome; orchestrator rows per model, flagged.
 //! - Bottleneck: per local day and repo, your own time in the loop, a
 //!   blocked proxy (a blocked dispatch's last record to its parent's next
 //!   typed prompt or Agent/SendMessage dispatch, on the day it went quiet),
 //!   and the permission waits the hooks recorded (#52), on the day each
-//!   started, in the window its agent was in.
+//!   started, in its agent's charge's repo.
+//!
+//! The repo of anything an agent did is its effective charge's (#107); a
+//! topic or no charge is in none (`""` in the repo filter).
 //! - Waste: rework and errors in the range.
 //!
 //! A dispatch with no notification is running while its last record is
@@ -28,10 +31,9 @@ use jiff::tz::TimeZone;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
-use super::cells::{self, Cell, Cells, Place};
+use super::cells::{self, Cell, Cells};
 use super::gh::Gh;
 use super::{AuditFilter, Tokens};
-use crate::names::parse_name;
 use crate::store::{Result, account};
 use crate::time::{USER_TOOLS, local_day, parse_timestamp};
 
@@ -60,9 +62,11 @@ pub struct Performance {
 pub struct Outcome {
     /// Every local day of the range, in order, the quiet ones too.
     pub days: Vec<OutcomeDay>,
-    /// The range's $ in windows with no `<repo>-<issue>` name.
+    /// The range's $ on no issue or epic: no charge, or a topic, repo or
+    /// uncached PR charge.
     pub unlinked_usd: f64,
-    pub unlinked_workstreams: i64,
+    /// How many charges that $ is on, no charge counting as one.
+    pub unlinked_charges: i64,
     /// The range's $ on issues not closed (or not in the GitHub cache).
     pub open_usd: f64,
     pub open_issues: i64,
@@ -126,7 +130,7 @@ pub struct Bottleneck {
     pub permission_waits: PermissionWaits,
 }
 
-/// Your time on one local day in one repo's windows (`None`: Unlinked).
+/// Your time on one local day in one repo (`None`: in none).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BottleneckDay {
@@ -229,13 +233,12 @@ pub fn performance(conn: &Connection, filter: &AuditFilter) -> Result<Performanc
         agents: AgentInfo::load_all(conn)?,
         newest: newest_record(conn)?,
     };
-    let places = Places::load(conn)?;
     let dispatches = read.dispatches(&cells, &in_range);
     let agents = read.agent_rows(&in_range, &dispatches);
     Ok(Performance {
         outcome: read.outcome(&cells, &in_range),
-        bottleneck: read.bottleneck(&cells, &in_range, &dispatches, &places)?,
-        waste: read.waste(&cells, &in_range, &dispatches, &agents, &places)?,
+        bottleneck: read.bottleneck(&cells, &in_range, &dispatches)?,
+        waste: read.waste(&cells, &in_range, &dispatches, &agents)?,
         agents,
     })
 }
@@ -289,8 +292,6 @@ struct AgentInfo {
     outcome: Option<String>,
     followups: i64,
     peak: Option<f64>,
-    /// The window a subagent started in.
-    segment: Option<i64>,
     /// A subagent's last record: as stored, and in ms.
     last: Option<(String, i64)>,
     /// The agent that dispatched it.
@@ -301,7 +302,7 @@ impl AgentInfo {
     fn load_all(conn: &Connection) -> Result<HashMap<AgentKey, Self>> {
         let mut stmt = conn.prepare_cached(
             "SELECT a.session_id, a.agent_id, a.agent_type, a.model, a.outcome, a.followups,
-                 a.context_peak_pct, a.segment_id,
+                 a.context_peak_pct,
                  CASE WHEN a.agent_id IS NOT NULL THEN
                      (SELECT max(e.timestamp) FROM events AS e
                       WHERE e.session_id = a.session_id AND e.agent_id = a.agent_id)
@@ -314,18 +315,17 @@ impl AgentInfo {
         let mut rows = stmt.query([])?;
         let mut out = HashMap::new();
         while let Some(r) = rows.next()? {
-            let last: Option<String> = r.get(8)?;
-            let parent: Option<String> = r.get(9)?;
+            let last: Option<String> = r.get(7)?;
+            let parent: Option<String> = r.get(8)?;
             let info = Self {
                 agent_type: r.get(2)?,
                 model: r.get(3)?,
                 outcome: r.get(4)?,
                 followups: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
                 peak: r.get(6)?,
-                segment: r.get(7)?,
                 last: last.and_then(|s| parse_timestamp(&s).map(|ms| (s, ms))),
                 parent: match parent {
-                    Some(session) => Some((session, r.get(10)?)),
+                    Some(session) => Some((session, r.get(9)?)),
                     None => None,
                 },
             };
@@ -352,84 +352,8 @@ struct Dispatch<'a> {
     agent_type: String,
     model: String,
     status: Status,
-    /// Its window's repo.
+    /// Its charge's repo.
     repo: Option<String>,
-}
-
-/// Each segment's repo, and each session's segments in transcript order:
-/// where a stored event counts, as `account` places requests.
-struct Places {
-    repos: HashMap<i64, Option<String>>,
-    /// (start offset, segment id, earliest record ms), by offset.
-    sessions: HashMap<String, Vec<(i64, i64, Option<i64>)>>,
-}
-
-impl Places {
-    fn load(conn: &Connection) -> Result<Self> {
-        let mut out = Self {
-            repos: HashMap::new(),
-            sessions: HashMap::new(),
-        };
-        let mut stmt = conn.prepare_cached(
-            "SELECT g.id, g.session_id, g.start_offset, w.name, w.fallback, g.started_at
-             FROM segments AS g
-             JOIN workstream_roots AS r ON r.id = g.workstream_id
-             JOIN workstreams AS w ON w.id = r.root
-             ORDER BY g.session_id, g.start_offset",
-        )?;
-        let mut rows = stmt.query([])?;
-        while let Some(r) = rows.next()? {
-            let id: i64 = r.get(0)?;
-            let name: String = r.get(3)?;
-            let fallback: bool = r.get(4)?;
-            let repo = (!fallback)
-                .then(|| parse_name(&name))
-                .flatten()
-                .map(|p| p.repo);
-            out.repos.insert(id, repo);
-            let started: Option<String> = r.get(5)?;
-            out.sessions.entry(r.get(1)?).or_default().push((
-                r.get(2)?,
-                id,
-                started.as_deref().and_then(parse_timestamp),
-            ));
-        }
-        Ok(out)
-    }
-
-    /// The repo of `segment` (`None`: Unlinked).
-    fn repo(&self, segment: Option<i64>) -> Option<&str> {
-        segment
-            .and_then(|s| self.repos.get(&s))
-            .and_then(Option::as_deref)
-    }
-
-    /// The window holding orchestrator byte `offset` of `session`.
-    fn segment_at(&self, session: &str, offset: i64) -> Option<i64> {
-        let segments = self.sessions.get(session)?;
-        segments
-            .iter()
-            .rev()
-            .find(|(start, _, _)| *start <= offset)
-            .map(|(_, id, _)| *id)
-    }
-
-    /// The window of `session`'s orchestrator at `ms`: the last one whose
-    /// earliest record is no later, else its first.
-    fn segment_at_time(&self, session: &str, ms: i64) -> Option<i64> {
-        let segments = self.sessions.get(session)?;
-        segments
-            .iter()
-            .rev()
-            .find(|(_, _, started)| started.is_some_and(|s| s <= ms))
-            .or(segments.first())
-            .map(|(_, id, _)| *id)
-    }
-
-    /// `session`'s first window.
-    fn first_segment(&self, session: &str) -> Option<i64> {
-        self.sessions.get(session)?.first().map(|(_, id, _)| *id)
-    }
 }
 
 struct Read<'a> {
@@ -443,8 +367,8 @@ struct Read<'a> {
 }
 
 impl Read<'_> {
-    /// Whether windows of `repo` (`None`: Unlinked, `""` in the filter)
-    /// are in the filter.
+    /// Whether work in `repo` (`None`: in none, `""` in the filter) is in
+    /// the filter.
     fn wanted(&self, repo: Option<&str>) -> bool {
         let slug = repo.unwrap_or("");
         self.filter.repos.is_empty() || self.filter.repos.iter().any(|w| w == slug)
@@ -461,14 +385,14 @@ impl Read<'_> {
         let mut issues: HashMap<(&str, i64), (f64, i64)> = HashMap::new();
         let mut prs: HashMap<(&str, i64), (f64, Option<i64>)> = HashMap::new();
         for cell in &cells.list {
-            let Place::Linked { repo, issue, pr } = &cells.window(cell).place else {
+            let Some((repo, issue, pr)) = cells.row_of(cell).place.issue() else {
                 continue;
             };
             let usd = cell.share.cost_usd.unwrap_or(0.0);
-            let life = issues.entry((repo, *issue)).or_default();
+            let life = issues.entry((repo, issue)).or_default();
             life.0 += usd;
             life.1 += cell.share.line.active_ms;
-            if let Some(pr) = pr.and_then(|n| self.gh.pr(repo, *issue, n)) {
+            if let Some(pr) = pr.and_then(|n| self.gh.pr(repo, issue, n)) {
                 prs.entry((&pr.repo, pr.number))
                     .or_insert((0.0, pr.merged_at))
                     .0 += usd;
@@ -497,22 +421,22 @@ impl Read<'_> {
             if let Some(d) = day(&mut days, Some(cell.day.clone())) {
                 d.spend += usd;
             }
-            let window = cells.window(cell);
-            match &window.place {
-                Place::Unlinked => {
+            let row = cells.row_of(cell);
+            match row.place.issue() {
+                None => {
                     unlinked_usd += usd;
-                    unlinked.insert(window.label.as_str());
+                    unlinked.insert(row.charge.as_str());
                 }
-                Place::Linked { repo, issue, .. }
+                Some((repo, issue, _))
                     if self
                         .gh
-                        .issue(repo, *issue)
+                        .issue(repo, issue)
                         .is_none_or(|i| i.closed.is_none()) =>
                 {
                     open_usd += usd;
-                    open.insert((repo.as_str(), *issue));
+                    open.insert((repo, issue));
                 }
-                Place::Linked { .. } => {}
+                Some(_) => {}
             }
         }
         Outcome {
@@ -522,7 +446,7 @@ impl Read<'_> {
                 .map(|d| days.remove(&d).unwrap_or_default().row(d))
                 .collect(),
             unlinked_usd,
-            unlinked_workstreams: unlinked.len() as i64,
+            unlinked_charges: unlinked.len() as i64,
             open_usd,
             open_issues: open.len() as i64,
         }
@@ -548,7 +472,7 @@ impl Read<'_> {
                     .or_else(|| cell.model.clone())
                     .unwrap_or_default(),
                 status: info.map_or(Status::NoReport, |i| self.status(i)),
-                repo: cells.window(cell).repo.clone(),
+                repo: cells.row_of(cell).place.repo().map(str::to_string),
                 info,
                 key,
             });
@@ -620,7 +544,6 @@ impl Read<'_> {
         cells: &Cells,
         in_range: &[&Cell],
         dispatches: &[Dispatch],
-        places: &Places,
     ) -> Result<Bottleneck> {
         let mut days: BTreeMap<DayKey, BottleneckDay> = BTreeMap::new();
         for cell in in_range.iter().filter(|c| c.agent_id.is_none()) {
@@ -628,7 +551,8 @@ impl Read<'_> {
             if t.active_ms == 0 && t.wait_ms == 0 {
                 continue;
             }
-            let row = day_row(&mut days, &cell.day, cells.window(cell).repo.clone());
+            let repo = cells.row_of(cell).place.repo().map(str::to_string);
+            let row = day_row(&mut days, &cell.day, repo);
             row.ask_ms += t.ask_ms;
             row.prompt_wait_ms += t.wait_ms - t.ask_ms;
             row.active_ms += t.active_ms;
@@ -649,7 +573,7 @@ impl Read<'_> {
             row.blocked_reports += 1;
             row.blocked_ms += answered.map_or(0, |at| (at - last).max(0));
         }
-        let permission_waits = self.permission_waits(&mut days, places)?;
+        let permission_waits = self.permission_waits(&mut days, cells)?;
         Ok(Bottleneck {
             days: days.into_values().collect(),
             permission_waits,
@@ -657,15 +581,14 @@ impl Read<'_> {
     }
 
     /// Adds each recorded permission wait in the range and filter to its
-    /// start day's row, in the window its agent was in: an orchestrator's
-    /// by time, a subagent's where it started. An open wait (no answer
+    /// start day's row, in its agent's charge's repo. An open wait (no answer
     /// stored yet) counts as a prompt with no time: its end is unknown, and
     /// the live needs-you view already shows a current one. A question or
     /// plan approval is left out: the time model counts it as ask time.
     fn permission_waits(
         &self,
         days: &mut BTreeMap<DayKey, BottleneckDay>,
-        places: &Places,
+        cells: &Cells,
     ) -> Result<PermissionWaits> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT a.session_id, a.agent_id, w.start_ms, w.end_ms, w.tool_name
@@ -684,11 +607,7 @@ impl Read<'_> {
             let Some(day) = self.day_in_range(start) else {
                 continue;
             };
-            let segment = match agent_id {
-                None => places.segment_at_time(&session, start),
-                agent => self.agents.get(&(session, agent)).and_then(|i| i.segment),
-            };
-            let repo = places.repo(segment);
+            let repo = cells.repo_of(&session, agent_id.as_deref());
             if !self.wanted(repo) {
                 continue;
             }
@@ -732,9 +651,8 @@ impl Read<'_> {
         in_range: &[&Cell],
         dispatches: &[Dispatch],
         rows: &[AgentRow],
-        places: &Places,
     ) -> Result<Waste> {
-        let counts = self.event_counts(places)?;
+        let counts = self.event_counts(cells)?;
         let count = |status: Status| dispatches.iter().filter(|d| d.status == status).count();
         let no_report_top = rows
             .iter()
@@ -759,10 +677,7 @@ impl Read<'_> {
             .collect();
         let reopened: HashSet<(&str, i64)> = in_range
             .iter()
-            .filter_map(|c| match &cells.window(c).place {
-                Place::Linked { repo, issue, .. } => Some((repo.as_str(), *issue)),
-                Place::Unlinked => None,
-            })
+            .filter_map(|c| cells.row_of(c).place.issue().map(|(repo, n, _)| (repo, n)))
             .filter(|&(repo, n)| {
                 self.gh
                     .issue(repo, n)
@@ -780,7 +695,7 @@ impl Read<'_> {
             no_report: count(Status::NoReport) as i64,
             no_report_top,
             compactions: counts.compactions,
-            clears: self.clears(places)?,
+            clears: self.clears(cells)?,
             context_peaks_over_80: peaks.iter().filter(|(p, _)| *p >= PEAK_PCT).count() as i64,
             deepest_peak: peaks
                 .iter()
@@ -798,13 +713,12 @@ impl Read<'_> {
         })
     }
 
-    /// The flagged events in the range and filter, placed in their window
-    /// as their requests are: an orchestrator's by transcript offset, a
-    /// subagent's in the window it started in.
-    fn event_counts(&self, places: &Places) -> Result<EventCounts> {
+    /// The flagged events in the range and filter, each in its agent's
+    /// charge's repo.
+    fn event_counts(&self, cells: &Cells) -> Result<EventCounts> {
         let mut out = EventCounts::default();
         let mut stmt = self.conn.prepare_cached(
-            "SELECT session_id, agent_id, byte_offset, timestamp, type, subtype,
+            "SELECT session_id, agent_id, timestamp, type, subtype,
                  json_array_length(message_to), api_error
              FROM events
              WHERE message_to IS NOT NULL OR api_error IS NOT NULL
@@ -813,28 +727,25 @@ impl Read<'_> {
         let mut rows = stmt.query([])?;
         while let Some(r) = rows.next()? {
             let session: String = r.get(0)?;
-            let at: Option<String> = r.get(3)?;
-            let segment = match r.get::<_, Option<String>>(1)? {
-                None => places.segment_at(&session, r.get(2)?),
-                agent => self.agents.get(&(session, agent)).and_then(|i| i.segment),
-            };
+            let agent: Option<String> = r.get(1)?;
+            let at: Option<String> = r.get(2)?;
             let in_scope = at
                 .as_deref()
                 .and_then(parse_timestamp)
                 .and_then(|ms| self.day_in_range(ms))
                 .is_some()
-                && self.wanted(places.repo(segment));
+                && self.wanted(cells.repo_of(&session, agent.as_deref()));
             if !in_scope {
                 continue;
             }
-            let system = r.get::<_, Option<String>>(4)?.as_deref() == Some("system");
-            match r.get::<_, Option<String>>(5)?.as_deref() {
+            let system = r.get::<_, Option<String>>(3)?.as_deref() == Some("system");
+            match r.get::<_, Option<String>>(4)?.as_deref() {
                 Some("compact_boundary") if system => out.compactions += 1,
                 Some("api_error") if system => out.api_retries += 1,
                 _ => {}
             }
-            out.send_messages += r.get::<_, Option<i64>>(6)?.unwrap_or(0);
-            match r.get::<_, Option<String>>(7)?.as_deref() {
+            out.send_messages += r.get::<_, Option<i64>>(5)?.unwrap_or(0);
+            match r.get::<_, Option<String>>(6)?.as_deref() {
                 Some("prompt_too_long") => {
                     out.api_errors += 1;
                     out.prompt_too_long += 1;
@@ -847,8 +758,8 @@ impl Read<'_> {
     }
 
     /// `/clear` successors (continuation children) that started in the
-    /// range, in a window of the filter.
-    fn clears(&self, places: &Places) -> Result<i64> {
+    /// range, their orchestrator charged in the filter.
+    fn clears(&self, cells: &Cells) -> Result<i64> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT s.session_id, s.started_at FROM edges AS e
              JOIN agents AS a ON a.id = e.child
@@ -865,7 +776,7 @@ impl Read<'_> {
                 .and_then(parse_timestamp)
                 .and_then(|ms| self.day_in_range(ms))
                 .is_some();
-            if in_range && self.wanted(places.repo(places.first_segment(&session))) {
+            if in_range && self.wanted(cells.repo_of(&session, None)) {
                 n += 1;
             }
         }

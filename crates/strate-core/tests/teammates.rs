@@ -104,7 +104,7 @@ fn drawn(db: &Connection) -> Vec<(String, AgentState)> {
     let rows = views::workstreams(db).expect("workstreams");
     let tab = rows
         .iter()
-        .find(|w| w.name == "team-repo-1")
+        .find(|w| w.name == "issue_team-repo-1")
         .unwrap_or_else(|| panic!("no team-repo-1 tab: {rows:?}"));
     let graph = views::live_graph(db, tab.id)
         .expect("query")

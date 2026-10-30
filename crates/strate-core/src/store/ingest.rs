@@ -7,7 +7,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
-use super::{Result, account, directs, group, live};
+use super::{Result, account, live, model};
 use crate::cost::SYNTHETIC;
 use crate::discovery::{AgentRef, Graph, Link, Unresolved, scalar_text};
 use crate::tail::{Batch, TailEvent};
@@ -53,10 +53,11 @@ fn owner_of(path: &Path) -> Owner {
     }
 }
 
-/// Stores a batch's events and its checkpoint, then regroups the batch's
-/// session, ends the waits left open on its `/clear` chain's earlier links
-/// and recomputes the rollups it touches, and `directs` when it stored a
-/// cross-session message.
+/// Stores a batch's events and its checkpoint, then relinks the batch's
+/// session ([`relink`]), ends the waits left open on its `/clear` chain's
+/// earlier links, re-resolves the agents it touched in the model,
+/// recomputes the rollups it touches, and rebuilds the message edges when
+/// it stored a cross-session message.
 pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
     let owner = owner_of(&batch.path);
     let file = text_of(&batch.path);
@@ -84,14 +85,15 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
             TailEvent::Malformed { .. } | TailEvent::Error { .. } | TailEvent::CaughtUp => {}
         }
     }
-    group::sessions(conn, [owner.session_id.as_str()])?;
+    relink(conn, &owner.session_id)?;
     if agent.is_some() {
         end_cleared_waits(conn, &owner.session_id)?;
     }
+    model::batch(conn, &owner.session_id, agent)?;
     let touched = account::touched(conn, &owner.session_id, &requests)?;
     account::rollup(conn, touched.iter().map(String::as_str))?;
     if messaged {
-        directs::rebuild(conn)?;
+        model::messages(conn)?;
     }
     if let Some(c) = batch.checkpoint {
         conn.prepare_cached(
@@ -105,6 +107,53 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
             c.identity.volume as i64,
             c.identity.index.to_string()
         ])?;
+    }
+    Ok(())
+}
+
+/// Sets `session_id`'s start, its orchestrator's earliest record time,
+/// then links the orchestrators of every session on its process root,
+/// predecessor to successor in start order (`continuation` edges). Both are
+/// functions of the stored events.
+fn relink(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.prepare_cached(
+        "UPDATE sessions SET started_at = (SELECT min(e.timestamp) FROM events AS e
+             WHERE e.session_id = ?1 AND e.agent_id IS NULL)
+         WHERE session_id = ?1",
+    )?
+    .execute([session_id])?;
+    let chain: Vec<i64> = conn
+        .prepare_cached(
+            "SELECT a.id FROM sessions AS s
+             JOIN sessions AS me ON me.process_root = s.process_root
+             JOIN agents AS a ON a.session_id = s.session_id AND a.agent_id IS NULL
+             WHERE me.session_id = ?1
+             ORDER BY s.started_at IS NULL, s.started_at, s.session_id",
+        )?
+        .query_map([session_id], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    if let Some(first) = chain.first() {
+        conn.prepare_cached("DELETE FROM edges WHERE kind = 'continuation' AND child = ?1")?
+            .execute([first])?;
+    }
+    for pair in chain.windows(2) {
+        conn.prepare_cached(
+            "INSERT INTO edges (kind, parent, child) VALUES ('continuation', ?1, ?2)
+             ON CONFLICT (kind, child) DO UPDATE SET parent = excluded.parent",
+        )?
+        .execute(params![pair[0], pair[1]])?;
+    }
+    Ok(())
+}
+
+/// [`relink`]s every stored session: a v1 store's upgrade.
+pub(super) fn relink_all(conn: &Connection) -> Result<()> {
+    let ids: Vec<String> = conn
+        .prepare("SELECT session_id FROM sessions ORDER BY session_id")?
+        .query_map([], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    for id in &ids {
+        relink(conn, id)?;
     }
     Ok(())
 }
@@ -201,6 +250,17 @@ fn agent_row(conn: &Connection, session_id: &str, agent_id: Option<&str>) -> Res
     conn.prepare_cached("SELECT id FROM agents WHERE session_id = ?1 AND agent_id IS ?2")?
         .query_row(params![session_id, agent_id], |r| r.get(0))
         .optional()
+}
+
+/// The row of the agent `r` names, if stored.
+fn ref_row(conn: &Connection, r: &AgentRef) -> Result<Option<i64>> {
+    match r {
+        AgentRef::Session { session_id } => agent_row(conn, session_id, None),
+        AgentRef::Subagent {
+            session_id,
+            agent_id,
+        } => agent_row(conn, session_id, Some(agent_id)),
+    }
 }
 
 /// What storing one record changed beyond its own row.
@@ -359,7 +419,8 @@ fn record(
 /// Stores the sessions, agents and edges of a discovery graph. Only adds
 /// and fills: nothing already stored is removed, so rows outlive the
 /// transcripts they came from. Meta values fill gaps; values read from
-/// transcript records stay on top.
+/// transcript records stay on top. Then re-resolves the graph's agents in
+/// the model and rebuilds the message edges.
 pub(super) fn graph(conn: &Connection, g: &Graph) -> Result<()> {
     for s in &g.sessions {
         let path = text_of(&s.path);
@@ -428,14 +489,7 @@ pub(super) fn graph(conn: &Connection, g: &Graph) -> Result<()> {
                 parent,
                 tool_use_id,
             } => {
-                let (session_id, agent_id) = match parent {
-                    AgentRef::Session { session_id } => (session_id, None),
-                    AgentRef::Subagent {
-                        session_id,
-                        agent_id,
-                    } => (session_id, Some(agent_id.as_str())),
-                };
-                let parent = agent_row(conn, session_id, agent_id)?;
+                let parent = ref_row(conn, parent)?;
                 edge(
                     conn,
                     "dispatch",
@@ -445,6 +499,12 @@ pub(super) fn graph(conn: &Connection, g: &Graph) -> Result<()> {
                     None,
                     None,
                 )?;
+            }
+            // Only meta `parentAgentId` names the parent: a dispatch with no
+            // tool_use_id.
+            Link::ParentAgent { parent } => {
+                let parent = ref_row(conn, parent)?;
+                edge(conn, "dispatch", parent, child, None, None, None)?;
             }
             Link::Teammate {
                 team_name,
@@ -498,7 +558,11 @@ pub(super) fn graph(conn: &Connection, g: &Graph) -> Result<()> {
             }
         }
     }
-    Ok(())
+    let sessions = g.sessions.iter().map(|s| s.session_id.as_str());
+    model::graph(
+        conn,
+        sessions.chain(g.subagents.iter().map(|s| s.session_id.as_str())),
+    )
 }
 
 fn edge(

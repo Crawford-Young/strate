@@ -44,7 +44,8 @@ pub fn status(progress: State<'_, Arc<Progress>>) -> Status {
     progress.status()
 }
 
-/// Every workstream with its $, state, needs-you count and drawn session.
+/// Every tab (a `/clear` chain) with its $, state, needs-you count and
+/// drawn session.
 #[tauri::command(async)]
 pub fn workstreams(reader: State<'_, Reader>) -> Result<Vec<Workstream>, String> {
     reader.read(views::workstreams)
@@ -60,8 +61,8 @@ pub fn needs_you(reader: State<'_, Reader>) -> Result<Vec<NeedsYou>, String> {
     reader.read(views::needs_you)
 }
 
-/// The live session of `workstream`: its agents and dispatch and teammate
-/// edges, never earlier sessions.
+/// The drawn link of tab `workstream`: its agents and dispatch and teammate
+/// edges, never earlier links', plus the live sessions it spawned.
 #[tauri::command(async)]
 pub fn live_graph(reader: State<'_, Reader>, workstream: i64) -> Result<Option<LiveGraph>, String> {
     reader.read(|conn| views::live_graph(conn, workstream))
