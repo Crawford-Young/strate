@@ -91,8 +91,6 @@ function agent(over: Partial<GraphAgent> & Pick<GraphAgent, 'id'>): GraphAgent {
     costUsd: null,
     contextTokens: null,
     contextPct: null,
-    nudgePct: 80,
-    hardStopPct: 95,
     parent: null,
     ...over,
   }
@@ -456,18 +454,13 @@ describe('needs-you chip', () => {
     expect(chip()).not.toBeInTheDocument()
   })
 
-  it('sits on the header line, before the panel toggles', async () => {
+  it('sits on the header line, before the Audit button', async () => {
     needsYouMock.mockResolvedValue([blocked])
     render(<App />)
     await screen.findByRole('button', { name: '1 needs you' })
     const header = screen.getByRole('banner')
     const buttons = within(header).getAllByRole('button')
-    expect(buttons.map((b) => b.textContent)).toEqual([
-      '1 needs you',
-      'Harness',
-      'Terminal',
-      'Audit',
-    ])
+    expect(buttons.map((b) => b.textContent)).toEqual(['1 needs you', 'Audit'])
   })
 
   it('lists every wait, a session with no tab too, and goes to a tabbed one', async () => {
@@ -565,13 +558,13 @@ describe('console', () => {
   it('drops the node selection when dragged shut', async () => {
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
-    act(() => dragTo('strate-columns', { harness: 0, canvas: 100, console: 0 }))
+    act(() => dragTo('strate-columns', { canvas: 100, console: 0 }))
     expect(screen.queryByRole('complementary', { name: 'Console' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: /implementer/ })).toHaveAttribute(
       'aria-pressed',
       'false',
     )
-    act(() => dragTo('strate-columns', { harness: 0, canvas: 70, console: 30 }))
+    act(() => dragTo('strate-columns', { canvas: 70, console: 30 }))
     const console = screen.getByRole('complementary', { name: 'Console' })
     expect(within(console).getByRole('heading', { name: 'Console' })).toBeInTheDocument()
   })
@@ -601,87 +594,57 @@ describe('console', () => {
 })
 
 describe('panels', () => {
-  const pressed = (name: string) =>
-    screen.getByRole('button', { name }).getAttribute('aria-pressed')
   const saved = () => JSON.parse(localStorage.getItem(PREFS_KEY) ?? 'null')
-
-  it('start closed on first launch', async () => {
+  const consolePanel = () => screen.queryByRole('complementary', { name: 'Console' })
+  const relaunch = async (first: ReturnType<typeof render>) => {
+    first.unmount()
+    cleanup()
+    resetGroups()
     render(<App />)
     await screen.findByRole('tab', { name: /strate-17/ })
-    expect(pressed('Harness')).toBe('false')
-    expect(pressed('Terminal')).toBe('false')
+  }
+
+  it('start with the console closed on first launch', async () => {
+    render(<App />)
+    await screen.findByRole('tab', { name: /strate-17/ })
+    expect(defaultLayoutOf('strate-columns')).toEqual({ canvas: 100, console: 0 })
+    expect(consolePanel()).not.toBeInTheDocument()
+  })
+
+  it('lay out the canvas centre and the console right, in one horizontal group', async () => {
+    render(<App />)
+    await screen.findByRole('tab', { name: /strate-17/ })
+    const columns = screen.getByTestId('group-strate-columns')
+    expect(columns).toHaveAttribute('data-orientation', 'horizontal')
+    const order = within(columns)
+      .getAllByTestId(/^panel-/)
+      .map((p) => p.dataset.testid)
+    expect(order).toEqual(['panel-canvas', 'panel-console'])
+    expect(screen.queryByTestId('group-strate-rows')).not.toBeInTheDocument()
+  })
+
+  it('have no Harness or Terminal', async () => {
+    render(<App />)
+    await screen.findByRole('tab', { name: /strate-17/ })
+    expect(screen.queryByRole('button', { name: /harness/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /terminal/i })).not.toBeInTheDocument()
     expect(screen.queryByRole('complementary', { name: 'Harness' })).not.toBeInTheDocument()
     expect(screen.queryByRole('region', { name: 'Terminal' })).not.toBeInTheDocument()
   })
 
-  it('lay out Harness left, canvas centre, console right, terminal below', async () => {
-    render(<App />)
-    await screen.findByRole('tab', { name: /strate-17/ })
-    const rows = screen.getByTestId('group-strate-rows')
-    expect(rows).toHaveAttribute('data-orientation', 'vertical')
-    const order = within(rows)
-      .getAllByTestId(/^panel-/)
-      .map((p) => p.dataset.testid)
-    expect(order).toEqual([
-      'panel-main',
-      'panel-harness',
-      'panel-canvas',
-      'panel-console',
-      'panel-terminal',
-    ])
-    expect(screen.getByTestId('group-strate-columns')).toHaveAttribute(
-      'data-orientation',
-      'horizontal',
-    )
-  })
-
-  it('open from the toggle buttons with a one-line placeholder', async () => {
-    render(<App />)
-    await screen.findByRole('tab', { name: /strate-17/ })
-    fireEvent.click(screen.getByRole('button', { name: 'Harness' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Terminal' }))
-    expect(pressed('Harness')).toBe('true')
-    expect(pressed('Terminal')).toBe('true')
-    expect(
-      within(screen.getByRole('complementary', { name: 'Harness' })).getByText(
-        'Harness arrives in #23.',
-      ),
-    ).toBeInTheDocument()
-    expect(
-      within(screen.getByRole('region', { name: 'Terminal' })).getByText(
-        'Terminal arrives in Epic E.',
-      ),
-    ).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Harness' }))
-    expect(pressed('Harness')).toBe('false')
-    expect(screen.queryByRole('complementary', { name: 'Harness' })).not.toBeInTheDocument()
-  })
-
-  it('save sizes and open state and restore them on the next launch', async () => {
+  it('save the console size and open state and restore them on the next launch', async () => {
     const first = render(<App />)
-    await screen.findByRole('tab', { name: /strate-17/ })
-    fireEvent.click(screen.getByRole('button', { name: 'Harness' }))
-    act(() => dragTo('strate-columns', { harness: 22, canvas: 78, console: 0 }))
-    fireEvent.click(screen.getByRole('button', { name: 'Terminal' }))
-    expect(saved()).toEqual({
-      harness: { open: true, size: 22 },
-      console: { open: false, size: 32 },
-      terminal: { open: true, size: 35 },
-    })
-    first.unmount()
-    cleanup()
-    resetGroups()
+    fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
+    act(() => dragTo('strate-columns', { canvas: 72, console: 28 }))
+    expect(saved()).toEqual({ console: { open: true, size: 28 } })
 
-    render(<App />)
-    await screen.findByRole('tab', { name: /strate-17/ })
-    expect(defaultLayoutOf('strate-columns')).toEqual({ harness: 22, canvas: 78, console: 0 })
-    expect(defaultLayoutOf('strate-rows')).toEqual({ main: 65, terminal: 35 })
-    expect(pressed('Harness')).toBe('true')
-    expect(pressed('Terminal')).toBe('true')
-    expect(screen.getByRole('complementary', { name: 'Harness' })).toBeInTheDocument()
+    await relaunch(first)
+    expect(defaultLayoutOf('strate-columns')).toEqual({ canvas: 72, console: 28 })
+    expect(consolePanel()).toBeInTheDocument()
   })
 
-  it('fall back to the defaults when the saved sizes cannot fit', async () => {
+  // Builds before #106 saved the Harness and Terminal too; their keys are dropped on the next save.
+  it('restore the console from a layout saved with the old Harness and Terminal', async () => {
     localStorage.setItem(
       PREFS_KEY,
       JSON.stringify({
@@ -692,27 +655,31 @@ describe('panels', () => {
     )
     render(<App />)
     await screen.findByRole('tab', { name: /strate-17/ })
-    expect(defaultLayoutOf('strate-columns')).toEqual({ harness: 0, canvas: 100, console: 0 })
-    expect(pressed('Harness')).toBe('false')
+    expect(defaultLayoutOf('strate-columns')).toEqual({ canvas: 55, console: 45 })
+    expect(consolePanel()).toBeInTheDocument()
+    expect(saved()).toEqual({ console: { open: true, size: 45 } })
   })
 
-  it('reopen at the size they had before closing', async () => {
+  it('reopen the console at the size it had before closing', async () => {
     render(<App />)
-    await screen.findByRole('tab', { name: /strate-17/ })
-    fireEvent.click(screen.getByRole('button', { name: 'Terminal' }))
-    act(() => dragTo('strate-rows', { main: 75, terminal: 25 }))
-    fireEvent.click(screen.getByRole('button', { name: 'Terminal' }))
-    fireEvent.click(screen.getByRole('button', { name: 'Terminal' }))
-    expect(saved().terminal).toEqual({ open: true, size: 25 })
+    fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
+    act(() => dragTo('strate-columns', { canvas: 75, console: 25 }))
+    fireEvent.click(screen.getByRole('button', { name: 'Close console' }))
+    expect(saved().console).toEqual({ open: false, size: 25 })
+    fireEvent.click(screen.getByRole('button', { name: /implementer/ }))
+    expect(saved().console).toEqual({ open: true, size: 25 })
   })
 
-  it('close when dragged shut', async () => {
-    render(<App />)
-    await screen.findByRole('tab', { name: /strate-17/ })
-    fireEvent.click(screen.getByRole('button', { name: 'Harness' }))
-    act(() => dragTo('strate-columns', { harness: 0, canvas: 100, console: 0 }))
-    expect(pressed('Harness')).toBe('false')
-    expect(saved().harness).toEqual({ open: false, size: 30 })
+  it('keep the last open size when the console is dragged shut', async () => {
+    const first = render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
+    act(() => dragTo('strate-columns', { canvas: 72, console: 28 }))
+    act(() => dragTo('strate-columns', { canvas: 100, console: 0 }))
+    expect(saved().console).toEqual({ open: false, size: 28 })
+
+    await relaunch(first)
+    expect(defaultLayoutOf('strate-columns')).toEqual({ canvas: 100, console: 0 })
+    expect(consolePanel()).not.toBeInTheDocument()
   })
 })
 
@@ -782,15 +749,16 @@ describe('audit view', () => {
     render(<App />)
     await screen.findByRole('tab', { name: /strate-17/ })
     selectTab(/app@main/)
-    fireEvent.click(screen.getByRole('button', { name: 'Harness' }))
-    act(() => dragTo('strate-columns', { harness: 22, canvas: 78, console: 0 }))
+    fireEvent.click(await screen.findByRole('button', { name: /app-main/ }))
+    act(() => dragTo('strate-columns', { canvas: 78, console: 22 }))
     const before = localStorage.getItem(PREFS_KEY)
     openAudit()
     back()
     expect(tab(/app@main/)).toHaveAttribute('aria-selected', 'true')
-    expect(screen.getByRole('button', { name: 'Harness' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('complementary', { name: 'Console' })).toBeInTheDocument()
     expect(localStorage.getItem(PREFS_KEY)).toBe(before)
   })
+
   it('re-fits the graph on return from Audit, but not while the canvas is hidden', async () => {
     const observed = new Set<{ callback: ResizeObserverCallback; target: Element }>()
     vi.stubGlobal(

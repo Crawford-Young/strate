@@ -1,7 +1,7 @@
 // Panel sizes and open state, saved locally and restored on open. Sizes are
 // percentages of the panel's group; a closed panel keeps its last open size.
 
-export type PanelId = 'harness' | 'console' | 'terminal'
+export type PanelId = 'console'
 
 export interface PanelPref {
   open: boolean
@@ -15,22 +15,18 @@ export type Layout = Record<string, number>
 
 export const PREFS_KEY = 'strate.layout'
 
-const PANELS: readonly PanelId[] = ['harness', 'console', 'terminal']
+const PANELS: readonly PanelId[] = ['console']
 
 export const DEFAULT_PREFS: LayoutPrefs = {
-  harness: { open: false, size: 30 },
   console: { open: false, size: 32 },
-  terminal: { open: false, size: 35 },
 }
 
 /** Smallest size per panel, in percent; the panels and the tests share these. */
-export const MIN_SIZE = { harness: 15, canvas: 20, console: 15, main: 20, terminal: 10 } as const
+export const MIN_SIZE = { canvas: 20, console: 15 } as const
 
-/** The most a panel can take while its neighbour keeps its minimum. */
+/** The most a panel can take while the canvas keeps its minimum. */
 const MAX_SIZE: Record<PanelId, number> = {
-  harness: 100 - MIN_SIZE.canvas,
   console: 100 - MIN_SIZE.canvas,
-  terminal: 100 - MIN_SIZE.main,
 }
 
 function isPref(id: PanelId, value: unknown): value is PanelPref {
@@ -44,6 +40,10 @@ function isPref(id: PanelId, value: unknown): value is PanelPref {
   )
 }
 
+/**
+ * The saved prefs, each invalid panel at its default. Keys of panels that no longer exist (the
+ * Harness and Terminal saved before #106) are ignored.
+ */
 export function loadPrefs(storage: Pick<Storage, 'getItem'>): LayoutPrefs {
   let stored: unknown
   try {
@@ -58,9 +58,7 @@ export function loadPrefs(storage: Pick<Storage, 'getItem'>): LayoutPrefs {
     const pref = record[id]
     if (isPref(id, pref)) prefs[id] = { open: pref.open, size: pref.size }
   }
-  // Harness and console share a row with the canvas: both at once must leave it room.
-  const fits = prefs.harness.size + prefs.console.size <= MAX_SIZE.harness
-  return fits ? prefs : DEFAULT_PREFS
+  return prefs
 }
 
 export function savePrefs(storage: Pick<Storage, 'setItem'>, prefs: LayoutPrefs): void {
@@ -71,19 +69,10 @@ export function savePrefs(storage: Pick<Storage, 'setItem'>, prefs: LayoutPrefs)
   }
 }
 
-const shown = (pref: PanelPref) => (pref.open ? pref.size : 0)
-
-/** Harness | canvas | console. */
+/** Canvas | console. */
 export function columnsLayout(prefs: LayoutPrefs): Layout {
-  const harness = shown(prefs.harness)
-  const right = shown(prefs.console)
-  return { harness, canvas: 100 - harness - right, console: right }
-}
-
-/** Main area over the terminal. */
-export function rowsLayout(prefs: LayoutPrefs): Layout {
-  const terminal = shown(prefs.terminal)
-  return { main: 100 - terminal, terminal }
+  const right = prefs.console.open ? prefs.console.size : 0
+  return { canvas: 100 - right, console: right }
 }
 
 /** Prefs updated from a group's reported layout; the same object when unchanged. */

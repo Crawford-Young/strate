@@ -38,23 +38,6 @@ pub struct Store {
     conn: Connection,
 }
 
-/// Gear for one agent: context sliders, $ warning, caps and path routing.
-/// Written per agent with [`Store::set_gear`] (on the orchestrator: the
-/// session's defaults; on any other agent: its overrides, `None`
-/// inheriting). Read back resolved by [`Store::gear`], where nudge and hard
-/// stop are always set (built-in 80 and 95).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Gear {
-    pub nudge_pct: Option<u8>,
-    pub hard_stop_pct: Option<u8>,
-    pub cost_warn_pct: Option<u8>,
-    pub cost_cap_usd: Option<f64>,
-    pub time_cap_ms: Option<u64>,
-    pub cwd: Option<String>,
-    pub model: Option<String>,
-    pub effort: Option<String>,
-}
-
 /// An open write transaction. Dropping it without [`Ingest::commit`] rolls
 /// everything in it back.
 pub struct Ingest<'a> {
@@ -153,49 +136,6 @@ impl Store {
         tx.commit()
     }
 
-    /// Replaces the gear row of one stored agent (`agent_id` `None`: the
-    /// session's orchestrator, whose row is the session's defaults). Fails,
-    /// changing nothing, when any agent of the session would end up with
-    /// its hard stop at or below its nudge.
-    pub fn set_gear(
-        &mut self,
-        session_id: &str,
-        agent_id: Option<&str>,
-        gear: &Gear,
-    ) -> Result<()> {
-        let time_cap_ms = gear
-            .time_cap_ms
-            .map(i64::try_from)
-            .transpose()
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        let changed = self.conn.execute(
-            "INSERT INTO gear_settings (agent, nudge_pct, hard_stop_pct, cost_warn_pct,
-                 cost_cap_usd, time_cap_ms, cwd, model, effort)
-             SELECT id, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10 FROM agents
-             WHERE session_id = ?1 AND agent_id IS ?2
-             ON CONFLICT (agent) DO UPDATE SET nudge_pct = excluded.nudge_pct,
-                 hard_stop_pct = excluded.hard_stop_pct, cost_warn_pct = excluded.cost_warn_pct,
-                 cost_cap_usd = excluded.cost_cap_usd, time_cap_ms = excluded.time_cap_ms,
-                 cwd = excluded.cwd, model = excluded.model, effort = excluded.effort",
-            params![
-                session_id,
-                agent_id,
-                gear.nudge_pct,
-                gear.hard_stop_pct,
-                gear.cost_warn_pct,
-                gear.cost_cap_usd,
-                time_cap_ms,
-                gear.cwd,
-                gear.model,
-                gear.effort,
-            ],
-        )?;
-        match changed {
-            0 => Err(rusqlite::Error::QueryReturnedNoRows),
-            _ => Ok(()),
-        }
-    }
-
     /// Applies registry poll events in one transaction: each entry's row in
     /// `registry` (a session it names gets a stub session and orchestrator
     /// until its transcript arrives). The row is the only copy of the
@@ -282,30 +222,6 @@ impl Store {
             0 => Err(rusqlite::Error::QueryReturnedNoRows),
             _ => Ok(()),
         }
-    }
-
-    /// The agent's effective gear: its own row, else its orchestrator's,
-    /// else the built-in nudge 80 / hard stop 95.
-    pub fn gear(&self, session_id: &str, agent_id: Option<&str>) -> Result<Gear> {
-        self.conn.query_row(
-            "SELECT g.nudge_pct, g.hard_stop_pct, g.cost_warn_pct, g.cost_cap_usd,
-                 g.time_cap_ms, g.cwd, g.model, g.effort
-             FROM gear_effective AS g JOIN agents AS a ON a.id = g.agent
-             WHERE a.session_id = ?1 AND a.agent_id IS ?2",
-            params![session_id, agent_id],
-            |r| {
-                Ok(Gear {
-                    nudge_pct: r.get(0)?,
-                    hard_stop_pct: r.get(1)?,
-                    cost_warn_pct: r.get(2)?,
-                    cost_cap_usd: r.get(3)?,
-                    time_cap_ms: r.get::<_, Option<i64>>(4)?.map(|ms| ms as u64),
-                    cwd: r.get(5)?,
-                    model: r.get(6)?,
-                    effort: r.get(7)?,
-                })
-            },
-        )
     }
 }
 
@@ -582,6 +498,47 @@ mod tests {
             .expect("types");
         let want = [("a1", "teammate"), ("a2", "reviewer"), ("a3", "recon")];
         assert_eq!(types, want.map(|(a, t)| (a.to_string(), t.to_string())));
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_v19_store_drops_its_gear_and_keeps_its_other_rows() {
+        // Strate v2 is visibility only (#106): stored gear rows go by design.
+        let dir = test_dir("store-v19-drop-gear");
+        let db = dir.join("strate.db");
+        let mut v19 = Connection::open(&db).expect("v19 db");
+        migrate::migrate(&mut v19, &migrate::MIGRATIONS[..19]).expect("v19");
+        v19.execute_batch(
+            "INSERT INTO sessions (session_id, path) VALUES ('s1', '/p/s1.jsonl');
+             INSERT INTO agents (id, session_id, kind, name) VALUES (1, 's1', 'orchestrator', 'lorem');
+             INSERT INTO gear_settings (agent, nudge_pct, hard_stop_pct) VALUES (1, 70, 90);",
+        )
+        .expect("v19 rows");
+        drop(v19);
+
+        let store = Store::open_in(&db, "UTC").expect("upgrade");
+        let gear: Vec<String> = store
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE name LIKE 'gear%' ORDER BY name")
+            .expect("schema")
+            .query_map([], |r| r.get(0))
+            .expect("rows")
+            .collect::<Result<_>>()
+            .expect("names");
+        assert_eq!(gear, Vec::<String>::new(), "table, view and triggers gone");
+        let name: String = store
+            .conn
+            .query_row("SELECT name FROM agents WHERE session_id = 's1'", [], |r| {
+                r.get(0)
+            })
+            .expect("s1 kept");
+        assert_eq!(name, "lorem");
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, 20);
         drop(store);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }

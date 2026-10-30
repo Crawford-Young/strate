@@ -4,7 +4,6 @@ import { createRef } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 import type { NeedsYou, Workstream } from './api'
 import { Header } from './Header'
-import { DEFAULT_PREFS } from './layout'
 
 const tabs: Workstream[] = [1, 2, 3, 4, 5].map((id) => ({
   id,
@@ -42,8 +41,6 @@ describe('a full header', () => {
           waits={waits}
           onGoToTab={vi.fn()}
           activeKey="1"
-          prefs={DEFAULT_PREFS}
-          onTogglePanel={vi.fn()}
           auditButtonRef={createRef()}
           onOpenAudit={vi.fn()}
         />

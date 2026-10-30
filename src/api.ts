@@ -63,10 +63,6 @@ export interface GraphAgent {
   contextTokens: number | null
   /** Latest request depth over the model's window; null for an unknown window. */
   contextPct: number | null
-  /** The agent's resolved context nudge, in percent (gear, default 80). */
-  nudgePct: number
-  /** The agent's resolved context hard stop, in percent (gear, default 95). */
-  hardStopPct: number
   parent: number | null
 }
 

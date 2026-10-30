@@ -119,8 +119,6 @@ function AgentNode({
         detail={a.description ?? a.model ?? undefined}
         context={a.contextPct ?? undefined}
         contextLabel={a.contextPct === null ? undefined : `${Math.round(a.contextPct)}%`}
-        nudgeAt={a.nudgePct}
-        hardStopAt={a.hardStopPct}
         selected={selected}
         data-agent={a.id}
         onFocus={(e) => reveal(e.currentTarget)}
@@ -170,9 +168,9 @@ function GraphView({ graph, selected, onSelect }: GraphViewProps) {
     )
     if (sizes.length > 0) setMeasured((m) => new Map([...m, ...sizes]))
   }, [])
-  // The flow fits once, on its first draw; this re-fits on every later canvas size: a panel
-  // toggle, a handle drag, a window resize, a return from Audit. A hidden canvas reports 0x0
-  // and fits nothing; its next real size fits.
+  // The flow fits once, on its first draw; this re-fits on every later canvas size: the console
+  // opening or closing, a handle drag, a window resize, a return from Audit. A hidden canvas
+  // reports 0x0 and fits nothing; its next real size fits.
   const refitOnResize = useCallback(
     (box: HTMLDivElement) => {
       let last: string | null | undefined

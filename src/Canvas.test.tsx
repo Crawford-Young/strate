@@ -51,8 +51,6 @@ function agent(over: Partial<GraphAgent> & Pick<GraphAgent, 'id'>): GraphAgent {
     costUsd: null,
     contextTokens: null,
     contextPct: null,
-    nudgePct: 80,
-    hardStopPct: 95,
     parent: null,
     ...over,
   }
@@ -208,25 +206,23 @@ describe('node cards', () => {
     expect(card('teammate')).toHaveTextContent('claude-opus-5-5')
   })
 
-  it("colours each gauge against that agent's own nudge and hard stop", async () => {
+  it('colours every gauge against the fixed nudge 80% and hard stop 95%', async () => {
+    const at = (id: number, contextPct: number) =>
+      agent({ id, name: `at-${contextPct}`, contextPct })
     const graph: LiveGraph = {
       ...tiered,
-      agents: [
-        agent({ id: 1, name: 'early', contextPct: 70, nudgePct: 60, hardStopPct: 90 }),
-        agent({ id: 2, name: 'late', contextPct: 92, nudgePct: 60, hardStopPct: 90 }),
-        agent({ id: 3, name: 'default', contextPct: 70 }),
-        agent({ id: 4, name: 'unknown' }),
-      ],
+      agents: [at(1, 79), at(2, 80), at(3, 94), at(4, 95), agent({ id: 5, name: 'unknown' })],
       edges: [],
     }
     render(view({ graph }))
     await screen.findByTestId('flow')
     const fill = (name: string) =>
       (within(card(name)).getByRole('meter').firstElementChild as Element).className
-    expect(fill('early')).toMatch(/bg-warning/)
-    expect(fill('late')).toMatch(/bg-destructive/)
-    expect(fill('default')).toMatch(/bg-success/)
-    expect(card('early')).toHaveTextContent('70%')
+    expect(fill('at-79')).toMatch(/bg-success/)
+    expect(fill('at-80')).toMatch(/bg-warning/)
+    expect(fill('at-94')).toMatch(/bg-warning/)
+    expect(fill('at-95')).toMatch(/bg-destructive/)
+    expect(card('at-79')).toHaveTextContent('79%')
     expect(within(card('unknown')).queryByRole('meter')).not.toBeInTheDocument()
   })
 })

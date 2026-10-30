@@ -1,6 +1,6 @@
 //! Integration tests for the SQLite store: schema, transactional offsets,
 //! ingest of the synthetic #10 fixture, survival past transcript deletion,
-//! WAL concurrency and gear settings. Every db lives in a temp dir.
+//! and WAL concurrency. Every db lives in a temp dir.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use rusqlite::{Connection, params};
 use serde_json::json;
 use strate_core::discovery::discover;
-use strate_core::store::{Gear, Store};
+use strate_core::store::Store;
 use strate_core::tail::{
     Batch, Checkpoint, FileIdentity, Offsets, ResetReason, TailEvent, TailOptions, Tailer,
 };
@@ -243,20 +243,6 @@ fn open_creates_every_table_with_the_required_columns() {
                 "status",
                 "created_at",
                 "correlated_agent",
-            ],
-        ),
-        (
-            "gear_settings",
-            &[
-                "agent",
-                "nudge_pct",
-                "hard_stop_pct",
-                "cost_warn_pct",
-                "cost_cap_usd",
-                "time_cap_ms",
-                "cwd",
-                "model",
-                "effort",
             ],
         ),
         (
@@ -1078,107 +1064,6 @@ fn subagents_whose_session_file_is_gone_get_a_stub_session() {
         )
         .expect("B");
     assert_eq!(stub, 0);
-}
-
-// ---- gear ---------------------------------------------------------------
-
-fn gear_store(tmp: &Temp) -> Store {
-    let root = fixture(tmp);
-    let mut store = Store::open(tmp.db()).expect("open");
-    store
-        .ingest_graph(&discover(&root).expect("discover"))
-        .expect("graph");
-    store
-}
-
-#[test]
-fn gear_defaults_to_80_and_95_and_agents_inherit_the_orchestrators() {
-    let tmp = Temp::new("gear-inherit");
-    let mut store = gear_store(&tmp);
-    let a1 = Some("a1000000000000001");
-
-    let fresh = store.gear(SA, a1).expect("gear");
-    assert_eq!((fresh.nudge_pct, fresh.hard_stop_pct), (Some(80), Some(95)));
-    assert_eq!(fresh.cost_cap_usd, None);
-
-    let defaults = Gear {
-        nudge_pct: Some(70),
-        hard_stop_pct: Some(90),
-        cost_warn_pct: Some(75),
-        cost_cap_usd: Some(20.0),
-        time_cap_ms: Some(3_600_000),
-        cwd: Some("/work/demo-repo".into()),
-        model: Some("claude-opus-5-5".into()),
-        effort: Some("high".into()),
-    };
-    store.set_gear(SA, None, &defaults).expect("defaults");
-    assert_eq!(store.gear(SA, None).expect("orchestrator"), defaults);
-    assert_eq!(store.gear(SA, a1).expect("inherits"), defaults);
-
-    let over = Gear {
-        hard_stop_pct: Some(85),
-        cwd: Some("/work/.worktrees/demo-repo-12".into()),
-        model: Some("claude-sonnet-5".into()),
-        ..Gear::default()
-    };
-    store.set_gear(SA, a1, &over).expect("override");
-    assert_eq!(
-        store.gear(SA, a1).expect("overridden"),
-        Gear {
-            hard_stop_pct: Some(85),
-            cwd: over.cwd.clone(),
-            model: over.model.clone(),
-            ..defaults.clone()
-        }
-    );
-    assert_eq!(
-        store.gear(SA, Some("a1000000000000002")).expect("sibling"),
-        defaults,
-        "an override touches only its agent"
-    );
-    assert_eq!(
-        store.gear(SB, None).expect("other orchestrator").nudge_pct,
-        Some(80)
-    );
-}
-
-#[test]
-fn hard_stop_must_stay_above_nudge() {
-    let tmp = Temp::new("gear-order");
-    let mut store = gear_store(&tmp);
-    let a1 = Some("a1000000000000001");
-    let pct = |nudge, hard_stop| Gear {
-        nudge_pct: nudge,
-        hard_stop_pct: hard_stop,
-        ..Gear::default()
-    };
-
-    assert!(store.set_gear(SA, None, &pct(Some(90), Some(90))).is_err());
-    assert!(store.set_gear(SA, None, &pct(Some(91), Some(85))).is_err());
-    // Against the inherited 95: a nudge of 96 inverts the pair.
-    assert!(store.set_gear(SA, a1, &pct(Some(96), None)).is_err());
-    assert!(
-        store.set_gear(SA, None, &pct(Some(10), Some(101))).is_err(),
-        "pct is 0..=100"
-    );
-
-    store
-        .set_gear(SA, a1, &pct(Some(90), None))
-        .expect("90 < 95");
-    // Lowering the default hard stop to 85 would invert a1's effective pair.
-    assert!(store.set_gear(SA, None, &pct(None, Some(85))).is_err());
-    assert_eq!(store.gear(SA, a1).expect("unchanged").nudge_pct, Some(90));
-    assert_eq!(
-        store.gear(SA, None).expect("unchanged").hard_stop_pct,
-        Some(95)
-    );
-
-    assert!(
-        store
-            .set_gear(SA, Some("a-not-stored"), &Gear::default())
-            .is_err(),
-        "gear needs a stored agent"
-    );
 }
 
 #[test]
