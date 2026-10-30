@@ -1,8 +1,9 @@
 //! Cost and time rollups (#14) over the synthetic fixture in
 //! `tests/fixtures/cost-home`: parity with claude-config's `audit.mjs`
 //! (its numbers committed in `tests/fixtures/audit-golden.json`; CI re-runs
-//! audit.mjs against it), hand-computed time values, context %, workstream
-//! $, and an incremental build converging to a cold one. Every db lives in
+//! audit.mjs against it), hand-computed time values, context %, $ per
+//! charge, and an incremental build converging to a cold one, its audit
+//! cells too. Every db lives in
 //! a temp dir.
 
 use std::fs;
@@ -358,41 +359,34 @@ fn a_prompt_over_the_long_prompt_threshold_is_stored_at_the_long_prompt_rates() 
 }
 
 #[test]
-fn workstream_cost_is_queryable_through_event_workstreams() {
-    let t = Temp::new("workstream");
+fn charge_cost_is_queryable_through_charge_costs() {
+    let t = Temp::new("charge-cost");
     let db = cold(&t);
-    let rows: Vec<(String, f64, i64)> = db
+    let rows: Vec<(Option<String>, f64, i64)> = db
         .prepare(
-            "SELECT w.name, c.cost_usd, c.unpriced FROM workstream_costs AS c
-             JOIN workstreams AS w ON w.id = c.workstream ORDER BY w.name",
+            "SELECT ch.key, c.cost_usd, c.unpriced FROM charge_costs AS c
+             LEFT JOIN charges AS ch ON ch.id = c.charge ORDER BY ch.key IS NULL, ch.key",
         )
         .expect("prepare")
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .expect("query")
         .collect::<Result<_, _>>()
         .expect("rows");
-    let names: Vec<(&str, i64)> = rows.iter().map(|(n, _, u)| (n.as_str(), *u)).collect();
-    assert_eq!(
-        names,
-        vec![
-            ("/work/cost-long @ main", 0),
-            ("/work/cost-other @ main", 1),
-            ("cost-repo-14", 0)
-        ]
+    // K1 is named cost-repo-14 and its subagent works under it; K2 and K3
+    // are unnamed, so Unlinked, K2's unpriced request with them.
+    let keys: Vec<(Option<&str>, i64)> = rows.iter().map(|(k, _, u)| (k.as_deref(), *u)).collect();
+    assert_eq!(keys, vec![(Some("issue_cost-repo-14"), 0), (None, 1)]);
+    let usd = |sid| session_row::<f64>(&db, "cost_usd", sid);
+    assert!((rows[0].1 - usd(K1)).abs() < 1e-12, "{} vs K1", rows[0].1);
+    assert!(
+        (rows[1].1 - usd(K2) - usd(K3)).abs() < 1e-12,
+        "{} vs K2 + K3",
+        rows[1].1
     );
-    // Each workstream holds one session; the named one, K1 and its subagent.
-    for (row, sid) in [(0, K3), (1, K2), (2, K1)] {
-        let usd: f64 = session_row(&db, "cost_usd", sid);
-        assert!(
-            (rows[row].1 - usd).abs() < 1e-12,
-            "{} vs {usd}",
-            rows[row].1
-        );
-    }
 }
 
-/// Every rollup, with $ to 9 places: sums over the same requests may add
-/// in a different order.
+/// Every rollup and audit cell, with $ to 9 places: sums over the same
+/// requests may add in a different order.
 fn rollups(db: &Connection) -> Vec<String> {
     let mut out: Vec<String> = db
         .prepare(
@@ -422,6 +416,26 @@ fn rollups(db: &Connection) -> Vec<String> {
             Ok(format!(
                 "{:?}",
                 (0..9)
+                    .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                    .collect::<Result<Vec<_>, _>>()?
+            ))
+        })
+        .expect("query")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rows"),
+    );
+    out.extend(
+        db.prepare(
+            "SELECT session_id, agent_id, day, model, wall_ms, active_ms, wait_ms, ask_ms,
+                 printf('%.9f', cost_usd), unpriced, input_tokens, output_tokens,
+                 cache_read_tokens, cache_write_tokens
+             FROM audit_cells ORDER BY session_id, agent_id, day, model",
+        )
+        .expect("cells")
+        .query_map([], |r| {
+            Ok(format!(
+                "{:?}",
+                (0..14)
                     .map(|i| r.get::<_, rusqlite::types::Value>(i))
                     .collect::<Result<Vec<_>, _>>()?
             ))

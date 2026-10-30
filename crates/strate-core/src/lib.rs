@@ -3,11 +3,11 @@
 //! transcripts, the live registry poll and optional hook receiver, the
 //! SQLite store, and cost and time accounting.
 
+pub mod charge;
 pub mod cost;
 pub mod discovery;
 pub mod github;
 pub mod hooks;
-pub mod names;
 mod proc;
 pub mod registry;
 pub mod store;

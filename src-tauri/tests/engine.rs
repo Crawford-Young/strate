@@ -170,7 +170,7 @@ fn it_indexes_then_goes_live_with_registry_and_discovered_edges() {
     });
     let rows = views::workstreams(&reader).expect("workstreams");
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].name, "alpha-1");
+    assert_eq!(rows[0].name, "issue_alpha-1", "the charge key of its name");
     assert_eq!(rows[0].state, AgentState::Working);
     assert!(runs.load(Ordering::SeqCst) > 0);
     engine.stop();
@@ -374,14 +374,14 @@ fn recorded_gh(
     })
 }
 
-/// Waits until the alpha-1 window is stored, so a refresh has a repo.
+/// Waits until the alpha-1 tab is stored, so a refresh has a repo.
 fn wait_for_window(temp: &Temp) {
     let reader = Store::open_reader(temp.db()).expect("reader");
     wait_for("the window stored", || {
         views::workstreams(&reader)
             .expect("workstreams")
             .iter()
-            .any(|w| w.name == "alpha-1")
+            .any(|w| w.name == "issue_alpha-1")
     });
 }
 

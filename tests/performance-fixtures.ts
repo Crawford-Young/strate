@@ -23,7 +23,7 @@ export const day = (over: Partial<OutcomeDay> = {}): OutcomeDay => ({
 export const outcome = (over: Partial<Outcome> = {}): Outcome => ({
   days: [],
   unlinkedUsd: 0,
-  unlinkedWorkstreams: 0,
+  unlinkedCharges: 0,
   openUsd: 0,
   openIssues: 0,
   ...over,

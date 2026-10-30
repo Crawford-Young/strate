@@ -1,13 +1,12 @@
 //! The GitHub cache: `gh_repos`, `gh_issues`, `gh_prs` and `gh_reverts`, keyed by repo
 //! slug (the repo part of a session name).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use rusqlite::{Connection, params};
 
-use super::{Result, Store};
+use super::{Result, Store, model};
 use crate::github::{Issue, Pr, Repo, Revert};
-use crate::names::parse_name;
 
 /// One cached repo: `fetched_at` (unix ms) is its last successful refresh,
 /// `error` the failure of the latest one, if it failed.
@@ -21,22 +20,16 @@ pub struct GhRepo {
 }
 
 impl Store {
-    /// The repo slugs of the user-named windows, sorted and unique: the repos
-    /// worth fetching. Windows with a fallback name or a name that does not
-    /// parse are Unlinked and add none.
-    pub fn window_slugs(&self) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT DISTINCT w.name FROM segments AS g
-             JOIN workstream_roots AS r ON r.id = g.workstream_id
-             JOIN workstreams AS w ON w.id = r.root
-             WHERE NOT w.fallback",
-        )?;
-        let names = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut slugs = BTreeSet::new();
-        for name in names {
-            slugs.extend(parse_name(&name?).map(|parsed| parsed.repo));
-        }
-        Ok(slugs.into_iter().collect())
+    /// The repos of the agents' name charges (a repo, or an epic, issue or
+    /// PR of one), sorted and unique.
+    pub fn charge_slugs(&self) -> Result<Vec<String>> {
+        self.conn
+            .prepare_cached(
+                "SELECT DISTINCT c.repo FROM agents AS a JOIN charges AS c ON c.id = a.name_charge
+                 WHERE c.repo IS NOT NULL ORDER BY c.repo",
+            )?
+            .query_map([], |r| r.get(0))?
+            .collect()
     }
 
     /// The owner of `slug` as a stored `github_links.pr_repository`
@@ -86,8 +79,8 @@ impl Store {
         )?;
         let mut insert_pr = conn.prepare(
             "INSERT OR REPLACE INTO gh_prs (repo, issue, number, state, created_at,
-                 merged_at, url)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 merged_at, url, head_ref)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
         let mut insert_revert = conn.prepare(
             "INSERT OR REPLACE INTO gh_reverts (repo, number, reverted, merged_at)
@@ -116,6 +109,7 @@ impl Store {
                     pr.created_at,
                     pr.merged_at,
                     pr.url,
+                    pr.head_ref,
                 ])?;
             }
         }
@@ -128,6 +122,7 @@ impl Store {
             ])?;
         }
         drop((insert_issue, insert_pr, insert_revert));
+        model::branched(conn)?;
         tx.commit()
     }
 
@@ -166,7 +161,7 @@ pub fn gh_repos(conn: &Connection) -> Result<Vec<GhRepo>> {
 pub fn gh_issues(conn: &Connection, slug: &str) -> Result<Vec<Issue>> {
     let mut prs: BTreeMap<i64, Vec<Pr>> = BTreeMap::new();
     let mut stmt = conn.prepare(
-        "SELECT issue, number, state, created_at, merged_at, url FROM gh_prs
+        "SELECT issue, number, state, created_at, merged_at, url, head_ref FROM gh_prs
          WHERE repo = ?1 ORDER BY issue, number",
     )?;
     for pr in stmt.query_map([slug], |r| {
@@ -177,6 +172,7 @@ pub fn gh_issues(conn: &Connection, slug: &str) -> Result<Vec<Issue>> {
             created_at: r.get(3)?,
             merged_at: r.get(4)?,
             url: r.get(5)?,
+            head_ref: r.get(6)?,
         })
     })? {
         let pr = pr?;
@@ -219,37 +215,4 @@ pub fn gh_reverts(conn: &Connection, slug: &str) -> Result<Vec<Revert>> {
         })
     })?
     .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::tail::test_dir;
-
-    #[test]
-    fn window_slugs_are_the_repos_of_user_named_windows_once_each() {
-        let dir = test_dir("gh-slugs");
-        let store = Store::open(dir.join("strate.db")).expect("store");
-        store
-            .conn
-            .execute_batch(
-                "INSERT INTO sessions (session_id, path) VALUES ('s1', '/p/s1.jsonl');
-                 INSERT INTO workstreams (id, name, fallback) VALUES
-                     (1, 'demo-9', 0), (2, 'demo-9-s2', 0), (3, 'other-lab-3', 0),
-                     (4, 'plain', 0), (5, 'cwd-5', 1), (6, 'merged-4', 0),
-                     (7, 'unused-8', 0), (8, 'ticket-typed-4', 0), (9, 'director-wave-3', 0);
-                 UPDATE workstreams SET merged_into = 3 WHERE id = 6;
-                 INSERT INTO segments (session_id, start_offset, workstream_id) VALUES
-                     ('s1', 0, 1), ('s1', 10, 2), ('s1', 20, 3), ('s1', 30, 4),
-                     ('s1', 40, 5), ('s1', 50, 6), ('s1', 60, 8), ('s1', 70, 9);",
-            )
-            .expect("rows");
-        assert_eq!(
-            store.window_slugs().expect("slugs"),
-            ["demo", "other-lab", "typed"],
-            "a fallback name, an unparsed or director name and a workstream with no window add none; a merge reads as its root; a ticket name adds its repo"
-        );
-        drop(store);
-        std::fs::remove_dir_all(dir).expect("cleanup");
-    }
 }

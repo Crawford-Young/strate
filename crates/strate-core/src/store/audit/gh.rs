@@ -17,6 +17,9 @@ pub(crate) struct Gh {
     /// their repo. A parent in another repo is dropped at fetch, so these
     /// are the epics with a sub-issue in the same repo.
     epics: HashSet<(String, i64)>,
+    /// Per PR of a repo (by its own URL), the lowest issue of that repo it
+    /// closes.
+    closes: HashMap<(String, i64), i64>,
 }
 
 pub(crate) struct GhIssue {
@@ -80,6 +83,7 @@ impl Gh {
             );
         }
         let mut prs: HashMap<(String, i64), Vec<GhPr>> = HashMap::new();
+        let mut closes: HashMap<(String, i64), i64> = HashMap::new();
         let mut stmt = conn.prepare_cached(
             "SELECT repo, issue, number, state, merged_at, url FROM gh_prs
              ORDER BY repo, issue, number",
@@ -99,9 +103,18 @@ impl Gh {
             ))
         })? {
             let (key, pr) = row?;
+            if pr.repo == key.0 {
+                let issue = closes.entry((pr.repo.clone(), pr.number)).or_insert(key.1);
+                *issue = (*issue).min(key.1);
+            }
             prs.entry(key).or_default().push(pr);
         }
-        Ok(Self { issues, prs, epics })
+        Ok(Self {
+            issues,
+            prs,
+            epics,
+            closes,
+        })
     }
 
     /// Issue `repo`#`number`, when the cache holds it.
@@ -120,6 +133,12 @@ impl Gh {
         self.prs
             .get(&(repo.to_string(), issue))
             .map_or(&[][..], Vec::as_slice)
+    }
+
+    /// The lowest issue of `repo` that its PR `number` closes, when the
+    /// cache holds one.
+    pub(crate) fn closed_by(&self, repo: &str, number: i64) -> Option<i64> {
+        self.closes.get(&(repo.to_string(), number)).copied()
     }
 
     /// PR `number` among those closing `repo`#`issue`.

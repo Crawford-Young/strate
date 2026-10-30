@@ -1,56 +1,50 @@
 //! The Audit rollups (#26): a tree over `audit_cells`, plus a headline and
 //! the performance read, on a reader connection.
 //!
-//! Levels: Repo > Epic > Issue > PR > Session > Agent. A Session node is a
-//! `/clear` chain's `/rename` windows in one workstream (#63): every file
-//! one process wrote across `/clear`s (its process root) under one name,
-//! with one orchestrator node and every link's subagents. A chain renamed
-//! into another workstream reads there as another row: a real store had
-//! 35 of 62 continuation edges cross workstreams, a process reused for the
-//! next ticket. A director's `--bg` unit (a row with a session in
-//! `directs`) nests under the director's row, the one holding the window
-//! that messaged it, and its work counts there, not under its own issue;
-//! a unit of a unit nests a level deeper. Rows that direct each other (a
-//! cycle) nest under the earliest-started of them, by its first window's
-//! start, whatever order they resolve in (#66). Its name (`<repo>-<issue>[-sN]`, bare or behind
-//! `ticket-` or `epic-`; see [`crate::names`]) places it under its repo and
-//! issue. When the GitHub cache holds that issue, it also goes under each
-//! epic above the issue, outermost first (an epic is one node, its own
-//! windows under its "Direct work"), and under a PR: the issue's PR that
-//! the newest `github_links` entry of any of the row's sessions names, else
-//! the issue's only PR, else none. A row has one place, whichever of its
-//! windows a link came from, so it is one node. An issue the cache doesn't
-//! hold (no `gh`, a failed fetch) has `github: false`, no epic, PR or
-//! progress, and is open. A row whose name gives no place (a director's)
-//! can still sit under a repo, as a Session node beside its issues (#63):
-//! the one repo all its unit rows that name one work in (a unit whose name
-//! gives no place counting where it sits in turn, one placed nowhere
-//! skipped), else (units in several repos, or none) the repo a
-//! `director-<repo>` name names when the GitHub cache or a window name
-//! knows it. The outermost row places a nest. Any other window that is
-//! unnamed, has a fallback name or has a name that doesn't parse sits
-//! under "Unlinked". The headline reads a unit's own window, wherever its
-//! row nests, and so does the repo filter (see [`AuditFilter`]).
+//! Each cell is one agent's work on one local day and model, and it sits
+//! where its agent's effective charge (`agent_charges`, #107) puts it:
+//!
+//! - issue: Repo > Epic (each epic above it in the GitHub cache, outermost
+//!   first) > Issue > PR > Session > Agent. An epic's own issue charge is
+//!   one Epic node with its work under a "Direct work" Issue node. The PR
+//!   is the issue's PR that the newest `github_links` entry of the Session
+//!   row's sessions names, else the issue's only PR, else none.
+//! - epic: Repo > Epic (and the epics above it) > Session > Agent.
+//! - pr: under the issue it closes when the cache holds it (the lowest
+//!   issue of its repo), as an issue's work under that PR; else Repo > PR.
+//! - repo: Repo > Session > Agent.
+//! - topic: a top-level Topic node per topic > Session > Agent.
+//! - none: Unlinked > Session > Agent.
+//!
+//! An issue the cache doesn't hold (no `gh`, a failed fetch) has `github:
+//! false`, no epic, PR or progress, and is open; so is a PR it doesn't hold.
+//! A Session row is a `/clear` chain (every file one process wrote, by its
+//! process root) within one charge: its sessions' orchestrators and
+//! subagents of that charge. A subagent charged apart from its orchestrator
+//! sits under its own charge, in a Session row of its session holding only
+//! it. A session another one messaged or launched has its own charge, or
+//! inherits it, and nests under nobody. The repo filter reads a cell by its
+//! charge's repo (see [`AuditFilter`]).
 //!
 //! Every node sums the cells under it. $, tokens, agent-hours (subagent
 //! wall) and the counts are additive at every level, and so are a node's $
 //! and agent-hours split by local day, agent type and model (#54): the
-//! slice for a key is what the node holds of that key's cells.
-//! Sessions, agents and rotations count once, on the first cell in the
-//! filter of each window or subagent: a window across midnight is a session
-//! on its first day. Active and waiting come from the orchestrator cells,
-//! which carry the session timeline, so they are additive from Session up.
-//! An Agent node shows its own active and waiting time, which is not summed
-//! into its session, since its agents run in parallel. Elapsed and epic
-//! progress are per level. Cells with no activity, requests or subagent run
-//! (a window sitting open overnight) are left out, so they put no node on a
-//! day.
+//! slice for a key is what the node holds of that key's cells. Sessions
+//! count once per charge, on the first cell in the filter of each (session,
+//! charge); agents on the first cell of each subagent. Active and waiting
+//! come from the orchestrator cells, which carry the session timeline, so
+//! they are additive from Session up. An Agent node shows its own active
+//! and waiting time, which is not summed into its session, since its agents
+//! run in parallel. Elapsed and epic progress are per level. Cells with no
+//! activity, requests or subagent run (a session sitting open overnight)
+//! are left out, so they put no node on a day.
 //!
 //! Modules: `gh` reads the GitHub cache, `cells` the cells in a filter and
-//! the windows and subagents they belong to, `tree` builds each cell's path
-//! and the rollup tree over them, `headline` the closed-issue and merged-PR
-//! figures, `timeline` one node's per-day spans and marks, and
-//! `performance` the outcome, agent, bottleneck and waste measures (#51).
+//! the agents, sessions and Session rows they belong to, `tree` builds
+//! each cell's path and the rollup tree over them, `headline` the
+//! closed-issue and merged-PR figures, `timeline` one node's per-day spans
+//! and marks, and `performance` the outcome, agent, bottleneck and waste
+//! measures (#51).
 
 mod cells;
 mod gh;
@@ -72,13 +66,9 @@ pub use performance::{
 pub use timeline::{SpanKind, TimelineDay, TimelineMark, TimelineSpan, audit_timeline};
 
 /// What [`audit`] rolls up: the cells on local days `from..=to`
-/// (`YYYY-MM-DD`) of windows in `repos` (repo slugs, `""` for the windows
-/// in none; empty: every window). A window is in the repo its name parses
-/// to, or a director's in the repo its row is placed under. A unit's cells
-/// still nest under its director's row wherever that is placed, so a
-/// director with units in two repos shows, under its own placement, when
-/// either is filtered: holding only the filtered repo's units, and its own
-/// cells only when its placement is filtered.
+/// (`YYYY-MM-DD`) of agents charged in `repos` (repo slugs, `""` for a
+/// topic or no charge; empty: every agent). A cell is in its agent's
+/// effective charge's repo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuditFilter {
@@ -93,6 +83,8 @@ pub struct AuditFilter {
 pub enum NodeKind {
     Root,
     Repo,
+    /// A topic charge: work on no repo.
+    Topic,
     Unlinked,
     Epic,
     Issue,
@@ -133,14 +125,13 @@ pub struct Metrics {
     pub active_ms: i64,
     /// Waiting on you.
     pub wait_ms: i64,
-    /// Windows.
+    /// Sessions, each once per charge its agents work.
     pub sessions: i64,
     /// Subagents.
     pub agents: i64,
-    /// Windows named `-sN`.
-    pub rotations: i64,
-    /// First window start to the close (epic, issue) or merge (PR), else to
-    /// the last activity. A session's is its windows in range, an agent's its run.
+    /// First session start to the close (epic, issue) or merge (PR), else
+    /// to the last activity. A Session row's is the time its sessions (or,
+    /// alone in the row, its subagents) cover in range, an agent's its run.
     pub elapsed_ms: Option<i64>,
     /// Elapsed runs to the last activity: the issue, epic or PR is open.
     pub open: bool,
@@ -169,13 +160,13 @@ pub struct Slice {
 #[serde(rename_all = "camelCase")]
 pub struct AuditNode {
     pub kind: NodeKind,
-    /// Unique among its siblings: a repo slug, an issue or PR number, a
-    /// Session row's `<process root>/<workstream id>` (`session:<id>` for a
-    /// session with no window) or an agent id (`""`: the orchestrator).
+    /// Unique among its siblings: a repo slug, a topic, an issue or PR
+    /// number, a Session row's `<process root>/<charge key>` (`<process
+    /// root>/` with no charge) or an agent id (`""`: the orchestrator).
     pub key: String,
     pub label: String,
-    /// An epic, issue or PR read from the GitHub cache. False on an issue
-    /// known only from a window name, and on every other kind.
+    /// An epic, issue or PR read from the GitHub cache. False on one known
+    /// only from a charge, and on every other kind.
     pub github: bool,
     pub metrics: Metrics,
     pub children: Vec<AuditNode>,
@@ -187,8 +178,8 @@ pub struct AuditNode {
 #[serde(rename_all = "camelCase")]
 pub struct Headline {
     pub issues_closed: i64,
-    /// Over each issue's whole life, first window ever to close, even when
-    /// the filter holds only part of it.
+    /// Over each issue's whole life, from the start of the first session
+    /// ever charged to it, even when the filter holds only part of it.
     pub median_elapsed_ms: Option<i64>,
     /// Their $ in the filter over their count.
     pub usd_per_closed_issue: Option<f64>,
@@ -207,10 +198,10 @@ pub struct Audit {
     /// The repos whose GitHub data is missing or stale: their issues show
     /// no title, epic or PR.
     pub github_errors: Vec<GithubError>,
-    /// The repos the range's windows are filed under, sorted, whatever the
+    /// The repos the range's cells are charged in, sorted, whatever the
     /// repo filter: what it can pick from.
     pub repos: Vec<String>,
-    /// Some window in the range is in no repo (`""` in the repo filter).
+    /// Some cell in the range is in no repo (`""` in the repo filter).
     pub unlinked: bool,
 }
 
@@ -228,7 +219,7 @@ pub fn audit(conn: &Connection, filter: &AuditFilter) -> Result<Audit> {
     let cells = Cells::load(conn, &gh, filter)?;
     Ok(Audit {
         root: tree::tree(&cells, &gh),
-        headline: headline::headline(conn, &gh, &cells)?,
+        headline: headline::headline(&gh, &cells),
         github_errors: gh::github_errors(conn)?,
         repos: cells.repos.iter().cloned().collect(),
         unlinked: cells.unlinked,

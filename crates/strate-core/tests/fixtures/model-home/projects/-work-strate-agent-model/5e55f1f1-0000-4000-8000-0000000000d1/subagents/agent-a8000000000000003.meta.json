@@ -1,0 +1,1 @@
+{"agentType":"reviewer","description":"review_pr_strate-120","spawnDepth":1,"requestShape":"agent","requestNonInteractive":true,"model":"claude-sonnet-5-5","toolUseId":"toolu_m1b"}

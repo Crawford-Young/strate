@@ -11,12 +11,11 @@
 
 mod account;
 mod audit;
-mod directs;
 mod github;
-mod group;
 mod ingest;
 mod live;
 mod migrate;
+mod model;
 pub mod views;
 
 pub use github::{GhRepo, gh_issues, gh_repos, gh_reverts};
@@ -24,7 +23,7 @@ pub use github::{GhRepo, gh_issues, gh_repos, gh_reverts};
 use std::path::Path;
 
 use rusqlite::types::Type;
-use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 
 use crate::discovery::Graph;
 use crate::hooks::Hook;
@@ -47,7 +46,8 @@ pub struct Ingest<'a> {
 impl Store {
     /// Opens (or creates) the db at `path` in WAL mode with
     /// `synchronous=NORMAL` and foreign keys on, then applies any pending
-    /// migrations. Audit days are in the machine's zone.
+    /// migrations and brings the rollups and the agent model up to date.
+    /// Audit days are in the machine's zone.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_in(path, &account::system_zone())
     }
@@ -69,14 +69,16 @@ impl Store {
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         migrate::migrate(&mut conn, migrate::MIGRATIONS)?;
         let mut store = Self { conn };
-        // A v1 store holds events but no workstream grouping yet.
+        let tx = store.transaction()?;
+        // A v1 store holds events but no session starts or /clear links yet.
         if version == 1 {
-            store.regroup_all()?;
+            ingest::relink_all(&tx.tx)?;
         }
         // A store from before v3 or v6, or accounted with another price list,
         // in another zone or at another rollup version.
-        let tx = store.transaction()?;
         account::refresh(&tx.tx, zone)?;
+        // A store from before v21, or built by another model version.
+        model::refresh(&tx.tx)?;
         tx.commit()?;
         Ok(store)
     }
@@ -120,8 +122,8 @@ impl Store {
         Ok(Ingest { tx })
     }
 
-    /// Stores one batch and its checkpoint in one transaction, regrouping
-    /// the batch's session there too (see [`Ingest::batch`]).
+    /// Stores one batch and its checkpoint in one transaction, with what
+    /// it changes (see [`Ingest::batch`]).
     pub fn ingest(&mut self, batch: &Batch) -> Result<()> {
         let tx = self.transaction()?;
         tx.batch(batch)?;
@@ -166,75 +168,26 @@ impl Store {
         tx.commit()
     }
 
-    /// Rebuilds the workstream grouping of every stored session from the
-    /// stored events, in one transaction. Ingest keeps grouping current on
-    /// its own, so this is only for a rebuild; it is idempotent and leaves
-    /// manual merges alone. Sessions whose windows moved get their rollups
-    /// and audit cells recomputed.
-    pub fn regroup_all(&mut self) -> Result<()> {
+    /// Rebuilds the agent model (#107) from the stored rows, in one
+    /// transaction: every agent's role and own charge, and the message
+    /// edges. Ingest keeps it current on its own, so this is only for a
+    /// rebuild; it is idempotent.
+    pub fn rebuild_model(&mut self) -> Result<()> {
         let tx = self.transaction()?;
-        let changed = group::all(&tx.tx)?;
-        account::rollup(&tx.tx, changed.iter().map(String::as_str))?;
+        model::rebuild(&tx.tx)?;
         tx.commit()
-    }
-
-    /// Makes workstream `from` read as `into` (and as whatever `into` is
-    /// merged into) in `workstream_roots` and `event_workstreams`. The merge
-    /// is a pointer on `from`, so it survives regrouping and re-ingest, and
-    /// a merged workstream is kept even while no segment uses it. Fails,
-    /// changing nothing, when `from` is unknown or the merge would form a
-    /// cycle.
-    pub fn merge_workstream(&mut self, from: i64, into: i64) -> Result<()> {
-        let tx = self.transaction()?;
-        let cycle: bool = tx.tx.query_row(
-            "WITH RECURSIVE up (id) AS (
-                 SELECT ?1 UNION SELECT w.merged_into FROM workstreams AS w
-                 JOIN up ON w.id = up.id WHERE w.merged_into IS NOT NULL
-             )
-             SELECT EXISTS (SELECT 1 FROM up WHERE id = ?2)",
-            params![into, from],
-            |r| r.get(0),
-        )?;
-        if cycle {
-            return Err(rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
-                Some(format!("workstream {from} into {into} would form a cycle")),
-            ));
-        }
-        let changed = tx.tx.execute(
-            "UPDATE workstreams SET merged_into = ?2 WHERE id = ?1",
-            params![from, into],
-        )?;
-        match changed {
-            0 => Err(rusqlite::Error::QueryReturnedNoRows),
-            _ => tx.commit(),
-        }
-    }
-
-    /// Undoes [`Store::merge_workstream`] on `id`; workstreams merged into
-    /// `id` stay merged into it. Fails when `id` is unknown.
-    pub fn unmerge_workstream(&mut self, id: i64) -> Result<()> {
-        let changed = self.conn.execute(
-            "UPDATE workstreams SET merged_into = NULL WHERE id = ?1",
-            [id],
-        )?;
-        match changed {
-            0 => Err(rusqlite::Error::QueryReturnedNoRows),
-            _ => Ok(()),
-        }
     }
 }
 
 impl Ingest<'_> {
     /// Writes a batch's events and checkpoint into this transaction, then
-    /// regroups the batch's session: its name segments and workstream, its
-    /// subagents' segments, and its process root's continuation edges.
-    /// Then it recomputes the cost, time and context rollups of that
-    /// session and of any session sharing one of the batch's requests, and
-    /// rebuilds `directs` when the batch stored a cross-session message.
-    /// Grouping, rollups and `directs` are functions of the stored events,
-    /// so batches in any order converge to a cold build. A subagent that
-    /// only a graph has added gets its segment at its session's next batch.
+    /// relinks the batch's session: its start and its process root's
+    /// continuation edges. Then it re-resolves the agents the batch touched
+    /// in the agent model, recomputes the cost, time and context rollups of
+    /// that session and of any session sharing one of the batch's requests,
+    /// and rebuilds the `message` edges when the batch stored a
+    /// cross-session message. All of these are functions of the stored rows,
+    /// so batches in any order converge to a cold build.
     pub fn batch(&self, batch: &Batch) -> Result<()> {
         ingest::batch(&self.tx, batch)
     }
@@ -327,12 +280,13 @@ mod tests {
     }
 
     #[test]
-    fn a_populated_v8_store_reads_its_messages_and_builds_directs_on_upgrade() {
+    fn a_populated_v8_store_reads_its_messages_and_builds_message_edges_on_upgrade() {
         let dir = test_dir("store-v8-upgrade");
         let db = dir.join("strate.db");
         let mut v8 = Connection::open(&db).expect("v8 db");
         migrate::migrate(&mut v8, &migrate::MIGRATIONS[..8]).expect("v8");
-        // Fully accounted by the build before rollup 4.
+        // Fully accounted by the build before rollup 4. The sender has no
+        // director's name: any first messager parents a session (#107).
         v8.execute(
             "INSERT INTO meta (key, value) VALUES ('prices', ?1), ('tz', 'UTC'), ('rollup', '3')",
             [crate::cost::PRICES_JSON],
@@ -341,29 +295,29 @@ mod tests {
         v8.execute_batch(
             r#"INSERT INTO sessions (session_id, path) VALUES ('d1', '/p/d1.jsonl'),
                    ('u1', '/p/u1.jsonl');
-               INSERT INTO agents (session_id, kind) VALUES ('d1', 'orchestrator'),
-                   ('u1', 'orchestrator');
+               INSERT INTO agents (id, session_id, kind) VALUES (1, 'd1', 'orchestrator'),
+                   (2, 'u1', 'orchestrator');
                INSERT INTO events (session_id, type, uuid, timestamp, file, byte_offset, raw)
                VALUES ('d1', 'user', 'd1-1', '2026-10-07T10:00:01.000Z', '/p/d1.jsonl', 0,
                        '{"type":"user","message":{"content":[{"type":"tool_result",
                          "tool_use_id":"toolu_1"}]},"toolUseResult":{"msg_id":"m1"}}'),
                       ('u1', 'user', 'u1-1', '2026-10-07T10:00:02.000Z', '/p/u1.jsonl', 0,
                        '{"type":"user","message":{"content":"Lorem."},
-                         "origin":{"kind":"peer","msg_id":"m1","name":"director-demo"}}');"#,
+                         "origin":{"kind":"peer","msg_id":"m1","name":"lorem"}}');"#,
         )
         .expect("v8 rows");
         drop(v8);
 
         let store = Store::open_in(&db, "UTC").expect("upgrade");
-        let directs: Vec<(String, String, String)> = store
+        let edges: Vec<(String, i64, i64)> = store
             .conn
-            .prepare("SELECT parent, child, msg_id FROM directs")
-            .expect("directs")
+            .prepare("SELECT kind, parent, child FROM edges")
+            .expect("edges")
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .expect("rows")
             .collect::<Result<_>>()
             .expect("edges");
-        assert_eq!(directs, [("d1".into(), "u1".into(), "m1".into())]);
+        assert_eq!(edges, [("message".into(), 1, 2)]);
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
@@ -538,7 +492,94 @@ mod tests {
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .expect("version");
-        assert_eq!(version, 20);
+        assert_eq!(version, migrate::MIGRATIONS.len() as i64, "the latest");
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_v20_store_gets_its_agent_model_built_on_upgrade_and_keeps_its_edges() {
+        let dir = test_dir("store-v20-model");
+        let db = dir.join("strate.db");
+        let mut v20 = Connection::open(&db).expect("v20 db");
+        migrate::migrate(&mut v20, &migrate::MIGRATIONS[..20]).expect("v20");
+        // s2's orchestrator received m1, which s1's subagent a1 sent.
+        v20.execute_batch(
+            r#"INSERT INTO sessions (session_id, path) VALUES ('s1', '/p/s1.jsonl'),
+                   ('s2', '/p/s2.jsonl');
+               INSERT INTO agents (id, session_id, agent_id, kind, name, description) VALUES
+                   (1, 's1', NULL, 'orchestrator', 'impl_issue_strate-5', NULL),
+                   (2, 's1', 'a1', 'subagent', NULL, 'review_pr_strate-3'),
+                   (3, 's2', NULL, 'orchestrator', NULL, NULL);
+               INSERT INTO edges (id, kind, parent, child, tool_use_id) VALUES
+                   (7, 'dispatch', 1, 2, 'toolu_1');
+               INSERT INTO events (session_id, agent_id, type, uuid, timestamp, file,
+                       byte_offset, raw)
+               VALUES ('s1', 'a1', 'user', 'e1', '2026-10-20T10:00:01.000Z', '/p/a1.jsonl', 0,
+                       '{"type":"user","message":{"content":[{"type":"tool_result",
+                         "tool_use_id":"toolu_2"}]},"toolUseResult":{"msg_id":"m1"}}'),
+                      ('s2', NULL, 'user', 'e2', '2026-10-20T10:00:02.000Z', '/p/s2.jsonl', 0,
+                       '{"type":"user","message":{"content":"Lorem."},
+                         "origin":{"kind":"peer","msg_id":"m1","name":"lorem"}}');"#,
+        )
+        .expect("v20 rows");
+        drop(v20);
+
+        let store = Store::open_in(&db, "UTC").expect("upgrade");
+        type Row = (i64, Option<String>, Option<String>, Option<String>);
+        let agents: Vec<Row> = store
+            .conn
+            .prepare(
+                "SELECT a.id, a.role, c.key, a.own_charge_source FROM agents AS a
+                 LEFT JOIN charges AS c ON c.id = a.own_charge ORDER BY a.id",
+            )
+            .expect("agents")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .expect("rows")
+            .collect::<Result<_>>()
+            .expect("agents");
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            agents,
+            [
+                (1, some("impl"), some("issue_strate-5"), some("name")),
+                (2, some("review"), some("pr_strate-3"), some("name")),
+                (3, None, None, None),
+            ]
+        );
+        let edges: Vec<(i64, String, i64, i64, Option<String>)> = store
+            .conn
+            .prepare("SELECT id, kind, parent, child, tool_use_id FROM edges ORDER BY kind")
+            .expect("edges")
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .expect("rows")
+            .collect::<Result<_>>()
+            .expect("edges");
+        assert_eq!(edges.len(), 2, "{edges:?}");
+        assert_eq!(
+            edges[0],
+            (7, "dispatch".into(), 1, 2, some("toolu_1")),
+            "kept"
+        );
+        assert_eq!(
+            (edges[1].1.as_str(), edges[1].2, edges[1].3),
+            ("message", 2, 3)
+        );
+        let (holder, source): (i64, String) = store
+            .conn
+            .query_row(
+                "SELECT holder, source FROM agent_charges WHERE agent = 3",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("s2's charge");
+        assert_eq!(
+            (holder, source.as_str()),
+            (2, "parent"),
+            "s2 takes a1's charge, by its message"
+        );
         drop(store);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
@@ -581,35 +622,171 @@ mod tests {
     }
 
     #[test]
-    fn opening_a_v1_store_backfills_and_groups_its_events() {
+    fn opening_a_v1_store_backfills_its_events_and_links_its_clear_chains() {
         let dir = test_dir("store-v1-upgrade");
         let db = dir.join("strate.db");
         let mut v1 = Connection::open(&db).expect("v1 db");
         migrate::migrate(&mut v1, &migrate::MIGRATIONS[..1]).expect("v1");
+        // s2 is s1's /clear successor: its records name s1 as process root.
         v1.execute_batch(
-            r#"INSERT INTO sessions (session_id, path) VALUES ('s1', '/p/s1.jsonl');
-               INSERT INTO agents (session_id, kind) VALUES ('s1', 'orchestrator');
+            r#"INSERT INTO sessions (session_id, path) VALUES ('s1', '/p/s1.jsonl'),
+                   ('s2', '/p/s2.jsonl');
+               INSERT INTO agents (id, session_id, kind) VALUES (1, 's1', 'orchestrator'),
+                   (2, 's2', 'orchestrator');
                INSERT INTO events (session_id, type, uuid, timestamp, file, byte_offset, raw)
                VALUES ('s1', 'user', 'u1', '2026-10-02T10:00:00.000Z', '/p/s1.jsonl', 0,
-                       '{"type":"user","cwd":"/work/x","gitBranch":"main","session_id":"root"}'),
+                       '{"type":"user","cwd":"/work/x","gitBranch":"main","session_id":"s1"}'),
                       ('s1', 'custom-title', NULL, NULL, '/p/s1.jsonl', 90,
-                       '{"type":"custom-title","customTitle":"demo-1"}');"#,
+                       '{"type":"custom-title","customTitle":"demo-1"}'),
+                      ('s2', 'user', 'u2', '2026-10-02T11:00:00.000Z', '/p/s2.jsonl', 0,
+                       '{"type":"user","cwd":"/work/x","session_id":"s1"}');"#,
         )
         .expect("v1 rows");
         drop(v1);
 
         let store = Store::open(&db).expect("upgrade");
-        let row: (String, String, String) = store
+        let sessions: Vec<(String, String, String)> = store
+            .conn
+            .prepare("SELECT session_id, process_root, started_at FROM sessions ORDER BY 1")
+            .expect("sessions")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("rows")
+            .collect::<Result<_>>()
+            .expect("sessions");
+        let link = |s: &str, at: &str| (s.to_string(), "s1".to_string(), at.to_string());
+        assert_eq!(
+            sessions,
+            [
+                link("s1", "2026-10-02T10:00:00.000Z"),
+                link("s2", "2026-10-02T11:00:00.000Z")
+            ]
+        );
+        let (cwd, edge): (String, (i64, i64)) = store
             .conn
             .query_row(
-                "SELECT w.name, s.process_root, e.cwd FROM sessions AS s
-                 JOIN workstreams AS w ON w.id = s.workstream_id
-                 JOIN events AS e ON e.uuid = 'u1'",
+                "SELECT (SELECT cwd FROM events WHERE uuid = 'u1'), parent, child FROM edges
+                 WHERE kind = 'continuation'",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))),
             )
-            .expect("grouped");
-        assert_eq!(row, ("demo-1".into(), "root".into(), "/work/x".into()));
+            .expect("linked");
+        assert_eq!((cwd.as_str(), edge), ("/work/x", (1, 2)));
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_v21_store_drops_its_workstreams_and_keeps_its_rows() {
+        let dir = test_dir("store-v21-drop-workstreams");
+        let db = dir.join("strate.db");
+        let mut v21 = Connection::open(&db).expect("v21 db");
+        migrate::migrate(&mut v21, &migrate::MIGRATIONS[..21]).expect("v21");
+        // A grouped store: a workstream merged into another, a segment that
+        // a subagent and an audit cell point at, and a directs edge.
+        v21.execute_batch(
+            "INSERT INTO workstreams (id, name) VALUES (1, 'demo-1'), (2, 'demo-2');
+             UPDATE workstreams SET merged_into = 1 WHERE id = 2;
+             INSERT INTO sessions (session_id, path, workstream_id) VALUES
+                 ('s1', '/p/s1.jsonl', 2), ('s2', '/p/s2.jsonl', NULL);
+             INSERT INTO segments (id, session_id, start_offset, workstream_id) VALUES
+                 (10, 's1', 0, 2);
+             INSERT INTO agents (id, session_id, agent_id, kind, segment_id) VALUES
+                 (1, 's1', NULL, 'orchestrator', NULL), (2, 's1', 'a1', 'subagent', 10),
+                 (3, 's2', NULL, 'orchestrator', NULL);
+             INSERT INTO directs (child, parent, msg_id) VALUES ('s2', 's1', 'm1');
+             INSERT INTO audit_cells (session_id, agent_id, segment_id, day, wall_ms, active_ms,
+                     wait_ms, unpriced, input_tokens, output_tokens, cache_read_tokens,
+                     cache_write_tokens)
+             VALUES ('s1', 'a1', 10, '2026-10-20', 5, 5, 0, 0, 0, 0, 0, 0);",
+        )
+        .expect("v21 rows");
+        drop(v21);
+
+        let store = Store::open_in(&db, "UTC").expect("upgrade");
+        let schema: Vec<String> = store
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE name LIKE '%workstream%' OR name LIKE '%segment%' OR name LIKE 'directs%'
+                 ORDER BY name",
+            )
+            .expect("schema")
+            .query_map([], |r| r.get(0))
+            .expect("rows")
+            .collect::<Result<_>>()
+            .expect("names");
+        assert_eq!(
+            schema,
+            Vec::<String>::new(),
+            "tables, views and indexes gone"
+        );
+        let columns: i64 = store
+            .conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM pragma_table_info('agents')
+                         WHERE name = 'segment_id')
+                     + (SELECT count(*) FROM pragma_table_info('sessions')
+                         WHERE name = 'workstream_id')
+                     + (SELECT count(*) FROM pragma_table_info('audit_cells')
+                         WHERE name = 'segment_id')",
+                [],
+                |r| r.get(0),
+            )
+            .expect("columns");
+        assert_eq!(columns, 0, "no column names a segment or workstream");
+        let agents: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM agents", [], |r| r.get(0))
+            .expect("agents");
+        assert_eq!(agents, 3, "every agent kept");
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, migrate::MIGRATIONS.len() as i64, "the latest");
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn charge_costs_sum_each_request_under_its_agents_effective_charge() {
+        let dir = test_dir("store-charge-costs");
+        let store = Store::open_in(dir.join("strate.db"), "UTC").expect("open");
+        // a1 has its own charge; a2 takes its dispatcher a1's; the
+        // orchestrator and the request with no agent row are Unlinked. k3
+        // streamed twice (its fuller record counts, once); k4 is unpriced.
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO charges (id, key, kind, repo, number) VALUES
+                     (7, 'issue_demo-5', 'issue', 'demo', 5);
+                 INSERT INTO sessions (session_id) VALUES ('s1');
+                 INSERT INTO agents (id, session_id, agent_id, kind, own_charge,
+                         own_charge_source) VALUES
+                     (1, 's1', NULL, 'orchestrator', NULL, NULL),
+                     (2, 's1', 'a1', 'subagent', 7, 'name'),
+                     (3, 's1', 'a2', 'subagent', NULL, NULL);
+                 INSERT INTO edges (kind, parent, child, tool_use_id) VALUES
+                     ('dispatch', 2, 3, 't1');
+                 INSERT INTO events (session_id, agent_id, file, byte_offset, raw, request_key,
+                         usage, output_tokens, cost_usd) VALUES
+                     ('s1', NULL, 'p', 0, '{}', 'k1', '{}', 1, 1.0),
+                     ('s1', 'a1', 'a1', 0, '{}', 'k2', '{}', 1, 2.0),
+                     ('s1', 'a2', 'a2', 0, '{}', 'k3', '{}', 1, 4.0),
+                     ('s1', 'a2', 'a2', 10, '{}', 'k3', '{}', 9, 8.0),
+                     ('s1', 'a2', 'a2', 20, '{}', 'k4', '{}', 1, NULL),
+                     ('s1', 'gone', 'g', 0, '{}', 'k5', '{}', 1, 16.0);",
+            )
+            .expect("rows");
+        let costs: Vec<(Option<i64>, Option<f64>, i64)> = store
+            .conn
+            .prepare("SELECT charge, cost_usd, unpriced FROM charge_costs ORDER BY charge")
+            .expect("costs")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("rows")
+            .collect::<Result<_>>()
+            .expect("costs");
+        assert_eq!(costs, [(None, Some(17.0), 0), (Some(7), Some(10.0), 1)]);
         drop(store);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }

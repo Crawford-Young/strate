@@ -100,6 +100,40 @@ fn pages_are_followed_by_cursor_and_parse_into_issues_with_their_prs() {
 }
 
 #[test]
+fn a_prs_head_branch_is_fetched_and_cached_and_may_be_missing() {
+    let (mut runner, calls) = scripted(vec![ok("model-home.json")]);
+    let repo = fetch_repo(&mut runner, "example", "strate").expect("fetch");
+    let heads: Vec<_> = repo
+        .issues
+        .iter()
+        .flat_map(|i| {
+            i.prs
+                .iter()
+                .map(|p| (p.issue, p.number, p.head_ref.as_deref()))
+        })
+        .collect();
+    let head = Some("feat/agent-model");
+    assert_eq!(heads, [(107, 120, head), (108, 120, head)]);
+    let query = calls.lock().expect("calls")[0].clone();
+    assert!(arg(&query, "query").is_some_and(|q| q.contains("headRefName")));
+
+    let tmp = Temp::new("head-ref");
+    let mut store = Store::open(tmp.db()).expect("open");
+    store
+        .gh_replace("strate", "example", &repo, 1)
+        .expect("store");
+    let reader = Store::open_reader(tmp.db()).expect("reader");
+    assert_eq!(gh_issues(&reader, "strate").expect("issues"), repo.issues);
+
+    // A response from before headRefName was asked for has none.
+    let (mut runner, _) = scripted(vec![ok("audit-home.json")]);
+    let old = fetch_repo(&mut runner, "example", "demo").expect("fetch");
+    let prs: Vec<_> = old.issues.iter().flat_map(|i| &i.prs).collect();
+    assert!(!prs.is_empty());
+    assert!(prs.iter().all(|p| p.head_ref.is_none()));
+}
+
+#[test]
 fn a_parent_in_another_repo_is_no_epic_and_the_close_reason_is_kept() {
     let (mut runner, calls) = scripted(vec![ok("audit-home.json")]);
     // GitHub owners are case-insensitive.

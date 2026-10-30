@@ -17,8 +17,8 @@ use std::collections::HashSet;
 
 use rusqlite::{Connection, params};
 
-use super::Result;
 use super::ingest::{ensure_agent, upsert_session};
+use super::{Result, model};
 use crate::hooks::{Hook, HookEvent};
 use crate::registry::{RegistryEntry, RegistryEvent, Status};
 
@@ -33,7 +33,8 @@ pub(super) fn registry(conn: &Connection, event: &RegistryEvent) -> Result<()> {
         } => {
             conn.prepare_cached("UPDATE registry SET gone = 1, last_seen_ms = ?2 WHERE key = ?1")?
                 .execute(params![entry.key(), last_seen_ms])?;
-            exited(conn, entry.session_id.as_deref(), *last_seen_ms)
+            exited(conn, entry.session_id.as_deref(), *last_seen_ms)?;
+            relisted(conn, entry.session_id.as_deref())
         }
         RegistryEvent::Baseline { keys } => reconcile(conn, keys),
         RegistryEvent::Error { .. } => Ok(()),
@@ -56,8 +57,18 @@ fn reconcile(conn: &Connection, keys: &[String]) -> Result<()> {
         conn.prepare_cached("UPDATE registry SET gone = 1 WHERE key = ?1")?
             .execute([key])?;
         exited(conn, session_id.as_deref(), *last_seen_ms)?;
+        relisted(conn, session_id.as_deref())?;
     }
     Ok(())
+}
+
+/// A registry row naming `session_id` changed: the name its chain's
+/// orchestrators read may have.
+fn relisted(conn: &Connection, session_id: Option<&str>) -> Result<()> {
+    match session_id {
+        Some(session_id) => model::listed(conn, session_id),
+        None => Ok(()),
+    }
 }
 
 fn upsert_entry(conn: &Connection, entry: &RegistryEntry, at_ms: i64) -> Result<()> {
@@ -115,7 +126,7 @@ fn upsert_entry(conn: &Connection, entry: &RegistryEntry, at_ms: i64) -> Result<
             end_wait(conn, agent, at_ms)?;
         }
     }
-    Ok(())
+    relisted(conn, entry.session_id.as_deref())
 }
 
 /// Once no live registry row describes the latest link of `session_id`'s

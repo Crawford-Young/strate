@@ -521,7 +521,7 @@ impl<F: FnMut()> Ingest<F> {
         };
         let targets = self
             .store
-            .window_slugs()
+            .charge_slugs()
             .and_then(|slugs| github::targets(&self.store, &slugs));
         match targets {
             Ok(targets) if targets.is_empty() => {}

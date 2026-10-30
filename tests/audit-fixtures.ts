@@ -11,7 +11,6 @@ export function metrics(over: Partial<Metrics> = {}): Metrics {
     waitMs: 0,
     sessions: 0,
     agents: 0,
-    rotations: 0,
     elapsedMs: null,
     open: false,
     progress: null,

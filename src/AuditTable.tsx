@@ -34,6 +34,7 @@ const FROM_GITHUB = new Set(['epic', 'issue', 'pr'])
 /** Each row's level, on its badge; the hierarchy has no Root or Group row. */
 const LEVEL: Partial<Record<NodeKind, string>> = {
   repo: 'repo',
+  topic: 'topic',
   unlinked: 'no issue',
   epic: 'epic',
   issue: 'issue',
@@ -302,7 +303,6 @@ function columnsFor({
     plain('Tokens', tokenTotal, compact),
     plain('Sessions', (m) => m.sessions),
     plain('Agents', (m) => m.agents),
-    plain('Rotations', (m) => m.rotations),
     column(
       'Progress',
       (m) => (m.progress ? m.progress.completed / m.progress.total : -1),

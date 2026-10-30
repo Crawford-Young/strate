@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ and github/audit-home.json for #26, nest-home/ and github/nest-home.json for #47, perf-home/ and github/perf-home.json for #51, directs-home/ for #53, chain-home/ for #63, teams-home/ for #83). Field names come from
+# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ and github/audit-home.json for #26, nest-home/ and github/nest-home.json for #47, perf-home/ and github/perf-home.json for #51, directs-home/ for #53, chain-home/ for #63, teams-home/ for #83, model-home/ and github/model-home.json for #107). Field names come from
 # the "~/.claude format, as observed" comment on strate #10; every value is a placeholder.
 set -eu
 cd "$(dirname "$0")/.."
@@ -76,7 +76,7 @@ DB="$F/projects/$LONG/$SB/subagents"
 sub "$DB" a2000000000000001 /work/.worktrees/demo-repo-7 "$SB" 2.1.263
 echo '{"agentType":"Explore","description":"Lorem task","toolUseId":"toolu_02AAAAAAAAAAAAAAAAAAAAAA","spawnDepth":1,"requestShape":"agent","requestNonInteractive":true,"model":"claude-haiku-4-5"}' > "$DB/agent-a2000000000000001.meta.json"
 
-# ---- workstreams-home: grouping by name segments and continuation (#13) ----
+# ---- workstreams-home: /clear chains, continuation and renames (#13, #107) ----
 W=fixtures/workstreams-home
 rm -rf "$W"
 # One process root (C1) whose /clear files start C1, C9, C5 in that time order.
@@ -249,7 +249,7 @@ aat() { # sessionId cwd sidechain-fields: the envelope of the records that follo
   AS=$1; AC=$2; ASIDE=$3
 }
 aenv() { # YYYY-MM-DDTHH:MM:SS uuid
-  AE="\"parentUuid\":null,$ASIDE,\"timestamp\":\"$1.000Z\",\"userType\":\"external\",\"entrypoint\":\"cli\",\"cwd\":\"$AC\",\"sessionId\":\"$AS\",\"version\":\"2.1.294\",\"gitBranch\":\"main\",\"uuid\":\"$2\""
+  AE="\"parentUuid\":null,$ASIDE,\"timestamp\":\"$1.000Z\",\"userType\":\"external\",\"entrypoint\":\"cli\",\"cwd\":\"$AC\",\"sessionId\":\"$AS\",\"version\":\"2.1.294\",\"gitBranch\":\"${AB:-main}\",\"uuid\":\"$2\""
 }
 atitle() { echo "{\"type\":\"custom-title\",\"customTitle\":\"$1\",\"sessionId\":\"$AS\"}"; }
 aprompt() { # time uuid: a typed prompt
@@ -290,12 +290,12 @@ aat $A1 /work/demo '"isSidechain":true,"agentId":"a9000000000000001"'
   areply 2026-10-04T14:01:20 a1s-2 req_f1 $SONNET "$US" "$TEXT"
 } > "$AD/$A1/subagents/agent-a9000000000000001.jsonl"
 ameta implementer toolu_a1 > "$AD/$A1/subagents/agent-a9000000000000001.meta.json"
-# A2, window demo-9-s2, 2026-10-05 03:50:00..04:05:10Z (across local midnight):
-# a background subagent (run_in_background the string "true", as real records
-# carry it; its tool_result the async launch), a link to PR #12, then a
-# 12m40s idle gap.
+# A2, issue_demo-9 (a second session on #9), 2026-10-05 03:50:00..04:05:10Z
+# (across local midnight): a background subagent (run_in_background the string
+# "true", as real records carry it; its tool_result the async launch), a link
+# to PR #12, then a 12m40s idle gap.
 aat $A2 /work/demo '"isSidechain":false'
-{ atitle demo-9-s2
+{ atitle issue_demo-9
   aprompt 2026-10-05T03:50:00 a2-01
   areply 2026-10-05T03:50:10 a2-02 req_b1 $OPUS "$UO" "$(ktool toolu_b1 Agent '{"subagent_type":"recon","description":"Lorem","prompt":"Lorem ipsum.","run_in_background":"true"}')"
   alaunch 2026-10-05T03:50:15 a2-03 toolu_b1 a9000000000000002
@@ -537,18 +537,19 @@ cat > fixtures/github/perf-home.json <<'JSON'
 ]}}}
 JSON
 
-# ---- directs-home: director-launched units (#53); hand values in tests/directs.rs ----
+# ---- directs-home: spawned sessions (#53, #107); hand values in tests/message_edges.rs ----
 # Cross-session messages, 2026-10-07Z. The sender's SendMessage result carries
 # toolUseResult.msg_id; the receiver gets a user record whose origin (kind
-# peer) carries the same msg_id and the sender's name. Edges: director-demo
+# peer) carries the same msg_id and the sender's name. Message edges (each
+# session under its first messager, whatever either is named): director-demo
 # (R1) -> ticket-demo-repo-1 (N1), and -> ticket-demo-repo-2 (N2, messaged
-# from a subagent of R1); director-alpha (X1) -> director-beta (X2). No edge:
-# N1's reply to R1 (not a director's), R1's message to a session not on disk,
-# R2 (R1's /clear successor, also director-demo) messaging N1 later (the first
-# messager wins), general-notes (Q1) <-> ticket-demo-repo-3 (Q3), and X2's
-# message back to X1 (it would close a cycle). N2 never replies. N1 dispatches
-# a subagent (S2); ticket-demo-repo-2 later draws N3, a session nobody directed.
-# X2 in turn directs ticket-demo-repo-4 (N4): a unit of a unit.
+# from a subagent of R1); general-notes (Q1) -> ticket-demo-repo-3 (Q3);
+# director-alpha (X1) -> director-beta (X2). No edge: the replies N1 -> R1,
+# Q3 -> Q1 and X2 -> X1 (each would close a cycle), R1's message to a session
+# not on disk, and R2 (R1's /clear successor) messaging N1 later (the first
+# messager wins). N2 never replies. N1 dispatches a subagent (S2); N3 is
+# another process named ticket-demo-repo-2 that nobody messaged. X2 in turn
+# spawns ticket-demo-repo-4 (N4): a unit of a unit.
 H=fixtures/directs-home
 R1=5e55d7d7-0000-4000-8000-0000000000c1
 # R2 sorts before R1 on purpose: the first messager is by time, not by id.
@@ -749,3 +750,99 @@ aat $TL /work/team-repo '"isSidechain":true,"agentId":"a7000000000000003"'
 tturn 01:00 06:00 t3 > "$TP/$TL/subagents/agent-a7000000000000003.jsonl"
 aat $TL /work/team-repo '"isSidechain":true,"agentId":"a7000000000000004"'
 { tturn 01:00 03:00 t4a; tturn 08:00 08:30 t4b; } > "$TP/$TL/subagents/agent-a7000000000000004.jsonl"
+
+# ---- model-home: the generic agent model (#107); hand values in tests/model.rs ----
+# 2026-10-20Z. M1 (manager_epic_strate-105) works on branch feat/agent-model,
+# the head of strate PR #120, which closes issues #108 and #107 (gh JSON:
+# github/model-home.json), so its own charge is issue strate#107. Its
+# subagents: a1 (description fix-step-2, a bare name, so no charge of its
+# own, on main), a2 (no toolUseId; meta parentAgentId names a1) and a3
+# (description review_pr_strate-120). a1 messages M2 first: M2 (unnamed)
+# hangs under a1 by a message edge. M3 is named ticket-strate-110. M4
+# (director-hub) dispatches b1, which messages M5; M5 messages M4 back (that
+# would close a cycle through b1's dispatch), then M3 messages M4: M4 hangs
+# under M3. M6 is on a detached HEAD, unnamed: Unlinked. M7 and its /clear
+# successor M8 are one background process (the test's registry row).
+H=fixtures/model-home
+M1=5e55f1f1-0000-4000-8000-0000000000d1
+M2=5e55f1f1-0000-4000-8000-0000000000d2
+M3=5e55f1f1-0000-4000-8000-0000000000d3
+M4=5e55f1f1-0000-4000-8000-0000000000d4
+M5=5e55f1f1-0000-4000-8000-0000000000d5
+M6=5e55f1f1-0000-4000-8000-0000000000d6
+M7=5e55f1f1-0000-4000-8000-0000000000d7
+M8=5e55f1f1-0000-4000-8000-0000000000d8
+MA1=a8000000000000001
+MA2=a8000000000000002
+MA3=a8000000000000003
+MB1=a8000000000000004
+WT="$H/projects/-work-strate-agent-model"
+NOTES="$H/projects/-work-notes"
+MHUB="$H/projects/-work-hub"
+rm -rf "$H"
+mkdir -p "$WT/$M1/subagents" "$NOTES" "$MHUB/$M4/subagents" "$H/projects/-work-scratch" "$H/projects/-work-bg"
+mm() { echo "5e55ff00-0000-4000-8000-00000000000$1"; }
+mmeta() { # agentType description [extra keys]: a subagent's meta.json
+  echo "{\"agentType\":\"$1\",\"description\":\"$2\",\"spawnDepth\":1,\"requestShape\":\"agent\",\"requestNonInteractive\":true,\"model\":\"$SONNET\"${3:+,$3}}"
+}
+MT=2026-10-20T10
+AB=feat/agent-model
+aat $M1 /work/strate-agent-model "\"isSidechain\":false,\"session_id\":\"$M1\""
+{ atitle manager_epic_strate-105
+  aprompt $MT:00:00 m1-01
+  gdispatch $MT:01:00 m1-02 req_m1-02 toolu_m1a; aresult $MT:01:01 m1-03 toolu_m1a
+  gdispatch $MT:02:00 m1-04 req_m1-04 toolu_m1b; aresult $MT:02:01 m1-05 toolu_m1b
+} > "$WT/$M1.jsonl"
+AB=main
+aat $M1 /work/strate-agent-model "\"isSidechain\":true,\"agentId\":\"$MA1\""
+{ atask $MT:01:10 ma1-01; dsend $MT:05 ma1-02 lorem "$(mm 1)"
+  gdispatch $MT:06:00 ma1-03 req_ma1-03 toolu_ma1x; } > "$WT/$M1/subagents/agent-$MA1.jsonl"
+mmeta implementer fix-step-2 "\"toolUseId\":\"toolu_m1a\"" > "$WT/$M1/subagents/agent-$MA1.meta.json"
+aat $M1 /work/strate-agent-model "\"isSidechain\":true,\"agentId\":\"$MA2\""
+{ atask $MT:06:10 ma2-01; areply $MT:06:20 ma2-02 req_ma2-02 $SONNET "$US" "$TEXT"; } > "$WT/$M1/subagents/agent-$MA2.jsonl"
+mmeta Explore "Lorem task" "\"parentAgentId\":\"$MA1\"" > "$WT/$M1/subagents/agent-$MA2.meta.json"
+aat $M1 /work/strate-agent-model "\"isSidechain\":true,\"agentId\":\"$MA3\""
+{ atask $MT:02:10 ma3-01; areply $MT:02:20 ma3-02 req_ma3-02 $SONNET "$US" "$TEXT"; } > "$WT/$M1/subagents/agent-$MA3.jsonl"
+mmeta reviewer review_pr_strate-120 "\"toolUseId\":\"toolu_m1b\"" > "$WT/$M1/subagents/agent-$MA3.meta.json"
+aat $M2 /work/notes "\"isSidechain\":false,\"session_id\":\"$M2\""
+{ dpeer $MT:05:02 m2-01 "$(mm 1)" lorem
+  areply $MT:05:10 m2-02 req_m2-02 $OPUS "$UO" "$TEXT"; } > "$NOTES/$M2.jsonl"
+aat $M3 /work/notes "\"isSidechain\":false,\"session_id\":\"$M3\""
+{ dname ticket-strate-110; aprompt $MT:00:00 m3-01
+  dsend $MT:30 m3-02 director-hub "$(mm 4)"; } > "$NOTES/$M3.jsonl"
+aat $M4 /work/hub "\"isSidechain\":false,\"session_id\":\"$M4\""
+{ atitle director-hub; aprompt $MT:00:00 m4-01
+  gdispatch $MT:01:00 m4-02 req_m4-02 toolu_m4b; aresult $MT:01:01 m4-03 toolu_m4b
+  dpeer $MT:20:02 m4-04 "$(mm 3)" lorem
+  dpeer $MT:30:02 m4-05 "$(mm 4)" ticket-strate-110; } > "$MHUB/$M4.jsonl"
+aat $M4 /work/hub "\"isSidechain\":true,\"agentId\":\"$MB1\""
+{ atask $MT:01:10 mb1-01; dsend $MT:10 mb1-02 lorem "$(mm 2)"; } > "$MHUB/$M4/subagents/agent-$MB1.jsonl"
+mmeta implementer "Lorem task" "\"toolUseId\":\"toolu_m4b\"" > "$MHUB/$M4/subagents/agent-$MB1.meta.json"
+aat $M5 /work/hub "\"isSidechain\":false,\"session_id\":\"$M5\""
+{ dpeer $MT:10:02 m5-01 "$(mm 2)" lorem
+  dsend $MT:20 m5-02 director-hub "$(mm 3)"; } > "$MHUB/$M5.jsonl"
+AB=HEAD
+aat $M6 /work/scratch "\"isSidechain\":false,\"session_id\":\"$M6\""
+{ aprompt $MT:00:00 m6-01; areply $MT:00:10 m6-02 req_m6-02 $OPUS "$UO" "$TEXT"; } > "$H/projects/-work-scratch/$M6.jsonl"
+AB=main
+aat $M7 /work/bg "\"isSidechain\":false,\"session_id\":\"$M7\""
+{ aprompt 2026-10-20T09:00:00 m7-01; areply 2026-10-20T09:00:10 m7-02 req_m7-02 $OPUS "$UO" "$TEXT"; } > "$H/projects/-work-bg/$M7.jsonl"
+aat $M8 /work/bg "\"isSidechain\":false,\"session_id\":\"$M7\""
+{ aprompt 2026-10-20T11:00:00 m8-01; areply 2026-10-20T11:00:10 m8-02 req_m8-02 $OPUS "$UO" "$TEXT"; } > "$H/projects/-work-bg/$M8.jsonl"
+unset AB
+cat > fixtures/github/model-home.json <<'JSON'
+{"data":{"repository":{"issues":{"pageInfo":{"hasNextPage":false,"endCursor":"CURSOR-M"},"nodes":[
+{"number":105,"title":"Epic: lorem model","state":"OPEN","stateReason":null,"createdAt":"2026-10-18T09:00:00Z","closedAt":null,"parent":null,
+ "subIssuesSummary":{"total":2,"completed":0},"closedByPullRequestsReferences":{"nodes":[]}},
+{"number":107,"title":"Ipsum charges","state":"OPEN","stateReason":null,"createdAt":"2026-10-18T10:00:00Z","closedAt":null,"parent":{"number":105,"repository":{"nameWithOwner":"example/strate"}},
+ "subIssuesSummary":{"total":0,"completed":0},
+ "closedByPullRequestsReferences":{"nodes":[
+   {"number":120,"state":"OPEN","createdAt":"2026-10-20T08:00:00Z","mergedAt":null,"url":"https://github.com/example/strate/pull/120","headRefName":"feat/agent-model"}]}},
+{"number":108,"title":"Dolor lanes","state":"OPEN","stateReason":null,"createdAt":"2026-10-18T11:00:00Z","closedAt":null,"parent":{"number":105,"repository":{"nameWithOwner":"example/strate"}},
+ "subIssuesSummary":{"total":0,"completed":0},
+ "closedByPullRequestsReferences":{"nodes":[
+   {"number":120,"state":"OPEN","createdAt":"2026-10-20T08:00:00Z","mergedAt":null,"url":"https://github.com/example/strate/pull/120","headRefName":"feat/agent-model"}]}},
+{"number":110,"title":"Sit tickets","state":"OPEN","stateReason":null,"createdAt":"2026-10-18T12:00:00Z","closedAt":null,"parent":null,
+ "subIssuesSummary":{"total":0,"completed":0},"closedByPullRequestsReferences":{"nodes":[]}}
+]}}}}
+JSON

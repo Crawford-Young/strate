@@ -12,7 +12,7 @@ use jiff::tz::TimeZone;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
-use super::{Result, directs};
+use super::{Result, model};
 use crate::cost::{self, SYNTHETIC, Usage, truthy};
 use crate::time::{self, Cat, IDLE_GAP_MS, Record, Split, Timed};
 
@@ -250,13 +250,15 @@ fn set_meta(conn: &Connection, key: &str, value: &str) -> Result<()> {
 /// 2: `audit_cells.ask_ms`. 3: the notification, SendMessage and API-error
 /// event columns and the agents' outcome, follow-ups and context peak (v8).
 /// 4: the sent and peer msg_id event columns, and `directs` from them (v9).
-const ROLLUP_VERSION: &str = "4";
+/// 5: cells per (session, agent, day, model), no longer cut at `/rename`
+/// windows (#107).
+const ROLLUP_VERSION: &str = "5";
 
 /// Recomputes every rollup and audit cell unless the store was last
 /// accounted at the vendored prices, at [`cost::PRICING_LOGIC_VERSION`], in
 /// `zone` (an IANA name) and at [`ROLLUP_VERSION`]. A new price list,
 /// pricing-logic version or rollup version also re-reads every event's
-/// accounting fields from `raw` and rebuilds `directs` from them. A store
+/// accounting fields from `raw` and rebuilds the message edges from them. A store
 /// from before v3 (no prices) or v6 (no zone) is filled here too.
 pub(super) fn refresh(conn: &Connection, zone: &str) -> Result<()> {
     let repriced = meta(conn, "prices")?.as_deref() != Some(cost::PRICES_JSON)
@@ -268,7 +270,7 @@ pub(super) fn refresh(conn: &Connection, zone: &str) -> Result<()> {
     }
     if repriced || reversioned {
         reread_fields(conn)?;
-        directs::rebuild(conn)?;
+        model::messages(conn)?;
     }
     set_meta(conn, "tz", zone)?;
     let ids: Vec<String> = conn
@@ -356,54 +358,9 @@ fn timed(
     Some(Timed { at, record })
 }
 
-/// A `/rename` window of a session transcript (one `segments` row): where it
-/// starts in the transcript and, once it has a timestamped record, in time.
-struct Window {
-    id: i64,
-    offset: i64,
-    start: Option<i64>,
-}
-
-/// The session's windows in transcript order.
-fn windows(conn: &Connection, session_id: &str) -> Result<Vec<Window>> {
-    conn.prepare_cached(
-        "SELECT id, start_offset, started_at FROM segments
-         WHERE session_id = ?1 ORDER BY start_offset",
-    )?
-    .query_map([session_id], |r| {
-        let start: Option<String> = r.get(2)?;
-        Ok(Window {
-            id: r.get(0)?,
-            offset: r.get(1)?,
-            start: start.as_deref().and_then(time::parse_timestamp),
-        })
-    })?
-    .collect()
-}
-
-/// The window live at epoch ms `at`: the latest started by then, else the
-/// first.
-fn window_at(windows: &[Window], at: i64) -> Option<i64> {
-    windows
-        .iter()
-        .rev()
-        .find(|w| w.start.is_some_and(|s| s <= at))
-        .or(windows.first())
-        .map(|w| w.id)
-}
-
-/// The window holding transcript byte `offset`.
-fn window_of(windows: &[Window], offset: i64) -> Option<i64> {
-    windows
-        .iter()
-        .rev()
-        .find(|w| w.offset <= offset)
-        .map(|w| w.id)
-}
-
-/// A bucket's key: agent (`None`: the orchestrator), window, local day. A
+/// A bucket's key: agent (`None`: the orchestrator) and local day. A
 /// bucket stores one audit cell per model of its requests.
-type BucketKey = (Option<String>, Option<i64>, Option<String>);
+type BucketKey = (Option<String>, Option<String>);
 
 /// The requests of one model in one bucket.
 #[derive(Default)]
@@ -417,7 +374,7 @@ struct Requests {
     tokens: [i64; 4],
 }
 
-/// One (agent, window, day) bucket: its time and its requests per model.
+/// One (agent, day) bucket: its time and its requests per model.
 #[derive(Default)]
 struct Bucket {
     /// Wall, active, wait and ask ms.
@@ -492,42 +449,31 @@ fn add(a: Split, b: &Split) -> Split {
 }
 
 /// `time::split` of a timeline, and the same cut at each local midnight in
-/// `tz` and at `cuts`: the whole, and the buckets that sum to it.
+/// `tz`: the whole, and the buckets that sum to it.
 fn split_days(
     records: &[Timed],
     also: &[i64],
     tz: &TimeZone,
-    cuts: &[i64],
 ) -> Option<(Split, Vec<(i64, Split)>)> {
-    let buckets = time::split_at(
-        records,
-        also,
-        IDLE_GAP_MS,
-        &day_cuts(records, also, tz, cuts)?,
-    )?;
+    let buckets = time::split_at(records, also, IDLE_GAP_MS, &day_cuts(records, also, tz)?)?;
     let whole = buckets.iter().map(|(_, s)| s).fold(Split::default(), add);
     Some((whole, buckets))
 }
 
-/// `cuts` plus each local midnight in `tz` inside the timeline; `None`
-/// with no records.
-fn day_cuts(records: &[Timed], also: &[i64], tz: &TimeZone, cuts: &[i64]) -> Option<Vec<i64>> {
+/// Each local midnight in `tz` inside the timeline; `None` with no
+/// records.
+fn day_cuts(records: &[Timed], also: &[i64], tz: &TimeZone) -> Option<Vec<i64>> {
     let times = records.iter().map(|t| t.at).chain(also.iter().copied());
     let (first, last) = (times.clone().min()?, times.max()?);
-    let mut all = time::local_midnights(tz, first, last);
-    all.extend_from_slice(cuts);
-    Some(all)
+    Some(time::local_midnights(tz, first, last))
 }
 
-/// A session's timelines and windows: what its cells and runs are cut from.
+/// A session's timelines: what its cells and runs are cut from.
 struct Lines {
     /// The orchestrator's records.
     main: Vec<Timed>,
     /// Each subagent's records.
     agents: BTreeMap<String, Vec<Timed>>,
-    windows: Vec<Window>,
-    /// The window each subagent started in.
-    started_in: BTreeMap<String, Option<i64>>,
 }
 
 /// A session's timed records, each agent's in transcript order, read from
@@ -566,24 +512,7 @@ impl Lines {
             .into_iter()
             .filter_map(|(agent, records)| Some((agent?, records)))
             .collect();
-        let started_in = conn
-            .prepare_cached(
-                "SELECT agent_id, segment_id FROM agents
-                 WHERE session_id = ?1 AND agent_id IS NOT NULL",
-            )?
-            .query_map([session_id], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<Result<_>>()?;
-        Ok(Self {
-            main,
-            agents,
-            windows: windows(conn, session_id)?,
-            started_in,
-        })
-    }
-
-    /// A subagent counts entirely toward the window it started in.
-    fn window_of_agent(&self, agent: &str) -> Option<i64> {
-        self.started_in.get(agent).copied().flatten()
+        Ok(Self { main, agents })
     }
 
     /// The orchestrator's `also`: its subagents' record times, so a parent
@@ -591,19 +520,12 @@ impl Lines {
     fn also(&self) -> Vec<i64> {
         self.agents.values().flatten().map(|t| t.at).collect()
     }
-
-    /// The orchestrator's timeline is cut at window starts too, so a
-    /// renamed transcript splits per window.
-    fn window_starts(&self) -> Vec<i64> {
-        self.windows.iter().filter_map(|w| w.start).collect()
-    }
 }
 
 /// One run of a session's time (`time::runs`), placed as its audit cell
-/// is: by agent (`None`: the orchestrator), window and local day.
+/// is: by agent (`None`: the orchestrator) and local day.
 pub(super) struct Run {
     pub(super) agent: Option<String>,
-    pub(super) segment: Option<i64>,
     pub(super) day: Option<String>,
     pub(super) start: i64,
     pub(super) end: i64,
@@ -611,35 +533,28 @@ pub(super) struct Run {
 }
 
 /// The runs of `session_id`'s timelines in `tz`, cut where [`rollup`]
-/// cuts its cells, so each lies in one cell's (agent, window, day) and a
-/// cell's time is the sum of its runs.
+/// cuts its cells, so each lies in one cell's (agent, day) and a cell's
+/// time is the sum of its runs.
 pub(super) fn session_runs(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<Vec<Run>> {
     let lines = Lines::load(conn, session_id)?;
-    let runs = |records: &[Timed], also: &[i64], cuts: &[i64]| {
-        day_cuts(records, also, tz, cuts)
+    let runs = |records: &[Timed], also: &[i64]| {
+        day_cuts(records, also, tz)
             .and_then(|all| time::runs(records, also, IDLE_GAP_MS, &all))
             .unwrap_or_default()
     };
     let mut out = Vec::new();
     for (agent, records) in &lines.agents {
-        let segment = lines.window_of_agent(agent);
-        out.extend(
-            runs(records, &[], &[])
-                .into_iter()
-                .map(|(start, end, cat)| Run {
-                    agent: Some(agent.clone()),
-                    segment,
-                    day: time::local_day(tz, start),
-                    start,
-                    end,
-                    cat,
-                }),
-        );
+        out.extend(runs(records, &[]).into_iter().map(|(start, end, cat)| Run {
+            agent: Some(agent.clone()),
+            day: time::local_day(tz, start),
+            start,
+            end,
+            cat,
+        }));
     }
-    let main = runs(&lines.main, &lines.also(), &lines.window_starts());
+    let main = runs(&lines.main, &lines.also());
     out.extend(main.into_iter().map(|(start, end, cat)| Run {
         agent: None,
-        segment: window_at(&lines.windows, start),
         day: time::local_day(tz, start),
         start,
         end,
@@ -650,41 +565,32 @@ pub(super) fn session_runs(conn: &Connection, session_id: &str, tz: &TimeZone) -
 
 fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
     let lines = Lines::load(conn, session_id)?;
-    let (main, windows) = (&lines.main, &lines.windows);
-    let window_of_agent = |agent: &str| lines.window_of_agent(agent);
+    let main = &lines.main;
 
     let mut buckets: BTreeMap<BucketKey, Bucket> = BTreeMap::new();
     let mut agent_splits: BTreeMap<String, Split> = BTreeMap::new();
     for (agent, records) in &lines.agents {
-        let Some((run, parts)) = split_days(records, &[], tz, &[]) else {
+        let Some((run, parts)) = split_days(records, &[], tz) else {
             continue;
         };
         for (at, split) in &parts {
-            let key = (
-                Some(agent.clone()),
-                window_of_agent(agent),
-                time::local_day(tz, *at),
-            );
+            let key = (Some(agent.clone()), time::local_day(tz, *at));
             buckets.entry(key).or_default().time(split);
         }
         agent_splits.insert(agent.clone(), run);
     }
-    let whole =
-        split_days(main, &lines.also(), tz, &lines.window_starts()).map(|(whole, parts)| {
-            for (at, split) in &parts {
-                let key = (None, window_at(windows, *at), time::local_day(tz, *at));
-                buckets.entry(key).or_default().time(split);
-            }
-            whole
-        });
-    // A request counts on the day and in the window of its own record. An
-    // orchestrator's time goes to a window by when it started, its requests
-    // by transcript offset: they agree unless timestamps run out of order.
+    let whole = split_days(main, &lines.also(), tz).map(|(whole, parts)| {
+        for (at, split) in &parts {
+            let key = (None, time::local_day(tz, *at));
+            buckets.entry(key).or_default().time(split);
+        }
+        whole
+    });
+    // A request counts on the day of its own record.
     let mut stmt = conn.prepare_cached(
-        "SELECT r.agent_id, r.timestamp, r.model, r.usage, r.cost_usd, e.byte_offset
-         FROM requests AS r JOIN events AS e ON e.id = r.id
-         WHERE r.session_id = ?1
-         ORDER BY r.timestamp, r.id",
+        "SELECT agent_id, timestamp, model, usage, cost_usd FROM requests
+         WHERE session_id = ?1
+         ORDER BY timestamp, id",
     )?;
     let mut rows = stmt.query([session_id])?;
     let mut n = 0;
@@ -695,10 +601,6 @@ fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
         let at: Option<String> = r.get(1)?;
         let model: Option<String> = r.get(2)?;
         let usage: String = r.get(3)?;
-        let window = match &agent {
-            None => window_of(windows, r.get(5)?),
-            Some(a) => window_of_agent(a),
-        };
         let day = at
             .as_deref()
             .and_then(time::parse_timestamp)
@@ -712,7 +614,7 @@ fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
             *peak = peak.max(pct);
         }
         buckets
-            .entry((agent, window, day))
+            .entry((agent, day))
             .or_default()
             .request(n, model, &usage, r.get(4)?);
         n += 1;
@@ -720,18 +622,17 @@ fn session(conn: &Connection, session_id: &str, tz: &TimeZone) -> Result<()> {
     conn.prepare_cached("DELETE FROM audit_cells WHERE session_id = ?1")?
         .execute([session_id])?;
     let mut insert = conn.prepare_cached(
-        "INSERT INTO audit_cells (session_id, agent_id, segment_id, day, wall_ms, active_ms,
-             wait_ms, ask_ms, cost_usd, unpriced, input_tokens, output_tokens,
-             cache_read_tokens, cache_write_tokens, model)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        "INSERT INTO audit_cells (session_id, agent_id, day, wall_ms, active_ms, wait_ms,
+             ask_ms, cost_usd, unpriced, input_tokens, output_tokens, cache_read_tokens,
+             cache_write_tokens, model)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
     )?;
-    for ((agent, window, day), bucket) in &buckets {
+    for ((agent, day), bucket) in &buckets {
         for (model, [wall, active, wait, ask], r) in bucket.cells() {
             let [input, output, cache_read, cache_write] = r.map_or([0; 4], |r| r.tokens);
             insert.execute(params![
                 session_id,
                 agent,
-                window,
                 day,
                 wall,
                 active,
