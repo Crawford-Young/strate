@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { GraphAgent, LiveGraph, Workstream } from './api'
-import { duration, money, nodeState, sessionLine } from './format'
+import { clockTime, duration, laneLabel, money, nodeState, sessionLine } from './format'
 
 const MIN = 60_000
 
@@ -18,6 +18,12 @@ function agent(costUsd: number | null): GraphAgent {
     contextTokens: null,
     contextPct: null,
     parent: null,
+    sessionId: 's',
+    role: null,
+    lane: 'interactive',
+    charge: null,
+    chargeKey: null,
+    chargeSource: 'unlinked',
   }
 }
 
@@ -87,6 +93,32 @@ describe('nodeState', () => {
     expect(nodeState('working')).toBe('working')
     expect(nodeState('idle')).toBe('idle')
     expect(nodeState('done')).toBe('done')
+  })
+})
+
+describe('laneLabel', () => {
+  it('names the known lanes in short', () => {
+    expect(laneLabel('subagent')).toBe('subagent')
+    expect(laneLabel('background-session')).toBe('background')
+    expect(laneLabel('interactive')).toBe('interactive')
+  })
+
+  it('shows a lane it does not know as it came', () => {
+    expect(laneLabel('cloud')).toBe('cloud')
+    expect(laneLabel('constructor')).toBe('constructor')
+    expect(laneLabel('')).toBe('')
+  })
+})
+
+describe('clockTime', () => {
+  it('shows an ISO time as the local wall clock, to the second', () => {
+    expect(clockTime(new Date(2026, 9, 30, 14, 2, 11).toISOString())).toBe('14:02:11')
+    expect(clockTime(new Date(2026, 9, 30, 9, 5, 7, 900).toISOString())).toBe('09:05:07')
+  })
+
+  it('shows a time it cannot read as it came, never NaN', () => {
+    expect(clockTime('not a time')).toBe('not a time')
+    expect(clockTime('')).toBe('')
   })
 })
 

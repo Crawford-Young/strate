@@ -1,7 +1,14 @@
-// The canvas centre: the selected tab's live session as a tiered graph
-// (orchestrator → subagents, teammates and directed units → their dispatches), laid out by ELK
-// and drawn by React Flow. Selecting a node opens it in the console.
-import { AgentNodeCard, BorderTrace, Button, EmptyState, TabsContent } from '@crawfordyoung/ui'
+// The canvas centre: the selected tab's company as a tiered graph, its root orchestrator on top and
+// every running agent beneath it, across lanes and at any depth, laid out by ELK and drawn by
+// React Flow. Selecting a node opens its transcript in the console.
+import {
+  AgentNodeCard,
+  BorderTrace,
+  Button,
+  EmptyState,
+  TabsContent,
+  badgeVariants,
+} from '@crawfordyoung/ui'
 import {
   Background,
   BackgroundVariant,
@@ -18,14 +25,18 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/base.css'
 import { Minus, Plus } from 'lucide-react'
-import { useCallback, useState } from 'react'
+import { useCallback, useState, type CSSProperties } from 'react'
 import type { GraphAgent, LiveGraph, Status, Workstream } from './api'
-import { nodeState, sessionLine } from './format'
+import { STATE_LABEL, laneLabel, money, nodeState, sessionLine } from './format'
 import { NODE_HEIGHT, NODE_WIDTH, drawnEdges } from './graphLayout'
 import { useClock } from './hooks'
 import { useGraphLayout } from './useGraphLayout'
 
 export const agentName = (a: GraphAgent) => a.name ?? a.agentType ?? a.kind
+
+/** Where an agent's charge came from, or that it has none. */
+const chargeLine = (a: GraphAgent) =>
+  a.chargeKey === null ? 'no charge' : `charge from ${a.chargeSource}`
 
 interface CanvasProps {
   error: string | null
@@ -114,12 +125,36 @@ function AgentNode({
       <Handle type="target" position={Position.Top} isConnectable={false} className="opacity-0" />
       <AgentNodeCard
         className="w-48"
-        name={agentName(a)}
+        name={a.role ?? agentName(a)}
         state={nodeState(a.state)}
-        detail={a.description ?? a.model ?? undefined}
+        // The $ rides with the state, so it shows with or without a gauge.
+        // The spaces keep the card's accessible name in words: "$1.23 needs you".
+        stateLabel={
+          <>
+            <span className="mr-1 font-normal tabular-nums text-muted-foreground">
+              {money(a.costUsd)}
+            </span>{' '}
+            {STATE_LABEL[a.state]}
+          </>
+        }
+        // The short lane keeps its room; a long charge key ellipsizes inside its chip.
+        detail={
+          <span className="flex min-w-0 items-center gap-1.5">
+            <span className="shrink-0">{laneLabel(a.lane)}</span>{' '}
+            {/* A Badge is a div, which a button can't hold; the chip takes its look on a span. */}
+            <span
+              data-slot="charge"
+              className={`${badgeVariants({ variant: 'outline' })} min-w-0 max-w-full font-mono`}
+            >
+              <span className="min-w-0 truncate">{a.chargeKey ?? 'unlinked'}</span>
+            </span>{' '}
+          </span>
+        }
         context={a.contextPct ?? undefined}
         contextLabel={a.contextPct === null ? undefined : `${Math.round(a.contextPct)}%`}
         selected={selected}
+        // Hover and assistive tech both get the charge's source.
+        title={[a.description, chargeLine(a)].filter((line) => line !== null).join('\n')}
         data-agent={a.id}
         onFocus={(e) => reveal(e.currentTarget)}
       />
@@ -136,12 +171,14 @@ function AgentNode({
 const nodeTypes = { agent: AgentNode }
 
 const EDGE_STYLE = { stroke: 'rgb(var(--muted-foreground) / 0.5)', strokeWidth: 2 }
-const EDGE_STYLES = {
-  dispatch: EDGE_STYLE,
-  teammate: { ...EDGE_STYLE, strokeDasharray: '6 4' },
-  // A director's unit: solid like dispatch, at the full muted colour so it reads as the stronger link.
-  directs: { ...EDGE_STYLE, stroke: 'rgb(var(--muted-foreground))' },
-}
+/** By edge kind; a kind not listed (one added after this build) is drawn in `EDGE_STYLE`. */
+const EDGE_STYLES: ReadonlyMap<string, CSSProperties> = new Map<string, CSSProperties>([
+  ['dispatch', EDGE_STYLE],
+  ['teammate', { ...EDGE_STYLE, strokeDasharray: '6 4' }],
+  // A spawned session under its spawner: solid like dispatch, at the full muted colour so it
+  // reads as the stronger link.
+  ['directs', { ...EDGE_STYLE, stroke: 'rgb(var(--muted-foreground))' }],
+])
 const FIT_VIEW_OPTIONS = { maxZoom: 1 }
 /** How long the canvas size holds still before the graph re-fits: a handle drag fits once, at its end. */
 export const REFIT_MS = 150
@@ -231,7 +268,7 @@ function GraphView({ graph, selected, onSelect }: GraphViewProps) {
       source: String(e.parent),
       target: String(e.child),
       type: 'step',
-      style: EDGE_STYLES[e.kind],
+      style: EDGE_STYLES.get(e.kind) ?? EDGE_STYLE,
     }))
   return (
     <>

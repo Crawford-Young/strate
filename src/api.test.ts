@@ -3,6 +3,7 @@ import { listen } from '@tauri-apps/api/event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   STORE_CHANGED,
+  agentTranscript,
   auditPerformance,
   auditRefresh,
   auditRollup,
@@ -20,6 +21,7 @@ import {
   type LiveGraph,
   type Performance,
   type TimelineDay,
+  type TranscriptEntry,
 } from './api'
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
@@ -65,13 +67,42 @@ describe('commands', () => {
           contextTokens: 50000,
           contextPct: 25,
           parent: null,
+          sessionId: 's-alpha',
+          role: 'director',
+          lane: 'interactive',
+          charge: { kind: 'issue', repo: 'strate', number: 109, topic: null },
+          chargeKey: 'issue_strate-109',
+          chargeSource: 'name',
         },
       ],
-      edges: [],
+      edges: [{ kind: 'launch', parent: 1, child: 2 }],
     }
     invokeMock.mockResolvedValueOnce(graph)
     await expect(liveGraph(7)).resolves.toEqual(graph)
     expect(invokeMock).toHaveBeenCalledWith('live_graph', { workstream: 7 })
+  })
+
+  it('agent_transcript passes the agent row id and returns its entries in order', async () => {
+    const entries: TranscriptEntry[] = [
+      { kind: 'user', text: 'lorem', timestamp: '2026-10-30T10:00:00Z' },
+      { kind: 'thinking', text: 'ipsum', timestamp: null },
+      {
+        kind: 'tool_call',
+        id: 'toolu_1',
+        name: 'TodoWrite',
+        args: 'TodoWrite(2 todos)',
+        status: 'success',
+        result: 'ok',
+        resultTruncated: false,
+        resultAt: '2026-10-30T10:00:02Z',
+        todos: [{ content: 'dolor', status: 'in_progress' }],
+        timestamp: '2026-10-30T10:00:01Z',
+      },
+      { kind: 'text', text: 'sit amet', timestamp: '2026-10-30T10:00:03Z' },
+    ]
+    invokeMock.mockResolvedValueOnce(entries)
+    await expect(agentTranscript(12)).resolves.toEqual(entries)
+    expect(invokeMock).toHaveBeenCalledWith('agent_transcript', { agent: 12 })
   })
 
   it('audit_rollup passes the filter and returns the tree', async () => {

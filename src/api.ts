@@ -48,6 +48,22 @@ export interface NeedsYou {
   workstream: number | null
 }
 
+/** How an agent runs, kebab-case. Lanes added later (e.g. `cloud`) arrive as their own string. */
+export type Lane = 'subagent' | 'background-session' | 'interactive' | (string & {})
+
+export type ChargeKind = 'repo' | 'epic' | 'issue' | 'pr' | 'topic'
+
+/** Where an agent's charge came from; `unlinked` with no charge. */
+export type ChargeSource = 'branch' | 'name' | 'parent' | 'unlinked'
+
+/** What an agent works on: `repo` and `number` as the kind needs, `topic` only for a topic. */
+export interface Charge {
+  kind: ChargeKind
+  repo: string | null
+  number: number | null
+  topic: string | null
+}
+
 export interface GraphAgent {
   /** Row id; edges and `parent` refer to it. */
   id: number
@@ -64,10 +80,24 @@ export interface GraphAgent {
   /** Latest request depth over the model's window; null for an unknown window. */
   contextPct: number | null
   parent: number | null
+  /** The agent row's session. */
+  sessionId: string
+  /** The role its name gives; null when it names none. */
+  role: string | null
+  lane: Lane
+  /** Its effective charge; null when Unlinked. */
+  charge: Charge | null
+  /** The charge's join key, e.g. `issue_strate-109`; null when Unlinked. */
+  chargeKey: string | null
+  chargeSource: ChargeSource
 }
 
+/**
+ * `directs` is a spawned session's orchestrator under its spawner, across sessions. Kinds added
+ * later arrive as their own string.
+ */
 export interface GraphEdge {
-  kind: 'dispatch' | 'teammate' | 'directs'
+  kind: 'dispatch' | 'teammate' | 'directs' | (string & {})
   parent: number
   child: number
 }
@@ -83,6 +113,38 @@ export interface LiveGraph {
   agents: GraphAgent[]
   edges: GraphEdge[]
 }
+
+export type TranscriptToolStatus = 'pending' | 'success' | 'error'
+
+export type TranscriptTodoStatus = 'pending' | 'in_progress' | 'completed'
+
+export interface TranscriptTodo {
+  content: string
+  status: TranscriptTodoStatus
+}
+
+/** One record of an agent's transcript, at its record's time (ISO; null when it has none). */
+export type TranscriptEntry = { timestamp: string | null } & (
+  | /** A human prompt. */ { kind: 'user'; text: string }
+  | /** An assistant text block. */ { kind: 'text'; text: string }
+  | /** Non-empty thinking; redacted thinking is skipped. */ { kind: 'thinking'; text: string }
+  | {
+      kind: 'tool_call'
+      id: string
+      name: string
+      /** The one-line `Tool(args)` summary. */
+      args: string
+      /** `pending` until its result arrives. */
+      status: TranscriptToolStatus
+      /** The result text, capped at 4000 characters. */
+      result: string | null
+      resultTruncated: boolean
+      /** When the result arrived (ISO). */
+      resultAt: string | null
+      /** TodoWrite's todos; null for every other tool. */
+      todos: TranscriptTodo[] | null
+    }
+)
 
 /** What auditRollup sums: the cells on local days `from..=to`. */
 export interface AuditFilter {
@@ -370,6 +432,10 @@ export const needsYou = () => invoke<NeedsYou[]>('needs_you')
 /** Null when the workstream has no session. */
 export const liveGraph = (workstream: number) =>
   invoke<LiveGraph | null>('live_graph', { workstream })
+
+/** The agent row's own transcript records in order, every tool call included; empty when unknown. */
+export const agentTranscript = (agent: number) =>
+  invoke<TranscriptEntry[]>('agent_transcript', { agent })
 
 /** Rejects with the message on a bad day in the filter. */
 export const auditRollup = (filter: AuditFilter) => invoke<Audit>('audit_rollup', { filter })

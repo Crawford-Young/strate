@@ -1,5 +1,5 @@
 // The live view: the header, then two resizable panels, the canvas centre and the console right.
-// The console opens when a node is selected; its body is #19. Audit is the only full-screen view:
+// The console opens when a node is selected and shows its transcript. Audit is the only full-screen view:
 // while it shows, this view stays mounted, `hidden` instead, so its state survives the visit.
 import {
   Button,
@@ -13,6 +13,7 @@ import { X } from 'lucide-react'
 import { useRef, useState, type RefObject } from 'react'
 import { liveGraph, needsYou, status, workstreams, type Workstream } from './api'
 import { Canvas, agentName } from './Canvas'
+import { AgentTranscript } from './Console'
 import { Header } from './Header'
 import { useLoad, useStoreVersion } from './hooks'
 import { MIN_SIZE, type Layout } from './layout'
@@ -36,6 +37,9 @@ interface LiveShellProps {
   auditButtonRef: RefObject<HTMLButtonElement | null>
   onOpenAudit: () => void
 }
+
+/** The console heading's id: it names the transcript's scroll region. */
+const HEADING_ID = 'console-heading'
 
 export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProps) {
   const version = useStoreVersion(hidden)
@@ -71,6 +75,15 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
     (overview && 'error' in overview ? overview.error : null) ??
     (currentGraphLoad && 'error' in currentGraphLoad ? currentGraphLoad.error : null)
   const selectedAgent = graph?.agents.find((a) => a.id === agentId)
+  // A finished agent leaves the canvas but its transcript stays open, so the heading keeps its name.
+  const [lastNamed, setLastNamed] = useState<{ id: number; name: string } | null>(null)
+  if (selectedAgent && (lastNamed?.id !== agentId || lastNamed.name !== agentName(selectedAgent)))
+    setLastNamed({ id: selectedAgent.id, name: agentName(selectedAgent) })
+  const heading = selectedAgent
+    ? agentName(selectedAgent)
+    : lastNamed?.id === agentId
+      ? lastNamed.name
+      : 'Console'
 
   const selectAgent = (id: number) => {
     setAgent(id)
@@ -139,8 +152,8 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
           {panels.prefs.console.open && (
             <aside aria-label="Console" className="flex h-full flex-col bg-surface">
               <div className="flex h-10 flex-none items-center gap-2 border-b border-border px-3">
-                <h2 className="min-w-0 flex-1 truncate text-sm font-semibold">
-                  {selectedAgent ? agentName(selectedAgent) : 'Console'}
+                <h2 id={HEADING_ID} className="min-w-0 flex-1 truncate text-sm font-semibold">
+                  {heading}
                 </h2>
                 <Button
                   variant="ghost"
@@ -152,7 +165,20 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
                   <X aria-hidden className="size-4" />
                 </Button>
               </div>
-              <EmptyState message="The console arrives in #19." />
+              {agentId === null ? (
+                <EmptyState message="Select an agent to see its transcript." />
+              ) : (
+                // Its own instance per agent, so each starts at its own newest entry; and gone
+                // while the console is closed, so a reopen reads afresh.
+                // A finished agent is not drawn, so it reads as not working.
+                <AgentTranscript
+                  key={agentId}
+                  agent={agentId}
+                  working={selectedAgent?.state === 'working'}
+                  version={version}
+                  labelledBy={HEADING_ID}
+                />
+              )}
             </aside>
           )}
         </ResizablePanel>

@@ -1,9 +1,10 @@
-import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { audit } from '../tests/audit-fixtures'
 import { defaultLayoutOf, dragTo, resetGroups } from '../tests/resizable-mock'
 import { fitView, resetFlow } from '../tests/xyflow-mock'
 import {
+  agentTranscript,
   auditRollup,
   liveGraph,
   needsYou,
@@ -13,6 +14,7 @@ import {
   type GraphAgent,
   type LiveGraph,
   type NeedsYou,
+  type TranscriptEntry,
   type Workstream,
 } from './api'
 import { App } from './App'
@@ -20,6 +22,7 @@ import { REFIT_MS } from './Canvas'
 import { PREFS_KEY } from './layout'
 
 vi.mock('./api', () => ({
+  agentTranscript: vi.fn(),
   status: vi.fn(),
   workstreams: vi.fn(),
   liveGraph: vi.fn(),
@@ -51,6 +54,7 @@ const liveGraphMock = vi.mocked(liveGraph)
 const needsYouMock = vi.mocked(needsYou)
 const onStoreChangedMock = vi.mocked(onStoreChanged)
 const auditRollupMock = vi.mocked(auditRollup)
+const transcriptMock = vi.mocked(agentTranscript)
 
 function ws(over: Partial<Workstream> & Pick<Workstream, 'id' | 'name'>): Workstream {
   return {
@@ -92,6 +96,12 @@ function agent(over: Partial<GraphAgent> & Pick<GraphAgent, 'id'>): GraphAgent {
     contextTokens: null,
     contextPct: null,
     parent: null,
+    sessionId: 's-2',
+    role: null,
+    lane: 'subagent',
+    charge: null,
+    chargeKey: null,
+    chargeSource: 'unlinked',
     ...over,
   }
 }
@@ -108,6 +118,7 @@ const shellGraph: LiveGraph = {
       agentId: null,
       kind: 'orchestrator',
       name: 'strate-17',
+      lane: 'interactive',
       model: 'claude-opus-5-5',
       costUsd: 0.3,
       contextPct: 41.6,
@@ -130,7 +141,16 @@ const unnamedGraph: LiveGraph = {
   live: true,
   sessionCostUsd: null,
   runMs: null,
-  agents: [agent({ id: 20, agentId: null, kind: 'orchestrator', name: 'app-main' })],
+  agents: [
+    agent({
+      id: 20,
+      agentId: null,
+      kind: 'orchestrator',
+      name: 'app-main',
+      sessionId: 's-3',
+      lane: 'interactive',
+    }),
+  ],
   edges: [],
 }
 
@@ -160,6 +180,7 @@ beforeEach(() => {
   needsYouMock.mockReset().mockResolvedValue([])
   listeners = []
   auditRollupMock.mockReset().mockResolvedValue(audit([]))
+  transcriptMock.mockReset().mockResolvedValue([])
   onStoreChangedMock.mockReset().mockImplementation((callback) => {
     listeners.push(callback)
     return Promise.resolve(unlisten)
@@ -475,6 +496,57 @@ describe('needs-you chip', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
   })
 
+  it("counts a wait deep in a tab's tree, in any lane, on that tab and goes to it", async () => {
+    // strate-17's own chain is at work. A session it spawned (unit-run) spawned a --bg session
+    // (bg-run) two levels down, and only bg-run waits. Both chains nest under the root tab
+    // (director = 2), and the store folds bg-run's wait into the root's row.
+    const root = ws({ ...shell, state: 'needs_you', needsYou: 1 })
+    const unit = ws({ id: 5, name: 'unit-run', live: true, state: 'working', director: 2 })
+    const spawned = ws({ id: 6, name: 'bg-run', live: true, state: 'needs_you', director: 2 })
+    workstreamsMock.mockResolvedValue([root, unnamed, unit, spawned])
+    needsYouMock.mockResolvedValue([
+      wait({ source: 'hook', sessionId: 's-6', waitingFor: 'Bash', workstream: 6 }),
+    ])
+    const orchestrator = (id: number, name: string, parent: number | null, sessionId: string) =>
+      agent({ id, agentId: null, kind: 'orchestrator', name, parent, sessionId })
+    const tree: LiveGraph = {
+      ...shellGraph,
+      agents: [
+        { ...orchestrator(10, 'strate-17', null, 's-2'), lane: 'interactive' },
+        { ...orchestrator(50, 'unit-run', 10, 's-5'), lane: 'interactive' },
+        {
+          ...orchestrator(60, 'bg-run', 50, 's-6'),
+          lane: 'background-session',
+          state: 'needs_you',
+        },
+      ],
+      edges: [
+        { kind: 'directs', parent: 10, child: 50 },
+        { kind: 'directs', parent: 50, child: 60 },
+      ],
+    }
+    liveGraphMock.mockImplementation((id) =>
+      Promise.resolve(id === 2 ? tree : id === 3 ? unnamedGraph : null),
+    )
+    render(<App />)
+    await screen.findByRole('tab', { name: /app@main/ })
+    selectTab(/app@main/)
+    fireEvent.click(await screen.findByRole('button', { name: '1 needs you' }))
+    // Neither nested chain gets a tab of its own; the root's carries the wait.
+    expect(screen.getAllByRole('tab')).toHaveLength(2)
+    expect(within(tab(/strate-17/)).getByText('needs you')).toBeInTheDocument()
+    const list = screen.getByRole('dialog', { name: 'Waiting on you' })
+    // Named for the chain that waits, not the root or the session between.
+    expect(within(list).getByText('bg-run')).toBeInTheDocument()
+    expect(within(list).queryByText('unit-run')).not.toBeInTheDocument()
+    fireEvent.click(within(list).getByRole('button', { name: 'go to tab for bg-run' }))
+    expect(tab(/strate-17/)).toHaveAttribute('aria-selected', 'true')
+    // And it is on that tab's canvas, in its own lane.
+    const waiting = await screen.findByRole('button', { name: /^bg-run/ })
+    expect(waiting).toHaveTextContent('background')
+    expect(waiting).toHaveTextContent('needs you')
+  })
+
   it('follows the store, leaving when the last wait is answered and returning closed', async () => {
     needsYouMock.mockResolvedValue([blocked])
     render(<App />)
@@ -519,22 +591,146 @@ describe('canvas', () => {
     const y = (id: number) => Number(screen.getByTestId(`node-${id}`).dataset.y)
     expect(y(10)).toBeLessThan(y(11))
     expect(screen.getByTestId('edge-10-11')).toBeInTheDocument()
-    expect(orchestrator).toHaveTextContent('claude-opus-5-5')
+    expect(orchestrator).toHaveTextContent('interactive')
+    expect(orchestrator).toHaveTextContent('$0.30')
     expect(orchestrator).toHaveTextContent('42%')
     const worker = screen.getByRole('button', { name: /implementer/ })
-    expect(worker).toHaveTextContent('Build the shell')
+    expect(worker).toHaveAttribute('title', 'Build the shell\nno charge')
+    expect(worker).toHaveTextContent('subagent')
+    expect(worker).toHaveTextContent('unlinked')
+    expect(worker).toHaveTextContent('$0.12')
     expect(worker).toHaveTextContent('needs you')
     expect(screen.getByRole('button', { name: /teammate/ })).toBeInTheDocument()
   })
 })
 
 describe('console', () => {
+  const said = (text: string): TranscriptEntry => ({ kind: 'text', text, timestamp: null })
+  const consolePanel = () => screen.getByRole('complementary', { name: 'Console' })
+
+  it("shows the selected agent's transcript, read-only", async () => {
+    transcriptMock.mockImplementation((id) =>
+      Promise.resolve([
+        { kind: 'user', text: `brief for ${id}`, timestamp: null },
+        {
+          kind: 'tool_call',
+          id: 'toolu_1',
+          name: 'Bash',
+          args: 'Bash(bun test)',
+          status: 'success',
+          result: 'ok',
+          resultTruncated: false,
+          resultAt: null,
+          todos: null,
+          timestamp: null,
+        },
+      ]),
+    )
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
+    const transcript = await within(consolePanel()).findByRole('list', { name: 'Agent transcript' })
+    expect(transcript).toHaveTextContent('brief for 11')
+    expect(transcript).toHaveTextContent('Bash(bun test)')
+    expect(transcriptMock).toHaveBeenCalledWith(11)
+    // The scroll stop is named by the console's visible heading, not left a nameless tab stop.
+    expect(within(consolePanel()).getByRole('region', { name: 'implementer' })).toContainElement(
+      transcript,
+    )
+    expect(within(consolePanel()).queryByRole('textbox')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /teammate/ }))
+    expect(await within(consolePanel()).findByText('brief for 12')).toBeInTheDocument()
+    expect(within(consolePanel()).queryByText('brief for 11')).not.toBeInTheDocument()
+  })
+
+  it('shows an unanswered call as running only while its agent works', async () => {
+    transcriptMock.mockResolvedValue([
+      {
+        kind: 'tool_call',
+        id: 'toolu_1',
+        name: 'Bash',
+        args: 'Bash(bun test)',
+        status: 'pending',
+        result: null,
+        resultTruncated: false,
+        resultAt: null,
+        todos: null,
+        timestamp: null,
+      },
+    ])
+    render(<App />)
+    // The implementer waits on the user; the teammate works.
+    fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
+    expect(await within(consolePanel()).findByText('Pending:')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /teammate/ }))
+    expect(await within(consolePanel()).findByText('Running:')).toBeInTheDocument()
+  })
+
+  it('rereads the open transcript on a store change', async () => {
+    transcriptMock.mockResolvedValue([said('first')])
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
+    await within(consolePanel()).findByText('first')
+    transcriptMock.mockResolvedValue([said('first'), said('second')])
+    act(() => storeChanged())
+    expect(await within(consolePanel()).findByText('second')).toBeInTheDocument()
+  })
+
+  it('reads the transcript afresh when the console reopens', async () => {
+    transcriptMock.mockResolvedValue([said('first')])
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
+    await within(consolePanel()).findByText('first')
+    fireEvent.click(within(consolePanel()).getByRole('button', { name: 'Close console' }))
+    // Nothing tells the closed console the store changed; reopening must read again anyway.
+    transcriptMock.mockResolvedValue([said('first'), said('later')])
+    fireEvent.click(screen.getByRole('button', { name: /implementer/ }))
+    expect(await within(consolePanel()).findByText('later')).toBeInTheDocument()
+    expect(transcriptMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('reads no transcript while Audit hides the live view', async () => {
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
+    await within(consolePanel()).findByText('No transcript records yet.')
+    fireEvent.click(screen.getByRole('button', { name: 'Audit' }))
+    act(() => storeChanged())
+    await act(async () => {})
+    expect(transcriptMock).toHaveBeenCalledOnce()
+  })
+
+  it('keeps naming the agent whose transcript shows after it leaves the canvas', async () => {
+    transcriptMock.mockResolvedValue([said('first')])
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
+    await within(consolePanel()).findByText('first')
+    liveGraphMock.mockResolvedValue({
+      ...shellGraph,
+      agents: shellGraph.agents.filter((a) => a.id !== 11),
+    })
+    act(() => storeChanged())
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: /implementer/ })).not.toBeInTheDocument(),
+    )
+    expect(within(consolePanel()).getByRole('heading', { name: 'implementer' })).toBeInTheDocument()
+    expect(within(consolePanel()).getByText('first')).toBeInTheDocument()
+  })
+
+  it('asks for an agent when none is selected', async () => {
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
+    selectTab(/app@main/)
+    await screen.findByRole('button', { name: /app-main/ })
+    expect(
+      within(consolePanel()).getByText('Select an agent to see its transcript.'),
+    ).toBeInTheDocument()
+  })
+
   it('opens on node select and closes on ×', async () => {
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
     const console = screen.getByRole('complementary', { name: 'Console' })
     expect(within(console).getByRole('heading', { name: 'implementer' })).toBeInTheDocument()
-    expect(within(console).getByText('The console arrives in #19.')).toBeInTheDocument()
+    expect(await within(console).findByText('No transcript records yet.')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /implementer/ })).toHaveAttribute(
       'aria-pressed',
       'true',

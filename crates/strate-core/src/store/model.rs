@@ -175,7 +175,38 @@ pub fn agent_model(conn: &Connection) -> Result<Vec<ModelAgent>> {
     .collect()
 }
 
-fn lane(s: &str) -> Lane {
+/// [`effective_charge`]'s query: `agent_charges` for agent `?1` alone,
+/// walking up from it only (the view walks up from every agent).
+const EFFECTIVE_CHARGE_SQL: &str = "WITH RECURSIVE up (at, depth, seen) AS (
+         SELECT ?1, 0, ',' || ?1 || ','
+         UNION ALL
+         SELECT p.parent, up.depth + 1, up.seen || p.parent || ','
+         FROM up
+         JOIN agents AS a ON a.id = up.at AND a.own_charge IS NULL
+         JOIN spawn_parents AS p ON p.child = up.at
+         WHERE up.depth < 32 AND instr(up.seen, ',' || p.parent || ',') = 0
+     )
+     SELECT c.kind, c.repo, c.number, c.topic,
+         CASE WHEN up.depth = 0 THEN h.own_charge_source ELSE 'parent' END
+     FROM up JOIN agents AS h ON h.id = up.at JOIN charges AS c ON c.id = h.own_charge
+     ORDER BY up.depth LIMIT 1";
+
+/// Agent row `agent`'s effective charge and where it came from, as the
+/// `agent_charges` view resolves it; `(None, Unlinked)` with none.
+pub(super) fn effective_charge(
+    conn: &Connection,
+    agent: i64,
+) -> Result<(Option<Charge>, ChargeSource)> {
+    let found = conn
+        .prepare_cached(EFFECTIVE_CHARGE_SQL)?
+        .query_row([agent], |r| {
+            Ok((charge_at(r, 0)?, source(&r.get::<_, String>(4)?)))
+        })
+        .optional()?;
+    Ok(found.unwrap_or((None, ChargeSource::Unlinked)))
+}
+
+pub(super) fn lane(s: &str) -> Lane {
     match s {
         "subagent" => Lane::Subagent,
         "background-session" => Lane::BackgroundSession,
