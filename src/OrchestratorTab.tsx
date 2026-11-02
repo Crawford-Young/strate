@@ -1,13 +1,6 @@
 import { Badge, StatusDot, TabsTrigger } from '@crawfordyoung/ui'
 import type { Workstream } from './api'
-import { money, nodeState } from './format'
-
-const STATE_LABEL = {
-  working: 'working',
-  needs_you: 'needs you',
-  idle: 'idle',
-  done: 'done',
-} as const
+import { STATE_LABEL, money, nodeState } from './format'
 
 /** One orchestrator tab: status dot, name, total $ and a needs-you badge. */
 export function OrchestratorTab({ ws }: { ws: Workstream }) {

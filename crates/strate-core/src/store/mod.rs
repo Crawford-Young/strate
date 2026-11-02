@@ -16,6 +16,7 @@ mod ingest;
 mod live;
 mod migrate;
 mod model;
+mod transcript;
 pub mod views;
 
 pub use github::{GhRepo, gh_issues, gh_repos, gh_reverts};

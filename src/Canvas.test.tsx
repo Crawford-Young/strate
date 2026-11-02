@@ -52,6 +52,12 @@ function agent(over: Partial<GraphAgent> & Pick<GraphAgent, 'id'>): GraphAgent {
     contextTokens: null,
     contextPct: null,
     parent: null,
+    sessionId: 's-1',
+    role: null,
+    lane: 'subagent',
+    charge: null,
+    chargeKey: null,
+    chargeSource: 'unlinked',
     ...over,
   }
 }
@@ -99,6 +105,9 @@ const node = (id: number) => screen.getByTestId(`node-${id}`)
 const y = (id: number) => Number(node(id).dataset.y)
 const pos = (id: number) => ({ x: node(id).dataset.x, y: node(id).dataset.y })
 const card = (name: string) => screen.getByRole('button', { name: new RegExp(name) })
+/** A card's charge chip: the last thing on its detail line. */
+const chip = (card: HTMLElement) =>
+  card.querySelector('[data-slot="detail"] [data-slot="charge"]') as HTMLElement
 
 beforeEach(() => {
   resetFlow()
@@ -146,6 +155,20 @@ describe('live graph', () => {
     expect(screen.getByTestId('edge-1-2').dataset.stroke).toBe('rgb(var(--muted-foreground) / 0.5)')
   })
 
+  it('draws an edge kind it does not know in the default style', async () => {
+    const launched: LiveGraph = {
+      ...tiered,
+      agents: [...tiered.agents, agent({ id: 5, kind: 'orchestrator', parent: 1, lane: 'cloud' })],
+      edges: [...tiered.edges, { kind: 'launch', parent: 1, child: 5 }],
+    }
+    render(view({ graph: launched }))
+    await screen.findByTestId('flow')
+    const edge = screen.getByTestId('edge-1-5')
+    expect(edge.dataset.dash).toBeUndefined()
+    expect(edge.dataset.stroke).toBe('rgb(var(--muted-foreground) / 0.5)')
+    expect(y(1)).toBeLessThan(y(5))
+  })
+
   it('pins nodes in place: no dragging, no connecting, handles top and bottom', async () => {
     render(view({}))
     await screen.findByTestId('flow')
@@ -191,19 +214,174 @@ describe('node cards', () => {
     expect(card('builder')).toHaveAttribute('data-agent', '2')
   })
 
-  it('names the agent by name, then type, then kind', async () => {
+  it('shows role, charge chip, lane, state, $ and context % on a node', async () => {
     const graph: LiveGraph = {
       ...tiered,
       agents: [
-        agent({ id: 1, name: null, agentType: 'implementer', description: 'Build it' }),
-        agent({ id: 2, name: null, kind: 'teammate', model: 'claude-opus-5-5' }),
+        agent({
+          id: 1,
+          kind: 'orchestrator',
+          agentId: null,
+          name: 'director_topic_company-model',
+          role: 'director',
+          lane: 'interactive',
+          charge: { kind: 'topic', repo: null, number: null, topic: 'company-model' },
+          chargeKey: 'topic_company-model',
+          chargeSource: 'name',
+          state: 'needs_you',
+          costUsd: 1.234,
+          contextPct: 41.6,
+        }),
       ],
       edges: [],
     }
     render(view({ graph }))
     await screen.findByTestId('flow')
-    expect(card('implementer')).toHaveTextContent('Build it')
-    expect(card('teammate')).toHaveTextContent('claude-opus-5-5')
+    const node = card('director')
+    // The role names the node; the charge has its own chip, so the full name isn't repeated.
+    expect(node).not.toHaveTextContent('director_topic_company-model')
+    expect(chip(node)).toHaveTextContent(/^topic_company-model$/)
+    expect(node).toHaveTextContent('interactive')
+    expect(node).toHaveTextContent('needs you')
+    expect(node).toHaveTextContent('$1.23')
+    expect(node).toHaveTextContent('42%')
+  })
+
+  it('puts the short lane first and the chip last, the chip shrinking to fit the row', async () => {
+    const graph: LiveGraph = {
+      ...tiered,
+      agents: [
+        agent({
+          id: 1,
+          name: 'builder',
+          lane: 'background-session',
+          chargeKey: 'issue_strate-109',
+          chargeSource: 'branch',
+        }),
+      ],
+      edges: [],
+    }
+    render(view({ graph }))
+    await screen.findByTestId('flow')
+    const node = card('builder')
+    const detail = node.querySelector('[data-slot="detail"]') as HTMLElement
+    expect(detail).toHaveTextContent(/^background\s+issue_strate-109$/)
+    // A long key ellipsizes inside its chip; the lane keeps its room.
+    const key = within(node).getByText('issue_strate-109')
+    expect(key).toHaveClass('min-w-0', 'truncate')
+    expect(chip(node)).toHaveClass('min-w-0', 'max-w-full')
+    expect(within(detail).getByText('background')).toHaveClass('shrink-0')
+  })
+
+  it("keeps the chip to the badge's own type, with no second weight stacked on it", async () => {
+    render(view({ graph: { ...tiered, agents: [agent({ id: 1, name: 'loose' })], edges: [] } }))
+    await screen.findByTestId('flow')
+    const weights = [...chip(card('loose')).classList].filter((c) =>
+      /^font-(thin|extralight|light|normal|medium|semibold|bold|extrabold|black)$/.test(c),
+    )
+    expect(weights).toHaveLength(1)
+  })
+
+  it('reads $, state, lane and charge as separate words', async () => {
+    const graph: LiveGraph = {
+      ...tiered,
+      agents: [
+        agent({
+          id: 1,
+          name: 'builder',
+          state: 'needs_you',
+          costUsd: 1.234,
+          lane: 'subagent',
+          chargeKey: 'issue_strate-109',
+          chargeSource: 'branch',
+          contextPct: 41.6,
+        }),
+      ],
+      edges: [],
+    }
+    render(view({ graph }))
+    await screen.findByTestId('flow')
+    const node = card('builder')
+    expect(node).toHaveAccessibleName(/\$1\.23 needs you/)
+    expect(node).toHaveAccessibleName(/subagent issue_strate-109\s/)
+  })
+
+  it('names a node with no role by its name, then type, then kind', async () => {
+    const graph: LiveGraph = {
+      ...tiered,
+      agents: [
+        agent({ id: 1, name: 'researcher' }),
+        agent({ id: 2, name: null, agentType: 'implementer' }),
+        agent({ id: 3, name: null, kind: 'teammate' }),
+      ],
+      edges: [],
+    }
+    render(view({ graph }))
+    await screen.findByTestId('flow')
+    expect(card('researcher')).toHaveAttribute('data-agent', '1')
+    expect(card('implementer')).toHaveAttribute('data-agent', '2')
+    expect(card('teammate')).toHaveAttribute('data-agent', '3')
+  })
+
+  it('shows an Unlinked chip, and the $ with no priced request or gauge', async () => {
+    render(view({ graph: { ...tiered, agents: [agent({ id: 1, name: 'loose' })], edges: [] } }))
+    await screen.findByTestId('flow')
+    expect(chip(card('loose'))).toHaveTextContent(/^unlinked$/)
+    expect(card('loose')).toHaveAccessibleDescription('no charge')
+    expect(card('loose')).toHaveTextContent('$—')
+    expect(within(card('loose')).queryByRole('meter')).not.toBeInTheDocument()
+  })
+
+  it('says where an inherited charge came from', async () => {
+    const graph: LiveGraph = {
+      ...tiered,
+      agents: [agent({ id: 1, name: 'helper', chargeKey: 'pr_strate-12', chargeSource: 'parent' })],
+      edges: [],
+    }
+    render(view({ graph }))
+    await screen.findByTestId('flow')
+    expect(chip(card('helper'))).toHaveTextContent('pr_strate-12')
+    // On the card itself, so keyboard and screen-reader users get it too, not only a mouse hover.
+    expect(card('helper')).toHaveAccessibleDescription('charge from parent')
+  })
+
+  it('names each lane, and shows one it does not know as it came', async () => {
+    const graph: LiveGraph = {
+      ...tiered,
+      agents: [
+        agent({ id: 1, name: 'worker', lane: 'subagent' }),
+        agent({ id: 2, name: 'spawned', lane: 'background-session' }),
+        agent({ id: 3, name: 'remote', lane: 'cloud' }),
+      ],
+      edges: [],
+    }
+    render(view({ graph }))
+    await screen.findByTestId('flow')
+    expect(card('worker')).toHaveTextContent('subagent')
+    expect(card('spawned')).toHaveTextContent('background')
+    expect(card('remote')).toHaveTextContent('cloud')
+  })
+
+  it("offers the description, then the charge's source, on hover and as the card's description", async () => {
+    const graph: LiveGraph = {
+      ...tiered,
+      agents: [
+        agent({
+          id: 1,
+          name: 'builder',
+          description: 'Build the shell',
+          chargeKey: 'issue_strate-109',
+          chargeSource: 'name',
+        }),
+        agent({ id: 2, name: 'quiet' }),
+      ],
+      edges: [],
+    }
+    render(view({ graph }))
+    await screen.findByTestId('flow')
+    expect(card('builder')).toHaveAttribute('title', 'Build the shell\ncharge from name')
+    expect(card('builder')).toHaveAccessibleDescription(/Build the shell\s+charge from name/)
+    expect(card('quiet')).toHaveAttribute('title', 'no charge')
   })
 
   it('colours every gauge against the fixed nudge 80% and hard stop 95%', async () => {

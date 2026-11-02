@@ -30,6 +30,12 @@ function agent(id: number, parent: number | null = null): GraphAgent {
     contextTokens: null,
     contextPct: null,
     parent,
+    sessionId: 's',
+    role: null,
+    lane: parent === null ? 'interactive' : 'subagent',
+    charge: null,
+    chargeKey: null,
+    chargeSource: 'unlinked',
   }
 }
 

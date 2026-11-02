@@ -1,6 +1,6 @@
 // Display formatting for the shell, following the mockup's copy.
 import type { AgentNodeState } from '@crawfordyoung/ui'
-import type { AgentState, LiveGraph, Workstream } from './api'
+import type { AgentState, Lane, LiveGraph, Workstream } from './api'
 
 /** Dollars to the cent; a dash when nothing is priced. */
 export function money(usd: number | null): string {
@@ -16,6 +16,34 @@ export function duration(ms: number): string {
   if (d) return `${d}d ${h}h`
   return h ? `${h}h ${m}m` : `${m}m`
 }
+
+const LANE_LABEL: ReadonlyMap<string, string> = new Map([
+  ['subagent', 'subagent'],
+  ['background-session', 'background'],
+  ['interactive', 'interactive'],
+])
+
+/** A lane in short; one this build doesn't know shows as it came. */
+export function laneLabel(lane: Lane): string {
+  return LANE_LABEL.get(lane) ?? lane
+}
+
+const pad = (n: number) => String(n).padStart(2, '0')
+
+/** An ISO time on the local wall clock, `HH:MM:SS`; one that doesn't parse shows as it came. */
+export function clockTime(iso: string): string {
+  const t = new Date(iso)
+  if (Number.isNaN(t.getTime())) return iso
+  return `${pad(t.getHours())}:${pad(t.getMinutes())}:${pad(t.getSeconds())}`
+}
+
+/** Each state in words. */
+export const STATE_LABEL = {
+  working: 'working',
+  needs_you: 'needs you',
+  idle: 'idle',
+  done: 'done',
+} as const satisfies Record<AgentState, string>
 
 /** The library spells `needs_you` as `needs-you`. */
 export function nodeState(state: AgentState): AgentNodeState {

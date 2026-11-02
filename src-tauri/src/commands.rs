@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use rusqlite::Connection;
 use strate_core::store::Store;
 use strate_core::store::views::{
-    self, Audit, AuditFilter, LiveGraph, NeedsYou, NodeKind, Performance, TimelineDay, Workstream,
-    WorkstreamCost,
+    self, Audit, AuditFilter, LiveGraph, NeedsYou, NodeKind, Performance, TimelineDay,
+    TranscriptEntry, Workstream, WorkstreamCost,
 };
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
@@ -61,11 +61,25 @@ pub fn needs_you(reader: State<'_, Reader>) -> Result<Vec<NeedsYou>, String> {
     reader.read(views::needs_you)
 }
 
-/// The drawn link of tab `workstream`: its agents and dispatch and teammate
-/// edges, never earlier links', plus the live sessions it spawned.
+/// The running tree beneath tab `workstream`: its drawn link's agents,
+/// never earlier links', plus every live chain beneath it at any depth.
 #[tauri::command(async)]
 pub fn live_graph(reader: State<'_, Reader>, workstream: i64) -> Result<Option<LiveGraph>, String> {
     reader.read(|conn| views::live_graph(conn, workstream))
+}
+
+/// Agent row `agent`'s own records as console entries, in transcript
+/// order, every tool call with its result; an unknown agent has none.
+#[tauri::command(async)]
+pub fn agent_transcript(
+    reader: State<'_, Reader>,
+    agent: i64,
+) -> Result<Vec<TranscriptEntry>, String> {
+    transcript(&reader, agent)
+}
+
+fn transcript(reader: &Reader, agent: i64) -> Result<Vec<TranscriptEntry>, String> {
+    reader.read(|conn| views::agent_transcript(conn, agent))
 }
 
 /// The Audit tree and headline for `filter`, over the stored cells and
@@ -194,6 +208,46 @@ mod tests {
         assert!(!err.is_empty());
 
         assert!(Reader::open(&dir.join("missing.db")).is_err());
+        drop(reader);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn an_agents_transcript_is_read_by_its_row_id() {
+        let dir = std::env::temp_dir().join(format!("strate-transcript-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let db = dir.join("strate.db");
+        drop(Store::open(&db).expect("store"));
+        let prompt = r#"{"type":"user","timestamp":"2026-10-07T10:00:00.000Z",
+            "message":{"role":"user","content":"Lorem ipsum."}}"#;
+        let writer = Connection::open(&db).expect("writer");
+        writer
+            .execute_batch(
+                "INSERT INTO sessions (session_id) VALUES ('s');
+                 INSERT INTO agents (id, session_id, agent_id, kind) VALUES
+                     (1, 's', NULL, 'orchestrator');",
+            )
+            .expect("agent");
+        writer
+            .execute(
+                "INSERT INTO events (session_id, agent_id, file, byte_offset, type, raw)
+                 VALUES ('s', NULL, 's', 0, 'user', ?1)",
+                [prompt],
+            )
+            .expect("record");
+        drop(writer);
+
+        let reader = Reader::open(&db).expect("reader");
+        let entries = transcript(&reader, 1).expect("a transcript");
+        let json = serde_json::to_value(&entries).expect("json");
+        assert_eq!(
+            json,
+            serde_json::json!([
+                {"timestamp": "2026-10-07T10:00:00.000Z", "kind": "user", "text": "Lorem ipsum."}
+            ])
+        );
+        assert_eq!(transcript(&reader, 99), Ok(vec![]), "an unknown agent");
         drop(reader);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }

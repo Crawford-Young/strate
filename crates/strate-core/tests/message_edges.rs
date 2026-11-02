@@ -2,9 +2,9 @@
 //! `tests/fixtures/directs-home`: the msg_id a session sent and the peer
 //! msg_id it received, and the edges rebuilt from them (whatever either
 //! side is named, and whatever order the transcripts arrive in); and the
-//! views over them: a spawned chain's tab nested under its spawner's live
-//! tab, and the spawned sessions on its canvas. Every db lives in a temp
-//! dir.
+//! views over them: a spawned chain's tab nested under its root (the
+//! topmost live tab of its spawn ancestry), and the running tree on that
+//! tab's canvas. Every db lives in a temp dir.
 
 use std::path::{Path, PathBuf};
 
@@ -373,7 +373,8 @@ fn a_spawned_tab_nests_under_its_spawners_tab_only_while_that_one_is_live() {
         .expect("spawners live");
     // N2 nests by its spawner, R1's subagent; Q3 under general-notes, no
     // director's name needed. X2 nests under X1 (its message back was
-    // refused, so not the other way), so N4, X2's, keeps its own tab.
+    // refused, so not the other way), and N4, X2's, under X1 too: a tab
+    // nests under its root (#109).
     assert_eq!(
         nesting(&reader),
         vec![
@@ -385,7 +386,7 @@ fn a_spawned_tab_nests_under_its_spawners_tab_only_while_that_one_is_live() {
             ("Q3", Some("Q1")),
             ("X1", None),
             ("X2", Some("X1")),
-            ("N4", None),
+            ("N4", Some("X1")),
         ]
     );
 
@@ -408,7 +409,7 @@ fn every_live_session_is_visible(rows: &[Workstream]) {
 }
 
 #[test]
-fn a_unit_of_a_nested_unit_keeps_its_own_tab() {
+fn a_unit_of_a_nested_unit_nests_under_the_root_tab() {
     let t = Temp::new("grandchild");
     let (mut store, reader) = viewed(&t);
     let chain = |reader: &Connection| -> Vec<(&str, Option<&str>)> {
@@ -429,24 +430,49 @@ fn a_unit_of_a_nested_unit_keeps_its_own_tab() {
         .expect("live");
     assert_eq!(
         chain(&reader),
-        vec![("X1", None), ("X2", Some("X1")), ("N4", None)]
+        vec![("X1", None), ("X2", Some("X1")), ("N4", Some("X1"))]
     );
-    // Folding is one level: N4's wait shows on its own tab, not on X1's.
+    // N4's wait shows on its own tab and every tab it nests under.
     let rows = views::workstreams(&reader).expect("workstreams");
     let needs = |label: &str| {
         let w = tab(&reader, &rows, label);
         (w.needs_you, w.state)
     };
     assert_eq!(needs("N4"), (1, AgentState::NeedsYou));
-    assert_eq!(needs("X2"), (0, AgentState::Idle));
-    assert_eq!(needs("X1"), (0, AgentState::Working));
+    assert_eq!(needs("X2"), (1, AgentState::NeedsYou));
+    assert_eq!(needs("X1"), (1, AgentState::NeedsYou));
+    let waits = views::needs_you(&reader).expect("needs_you");
+    assert_eq!(
+        waits.iter().map(|n| n.workstream).collect::<Vec<_>>(),
+        [Some(tab_id(&reader, "N4"))],
+        "a wait names its own chain's tab, whose director (above) is the root"
+    );
+    // X1's canvas draws the whole running tree: X2 under X1, N4 under X2.
+    let graph = views::live_graph(&reader, tab_id(&reader, "X1"))
+        .expect("query")
+        .expect("a graph");
+    let ids: Vec<i64> = graph.agents.iter().map(|a| a.id).collect();
+    assert_eq!(
+        ids,
+        ["X1", "X2", "N4"].map(|l| tab_id(&reader, l)),
+        "{graph:?}"
+    );
+    let edges: Vec<(&str, i64, i64)> = graph
+        .edges
+        .iter()
+        .map(|e| (e.kind.as_str(), e.parent, e.child))
+        .collect();
+    assert_eq!(
+        edges,
+        [("directs", ids[0], ids[1]), ("directs", ids[1], ids[2])]
+    );
 
-    // X2 waiting shows on X1's tab.
+    // X2 waiting too shows on X1's tab.
     store
         .apply_registry(&[listed(4103, X2, "director-beta", "waiting")])
         .expect("X2 waits");
     let rows = views::workstreams(&reader).expect("workstreams");
-    assert_eq!(tab(&reader, &rows, "X1").needs_you, 1);
+    assert_eq!(tab(&reader, &rows, "X1").needs_you, 2);
 
     // With X1 gone, X2 is a tab and N4 nests under it.
     store
@@ -481,6 +507,11 @@ fn a_spawners_tab_counts_what_its_nested_units_need() {
         needs.iter().map(|n| n.workstream).collect::<Vec<_>>(),
         [Some(tab_id(&reader, "N1"))],
         "a wait names its own chain's tab"
+    );
+    assert_eq!(
+        tab(&reader, &rows, "N1").director,
+        Some(tab_id(&reader, "R")),
+        "whose director is the root tab"
     );
 
     store

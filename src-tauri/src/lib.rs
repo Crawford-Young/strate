@@ -23,6 +23,7 @@ pub fn run() {
             commands::workstream_costs,
             commands::needs_you,
             commands::live_graph,
+            commands::agent_transcript,
             commands::audit_rollup,
             commands::audit_timeline,
             commands::audit_performance,
