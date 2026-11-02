@@ -226,6 +226,13 @@ fn read_object(path: &Path, warnings: &mut Vec<Warning>) -> Option<Map<String, V
     }
 }
 
+/// The meta `finished` of the subagent whose transcript is `transcript`,
+/// read now: a linked subagent's records start no discovery pass, so its
+/// batch reads it too (#108). `None` when the meta is missing, unreadable or says nothing.
+pub(crate) fn meta_finished(transcript: &Path, agent_id: &str) -> Option<bool> {
+    read_meta(transcript, agent_id, &mut Vec::new())?.finished
+}
+
 fn read_meta(
     transcript: &Path,
     agent_id: &str,
@@ -249,6 +256,7 @@ fn read_meta(
         parent_agent_id: text("parentAgentId"),
         name: text("name"),
         team_name: text("teamName"),
+        finished: map.get("finished").and_then(Value::as_bool),
     })
 }
 
@@ -530,6 +538,40 @@ mod tests {
         assert_eq!(scalar_text(&Value::from(3)), Some("3".to_string()));
         assert_eq!(scalar_text(&serde_json::json!({"level": 3})), None);
         assert_eq!(scalar_text(&Value::Null), None);
+    }
+
+    #[test]
+    fn meta_finished_reads_a_boolean_and_stays_none_while_running() {
+        let root =
+            std::env::temp_dir().join(format!("strate-core-finished-{}", std::process::id()));
+        let subagents = root.join("projects/-work-x/s1/subagents");
+        fs::create_dir_all(&subagents).expect("temp dirs");
+        for (id, meta) in [
+            ("a1", r#"{"agentType":"x","finished":true}"#),
+            ("a2", r#"{"agentType":"x"}"#),
+            ("a3", r#"{"agentType":"x","finished":"yes"}"#),
+        ] {
+            fs::write(
+                subagents.join(format!("agent-{id}.jsonl")),
+                "{\"type\":\"user\"}\n",
+            )
+            .expect("write");
+            fs::write(subagents.join(format!("agent-{id}.meta.json")), meta).expect("write");
+        }
+
+        let g = discover(&root).expect("readable root");
+        fs::remove_dir_all(&root).expect("cleanup");
+
+        let finished = |id: &str| {
+            g.subagents
+                .iter()
+                .find(|s| s.agent_id == id)
+                .and_then(|s| s.meta.as_ref())
+                .and_then(|m| m.finished)
+        };
+        assert_eq!(finished("a1"), Some(true));
+        assert_eq!(finished("a2"), None, "absent while the subagent runs");
+        assert_eq!(finished("a3"), None, "only a boolean counts");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ and github/audit-home.json for #26, nest-home/ and github/nest-home.json for #47, perf-home/ and github/perf-home.json for #51, directs-home/ for #53, chain-home/ for #63, teams-home/ for #83, model-home/ and github/model-home.json for #107). Field names come from
+# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ and github/audit-home.json for #26, nest-home/ and github/nest-home.json for #47, perf-home/ and github/perf-home.json for #51, directs-home/ for #53, chain-home/ for #63, teams-home/ for #83, model-home/ and github/model-home.json for #107, lanes-home/ for #108). Field names come from
 # the "~/.claude format, as observed" comment on strate #10; every value is a placeholder.
 set -eu
 cd "$(dirname "$0")/.."
@@ -846,3 +846,53 @@ cat > fixtures/github/model-home.json <<'JSON'
  "subIssuesSummary":{"total":0,"completed":0},"closedByPullRequestsReferences":{"nodes":[]}}
 ]}}}}
 JSON
+
+# ---- lanes-home: every lane (#108); hand values in tests/lanes.rs ----
+# 2026-10-20Z. L1 dispatches b1 (answered: finished), then b2, b3 and b4 in
+# the background (async_launched launch results): b2's meta says finished,
+# b3 still runs (no `finished`), and b4's task notification arrives. L2 runs
+# `claude --bg -n lorem-unit`, whose result prints short id c0ffee01: the
+# test's background registry row naming L3. L4 messages L3 first, but L3
+# hangs under L2 by the launch.
+H=fixtures/lanes-home
+L1=5e55f2f2-0000-4000-8000-0000000000e1
+L2=5e55f2f2-0000-4000-8000-0000000000e2
+L3=5e55f2f2-0000-4000-8000-0000000000e3
+L4=5e55f2f2-0000-4000-8000-0000000000e4
+LB1=a9100000000000001
+LB2=a9100000000000002
+LB3=a9100000000000003
+LB4=a9100000000000004
+LD="$H/projects/-work-lanes"
+rm -rf "$H"
+mkdir -p "$LD/$L1/subagents"
+lm() { echo "5e55ff22-0000-4000-8000-00000000000$1"; }
+LT=2026-10-20T10
+aat $L1 /work/lanes "\"isSidechain\":false,\"session_id\":\"$L1\""
+{ aprompt $LT:00:00 l1-01
+  gdispatch $LT:01:00 l1-02 req_l1-02 toolu_l1a; aresult $LT:01:01 l1-03 toolu_l1a
+  gdispatch $LT:02:00 l1-04 req_l1-04 toolu_l1b; alaunch $LT:02:01 l1-05 toolu_l1b $LB2
+  gdispatch $LT:03:00 l1-06 req_l1-06 toolu_l1c; alaunch $LT:03:01 l1-07 toolu_l1c $LB3
+  gdispatch $LT:04:00 l1-08 req_l1-08 toolu_l1d; alaunch $LT:04:01 l1-09 toolu_l1d $LB4
+  gnotice $LT:09:00 l1-10 "$(note $LB4 toolu_l1d completed)"
+} > "$LD/$L1.jsonl"
+lsub() { # agentId minute toolUseId [extra meta keys]: a subagent of L1
+  aat $L1 /work/lanes "\"isSidechain\":true,\"agentId\":\"$1\""
+  { atask $LT:0$2:10 "$1-01"; areply $LT:0$2:20 "$1-02" "req_$1-02" $SONNET "$US" "$TEXT"; } > "$LD/$L1/subagents/agent-$1.jsonl"
+  mmeta implementer "Lorem task" "\"toolUseId\":\"$3\"${4:+,$4}" > "$LD/$L1/subagents/agent-$1.meta.json"
+}
+lsub $LB1 1 toolu_l1a
+lsub $LB2 2 toolu_l1b '"finished":true'
+lsub $LB3 3 toolu_l1c
+lsub $LB4 4 toolu_l1d
+STARTED='Started background session c0ffee01.\nAttach: claude attach c0ffee01'
+aat $L2 /work/lanes "\"isSidechain\":false,\"session_id\":\"$L2\""
+{ aprompt $LT:40:00 l2-01
+  areply $LT:40:10 l2-02 req_l2-02 $OPUS "$UO" "$(ktool toolu_l2l Bash '{"command":"claude --bg -n lorem-unit \"Lorem ipsum.\"","description":"Lorem"}')"
+  aenv $LT:40:12 l2-03; echo "{$AE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_l2l\",\"content\":\"$STARTED\",\"is_error\":false}]},\"toolUseResult\":{\"stdout\":\"$STARTED\",\"stderr\":\"\",\"interrupted\":false}}"
+} > "$LD/$L2.jsonl"
+aat $L3 /work/lanes "\"isSidechain\":false,\"session_id\":\"$L3\""
+{ aprompt $LT:40:15 l3-01; dpeer $LT:40:31 l3-02 "$(lm 1)" lorem
+  areply $LT:40:40 l3-03 req_l3-03 $OPUS "$UO" "$TEXT"; } > "$LD/$L3.jsonl"
+aat $L4 /work/lanes "\"isSidechain\":false,\"session_id\":\"$L4\""
+{ aprompt $LT:39:00 l4-01; dsend $LT:40 l4-02 lorem-unit "$(lm 1)"; } > "$LD/$L4.jsonl"

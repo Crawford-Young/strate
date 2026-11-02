@@ -5,6 +5,7 @@
 
 mod config_dir;
 mod jsonl;
+mod launch;
 mod scan;
 
 use std::io;
@@ -14,7 +15,8 @@ use serde_json::Value;
 
 pub use config_dir::resolve_config_dir;
 pub(crate) use jsonl::parse_line;
-pub(crate) use scan::{is_transcript, scalar_text, transcript_paths};
+pub use launch::{Launch, launches};
+pub(crate) use scan::{is_transcript, meta_finished, scalar_text, transcript_paths};
 
 /// Everything discovered under one config dir.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -82,6 +84,9 @@ pub struct SubagentMeta {
     pub name: Option<String>,
     /// Teammate team, matching a [`TeamNode::name`].
     pub team_name: Option<String>,
+    /// `finished`: `true` once the subagent finished (CLI 2.1.314,
+    /// observed 2026-10). Absent while it runs; only a boolean counts.
+    pub finished: Option<bool>,
 }
 
 /// How a subagent node attaches to the rest of the graph.

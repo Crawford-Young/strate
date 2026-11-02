@@ -14,31 +14,57 @@
 //!   description that parses; a bare form only from an orchestrator's
 //!   own title (`fix-step-2`, `unit-3`, a registry `code-42` are no
 //!   issues).
-//! - Parent (view `spawn_parents`): its dispatch, teammate or message edge.
-//!   A session's orchestrator hangs (`message`) under its first messager:
-//!   the agent whose record holds the msg_id of a SendMessage result that
-//!   one of the session's records received, by receipt time, then msg_id,
-//!   refusing one whose parent descends from the session through any spawn
-//!   edge.
+//! - Parent (view `spawn_parents`): its dispatch, teammate, launch or
+//!   message edge, in that order.
+//!   - A background session's orchestrator hangs (`launch`, #108) under the
+//!     agent whose Bash or PowerShell tool_use ran the `claude --bg`
+//!     command that started it (table `launches`, [`launches`]): the
+//!     session its `--resume` names, else the earliest link, started at or
+//!     after it, of the `/clear` chain of the background registry row
+//!     whose short id its result prints as a whole token, else the
+//!     earliest background-lane orchestrator named as its `--name`
+//!     (trimmed, case-folded; its own name, else its registry name) that
+//!     started at or after it. Launches go in time order, those naming
+//!     their child by resume or short id before those by name alone: each
+//!     links at most one child and a child takes the first launch to
+//!     reach it, refusing one whose parent descends from the child through
+//!     a dispatch, teammate or earlier launch edge.
+//!   - A session's orchestrator hangs (`message`) under its first
+//!     messager: the agent whose record holds the msg_id of a SendMessage
+//!     result that one of the session's records received, by receipt time,
+//!     then msg_id, refusing one whose parent descends from the session
+//!     through any spawn edge.
+//! - Finished (a subagent's; never a teammate's, whose rests and lead's
+//!   registry row say liveness): its meta.json `finished` (`agents.finished`,
+//!   sticky), its task notification, or its dispatch answered
+//!   (`agents.dispatch_result`; a background dispatch's `async_launched`
+//!   launch result is no answer, and marks it background).
 //! - Effective charge (view `agent_charges`): its own, else its nearest
 //!   spawn ancestor's own, else Unlinked.
 //!
 //! Every stored value is a function of stored rows, recomputed whenever a
 //! batch, graph, registry poll or GitHub refresh changes an input, so an
-//! incremental build equals a cold one.
+//! incremental build equals a cold one. Meta `finished` is the exception:
+//! it is read from disk at a discovery pass (not every scan). The meta is written after
+//! the subagent's last record, so a batch on its transcript (which re-reads
+//! it while unset) rarely sees it; its task notification or dispatch
+//! answer usually finishes it first.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
+use serde_json::Value;
 
 use super::Result;
 use crate::charge::{Charge, ChargeKind, NameForm, ParsedName, parse_agent_name};
+use crate::discovery::launches;
 
 /// What the stored model was built by, under meta `model`: a store at
 /// another version (one from before v21 too) is rebuilt on open. Bump it
-/// when resolution changes.
-const MODEL_VERSION: &str = "1";
+/// when resolution changes. v2 (#108) derives the launches and dispatch
+/// results.
+const MODEL_VERSION: &str = "2";
 
 /// Where an agent runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -87,8 +113,19 @@ pub struct ModelAgent {
     pub charge_source: ChargeSource,
     /// The spawn parent's row id.
     pub parent: Option<i64>,
-    /// dispatch | teammate | message.
+    /// dispatch | teammate | launch | message.
     pub parent_via: Option<String>,
+    /// A subagent's finished signal: its meta.json says so, its task
+    /// notification arrived, or its dispatch was answered (a background
+    /// dispatch's `async_launched` result is no answer). Never set for a
+    /// teammate (no dispatch, meta `finished` or notification) or an
+    /// orchestrator. `false` is not running: a worker whose lead exited
+    /// never finishes. Liveness comes from the lead's registry row and a
+    /// teammate's rests (as `views.rs` `session_agents` does).
+    pub finished: bool,
+    /// A worker dispatched in the background: its dispatch's tool_result
+    /// is `async_launched`.
+    pub background: bool,
 }
 
 /// The registry name of orchestrator `a`: of the newest row (a live one
@@ -106,7 +143,11 @@ pub fn agent_model(conn: &Connection) -> Result<Vec<ModelAgent>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT a.id, a.session_id, a.agent_id, a.kind, l.lane, a.role,
              coalesce(a.name, CASE WHEN a.agent_id IS NULL THEN {REGISTRY_NAME} END),
-             c.kind, c.repo, c.number, c.topic, x.source, p.parent, p.kind
+             c.kind, c.repo, c.number, c.topic, x.source, p.parent, p.kind,
+             a.agent_id IS NOT NULL AND (a.finished IS 1 OR a.dispatch_result IS 'answered'
+                 OR EXISTS (SELECT 1 FROM events AS n
+                     WHERE n.session_id = a.session_id AND n.notification_task = a.agent_id)),
+             a.dispatch_result IS 'async_launched'
          FROM agents AS a
          JOIN agent_lanes AS l ON l.agent = a.id
          JOIN agent_charges AS x ON x.agent = a.id
@@ -127,6 +168,8 @@ pub fn agent_model(conn: &Connection) -> Result<Vec<ModelAgent>> {
             charge_source: source(&r.get::<_, String>(11)?),
             parent: r.get(12)?,
             parent_via: r.get(13)?,
+            finished: r.get(14)?,
+            background: r.get(15)?,
         })
     })?
     .collect()
@@ -182,14 +225,88 @@ pub(super) fn refresh(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Rebuilds every agent's role and own charge, and the message edges.
+/// Rebuilds every agent's role, own charge and dispatch result, the
+/// launches from the stored events, and the launch and message edges.
 pub(super) fn rebuild(conn: &Connection) -> Result<()> {
     let all: Vec<i64> = conn
         .prepare("SELECT id FROM agents ORDER BY id")?
         .query_map([], |r| r.get(0))?
         .collect::<Result<_>>()?;
     resolve(conn, all)?;
+    dispatch_results(conn)?;
+    derive_launches(conn)?;
+    launch_edges(conn)?;
     messages(conn)
+}
+
+/// Each dispatched subagent and the first stored event holding its
+/// dispatch's tool_result. CROSS JOIN keeps the events outermost: read
+/// once, not once per edge.
+const DISPATCH_RESULTS_SQL: &str = "SELECT d.child, min(e.id) AS event
+    FROM events AS e CROSS JOIN json_each(e.tool_results) AS j
+    CROSS JOIN edges AS d ON d.kind = 'dispatch' AND d.tool_use_id = j.value
+    WHERE e.tool_results IS NOT NULL
+    GROUP BY d.child";
+
+/// Each stored launch's tool_use id and the first stored event holding its
+/// tool_result, the events read once as in [`DISPATCH_RESULTS_SQL`].
+const LAUNCH_RESULTS_SQL: &str = "SELECT l.tool_use_id, min(e.id) AS event
+    FROM events AS e CROSS JOIN json_each(e.tool_results) AS j
+    CROSS JOIN launches AS l ON l.tool_use_id = j.value
+    WHERE e.tool_results IS NOT NULL
+    GROUP BY l.tool_use_id";
+
+/// Every subagent's dispatch result, from its dispatch's first stored
+/// tool_result.
+fn dispatch_results(conn: &Connection) -> Result<()> {
+    conn.execute_batch(&format!(
+        "UPDATE agents SET dispatch_result = NULL WHERE dispatch_result IS NOT NULL;
+         WITH r AS ({DISPATCH_RESULTS_SQL})
+         UPDATE agents SET dispatch_result = (
+             SELECT CASE WHEN json_extract(x.raw, '$.toolUseResult.status') IS 'async_launched'
+                 THEN 'async_launched' ELSE 'answered' END
+             FROM events AS x WHERE x.id = r.event)
+         FROM r WHERE agents.id = r.child;"
+    ))
+}
+
+/// Re-derives the `launches` table from the stored Bash and PowerShell
+/// tool_uses that mention a `--b…` flag.
+fn derive_launches(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM launches", [])?;
+    let records: Vec<(i64, String)> = conn
+        .prepare(
+            "SELECT a.id, e.raw FROM events AS e
+             JOIN agents AS a ON a.session_id = e.session_id
+                 AND ifnull(a.agent_id, '') = ifnull(e.agent_id, '')
+             WHERE e.tool_uses IS NOT NULL
+                 AND (e.tool_uses LIKE '%\"Bash\"]%' OR e.tool_uses LIKE '%\"PowerShell\"]%')
+                 AND instr(e.raw, '--b') > 0
+             ORDER BY e.id",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_>>()?;
+    let mut any = false;
+    for (agent, raw) in records {
+        if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+            any |= launch_record(conn, agent, &value, false)?;
+        }
+    }
+    if !any {
+        return Ok(());
+    }
+    // Every result at once, not a scan of the launcher's events per launch.
+    let found: Vec<(String, i64)> = conn
+        .prepare(LAUNCH_RESULTS_SQL)?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<Result<_>>()?;
+    for (id, event) in found {
+        let raw: String = conn
+            .prepare_cached("SELECT raw FROM events WHERE id = ?1")?
+            .query_row([event], |r| r.get(0))?;
+        result_in(conn, &id, &raw)?;
+    }
+    Ok(())
 }
 
 /// After a batch of `session_id`: its transcript's agent (`agent`, when it
@@ -202,13 +319,16 @@ pub(super) fn batch(conn: &Connection, session_id: &str, agent: Option<i64>) -> 
 }
 
 /// After a registry row naming `session_id` changed: its chain's
-/// orchestrators.
+/// orchestrators, and the launch edges, which read background rows' short
+/// ids, names and lanes.
 pub(super) fn listed(conn: &Connection, session_id: &str) -> Result<()> {
-    resolve(conn, chain_orchestrators(conn, session_id)?)
+    resolve(conn, chain_orchestrators(conn, session_id)?)?;
+    relaunch(conn, false)
 }
 
-/// After a discovery graph: every agent of `sessions`, then the message
-/// edges, whose cycle check walks the graph's dispatch and teammate edges.
+/// After a discovery graph: every agent of `sessions`, then the launch and
+/// message edges, whose cycle checks walk the graph's dispatch and teammate
+/// edges.
 pub(super) fn graph<'a>(
     conn: &Connection,
     sessions: impl IntoIterator<Item = &'a str>,
@@ -221,7 +341,19 @@ pub(super) fn graph<'a>(
         }
     }
     resolve(conn, ids)?;
+    launch_edges(conn)?;
     messages(conn)
+}
+
+/// After something a launch edge reads may have changed (a launch or its
+/// result, a background registry row, an orchestrator's name or start):
+/// rebuilds the launch edges, then the message edges when those changed or
+/// `messaged` (the batch stored a cross-session message).
+pub(super) fn relaunch(conn: &Connection, messaged: bool) -> Result<()> {
+    if launch_edges(conn)? || messaged {
+        messages(conn)?;
+    }
+    Ok(())
 }
 
 /// After a GitHub refresh: every agent on a branch that can head a PR.
@@ -408,15 +540,7 @@ fn charge_id(conn: &Connection, c: &Charge) -> Result<i64> {
 /// orchestrator under its first messager (see the module doc), a
 /// candidate whose parent it is an ancestor of refused for the next.
 pub(super) fn messages(conn: &Connection) -> Result<()> {
-    let mut up: HashMap<i64, Vec<i64>> = HashMap::new();
-    let mut spawns = conn.prepare_cached(
-        "SELECT child, parent FROM edges
-         WHERE kind IN ('dispatch', 'teammate') AND parent IS NOT NULL",
-    )?;
-    for edge in spawns.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get(1)?)))? {
-        let (child, parent) = edge?;
-        up.entry(child).or_default().push(parent);
-    }
+    let mut up = spawn_up(conn, true)?;
     let candidates: Vec<(i64, i64)> = conn
         .prepare_cached(
             "SELECT p.id, c.id
@@ -448,6 +572,363 @@ pub(super) fn messages(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Each child's parents by its dispatch and teammate edges, and its launch
+/// edges with `launch`.
+fn spawn_up(conn: &Connection, launch: bool) -> Result<HashMap<i64, Vec<i64>>> {
+    let mut up: HashMap<i64, Vec<i64>> = HashMap::new();
+    let mut spawns = conn.prepare_cached(
+        "SELECT child, parent FROM edges
+         WHERE (kind IN ('dispatch', 'teammate') OR ?1 AND kind = 'launch')
+             AND parent IS NOT NULL",
+    )?;
+    for edge in spawns.query_map([launch], |r| Ok((r.get::<_, i64>(0)?, r.get(1)?)))? {
+        let (child, parent) = edge?;
+        up.entry(child).or_default().push(parent);
+    }
+    Ok(up)
+}
+
+/// Stores the `claude --bg` launches in record `value` of agent row
+/// `agent` (a Bash or PowerShell tool_use, each with the tool_result
+/// already stored when `stored`, if any), and the launch result it
+/// carries; whether it stored either.
+pub(super) fn launch_record(
+    conn: &Connection,
+    agent: i64,
+    value: &Value,
+    stored: bool,
+) -> Result<bool> {
+    let blocks = value["message"]["content"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    let mut changed = false;
+    for block in blocks {
+        match block["type"].as_str() {
+            Some("tool_use") if matches!(block["name"].as_str(), Some("Bash" | "PowerShell")) => {
+                let (Some(id), Some(command)) =
+                    (block["id"].as_str(), block["input"]["command"].as_str())
+                else {
+                    continue;
+                };
+                let found = launches(command);
+                for (seq, launch) in found.iter().enumerate() {
+                    changed |=
+                        conn.prepare_cached(
+                            "INSERT OR IGNORE INTO launches
+                                 (agent, tool_use_id, seq, at, name, resume_id)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        )?
+                        .execute(params![
+                            agent,
+                            id,
+                            seq as i64,
+                            value["timestamp"].as_str(),
+                            launch.name,
+                            launch.resume
+                        ])? > 0;
+                }
+                if stored && !found.is_empty() {
+                    stored_result(conn, agent, id)?;
+                }
+            }
+            Some("tool_result") => {
+                let Some(id) = block["tool_use_id"].as_str() else {
+                    continue;
+                };
+                let pending: bool = conn
+                    .prepare_cached(
+                        "SELECT EXISTS (SELECT 1 FROM launches
+                             WHERE tool_use_id = ?1 AND result IS NULL)",
+                    )?
+                    .query_row([id], |r| r.get(0))?;
+                if pending {
+                    set_result(conn, id, &result_text(value, block))?;
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(changed)
+}
+
+/// Fills launch `id`'s result from a tool_result agent row `agent`'s
+/// transcript already holds.
+fn stored_result(conn: &Connection, agent: i64, id: &str) -> Result<()> {
+    let raw: Option<String> = conn
+        .prepare_cached(
+            "SELECT e.raw FROM agents AS a
+             JOIN events AS e ON e.session_id = a.session_id AND e.agent_id IS a.agent_id
+             WHERE a.id = ?1 AND e.tool_results IS NOT NULL AND instr(e.tool_results, ?2) > 0
+             ORDER BY e.id LIMIT 1",
+        )?
+        .query_row(params![agent, format!("\"{id}\"")], |r| r.get(0))
+        .optional()?;
+    match raw {
+        Some(raw) => result_in(conn, id, &raw),
+        None => Ok(()),
+    }
+}
+
+/// Fills launch `id`'s result from its tool_result in record `raw`.
+fn result_in(conn: &Connection, id: &str, raw: &str) -> Result<()> {
+    let Ok(value) = serde_json::from_str::<Value>(raw) else {
+        return Ok(());
+    };
+    let blocks = value["message"]["content"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    if let Some(block) = blocks.iter().find(|b| b["tool_use_id"] == id) {
+        set_result(conn, id, &result_text(&value, block))?;
+    }
+    Ok(())
+}
+
+fn set_result(conn: &Connection, id: &str, text: &str) -> Result<()> {
+    conn.prepare_cached(
+        "UPDATE launches SET result = ?2 WHERE tool_use_id = ?1 AND result IS NULL",
+    )?
+    .execute(params![id, text])?;
+    Ok(())
+}
+
+/// A tool_result's text: its content (a string, or its text parts), else
+/// the record's `toolUseResult.stdout`.
+fn result_text(value: &Value, block: &Value) -> String {
+    let content = match &block["content"] {
+        Value::String(s) => s.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
+    if content.is_empty() {
+        value["toolUseResult"]["stdout"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        content
+    }
+}
+
+/// One stored launch, as the launch edges read it.
+struct Launched {
+    parent: i64,
+    tool_use_id: String,
+    /// Its record's time, in unix seconds.
+    at: Option<f64>,
+    name: Option<String>,
+    resume: Option<String>,
+    result: Option<String>,
+}
+
+/// The background-lane orchestrators, read once per [`launch_edges`].
+#[derive(Default)]
+struct Background {
+    /// Each `/clear` chain's orchestrators by process root, by start.
+    chains: HashMap<String, Vec<Link>>,
+    /// The orchestrators by trimmed, case-folded name (their own, else
+    /// their chain's registry name), by start, then session.
+    named: HashMap<String, Vec<Link>>,
+    /// Each background registry row's short id, and its process root.
+    short_ids: HashMap<String, String>,
+}
+
+/// An orchestrator of [`Background`] and its start, in unix seconds.
+#[derive(Clone, Copy)]
+struct Link {
+    id: i64,
+    start: Option<f64>,
+}
+
+impl Background {
+    fn load(conn: &Connection) -> Result<Self> {
+        let mut registry_names: HashMap<String, String> = HashMap::new();
+        let mut stmt = conn.prepare_cached(
+            "SELECT ifnull(rs.process_root, rs.session_id), r.name FROM registry AS r
+             JOIN sessions AS rs ON rs.session_id = r.session_id
+             WHERE r.name <> ''
+             ORDER BY r.gone, r.last_seen_ms DESC, r.id DESC",
+        )?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get(1)?)))? {
+            let (root, name) = row?;
+            registry_names.entry(root).or_insert(name);
+        }
+        let mut out = Self::default();
+        let mut stmt = conn.prepare_cached(
+            "WITH roots AS (SELECT DISTINCT ifnull(rs.process_root, rs.session_id) AS root
+                 FROM registry AS r JOIN sessions AS rs ON rs.session_id = r.session_id
+                 WHERE r.kind = 'background')
+             SELECT a.id, roots.root, unixepoch(s.started_at, 'subsec'), a.name
+             FROM roots
+             JOIN sessions AS s ON (s.session_id = roots.root OR s.process_root = roots.root)
+                 AND ifnull(s.process_root, s.session_id) = roots.root
+             JOIN agents AS a ON a.session_id = s.session_id AND a.agent_id IS NULL
+             ORDER BY unixepoch(s.started_at, 'subsec') IS NULL,
+                 unixepoch(s.started_at, 'subsec'), s.session_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                Link {
+                    id: r.get(0)?,
+                    start: r.get(2)?,
+                },
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (link, root, name) = row?;
+            let name = name.or_else(|| registry_names.get(&root).cloned());
+            if let Some(name) = name
+                .map(|n| n.trim().to_lowercase())
+                .filter(|n| !n.is_empty())
+            {
+                out.named.entry(name).or_default().push(link);
+            }
+            out.chains.entry(root).or_default().push(link);
+        }
+        let mut stmt = conn.prepare_cached(
+            "SELECT r.bg_id, ifnull(rs.process_root, rs.session_id) FROM registry AS r
+             JOIN sessions AS rs ON rs.session_id = r.session_id
+             WHERE r.kind = 'background' AND r.bg_id <> ''
+             ORDER BY r.id",
+        )?;
+        for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get(1)?)))? {
+            let (bg_id, root) = row?;
+            out.short_ids.entry(bg_id).or_insert(root);
+        }
+        Ok(out)
+    }
+}
+
+/// Whether a link started at `start` started at or after `at`; with no
+/// launch time, any link does.
+fn since(start: Option<f64>, at: Option<f64>) -> bool {
+    match (start, at) {
+        (Some(start), Some(at)) => start >= at,
+        (_, None) => true,
+        (None, Some(_)) => false,
+    }
+}
+
+/// Rebuilds the launch edges from the stored launches (see the module
+/// doc); whether they changed.
+fn launch_edges(conn: &Connection) -> Result<bool> {
+    let before: BTreeMap<i64, (i64, String)> = conn
+        .prepare_cached("SELECT child, parent, tool_use_id FROM edges WHERE kind = 'launch'")?
+        .query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?
+        .collect::<Result<_>>()?;
+    let rows: Vec<Launched> = conn
+        .prepare_cached(
+            "SELECT agent, tool_use_id, unixepoch(at, 'subsec'), name, resume_id, result
+             FROM launches
+             ORDER BY unixepoch(at, 'subsec') IS NULL, unixepoch(at, 'subsec'), tool_use_id, seq",
+        )?
+        .query_map([], |r| {
+            Ok(Launched {
+                parent: r.get(0)?,
+                tool_use_id: r.get(1)?,
+                at: r.get(2)?,
+                name: r.get(3)?,
+                resume: r.get(4)?,
+                result: r.get(5)?,
+            })
+        })?
+        .collect::<Result<_>>()?;
+    if rows.is_empty() && before.is_empty() {
+        return Ok(false);
+    }
+    let background = Background::load(conn)?;
+    let mut up = spawn_up(conn, false)?;
+    let mut chosen: BTreeMap<i64, (i64, String)> = BTreeMap::new();
+    let mut take = |launch: &Launched, candidates: Vec<i64>| {
+        let child = candidates
+            .into_iter()
+            .find(|c| !chosen.contains_key(c) && !descends(launch.parent, *c, &up));
+        if let Some(child) = child {
+            up.entry(child).or_default().push(launch.parent);
+            chosen.insert(child, (launch.parent, launch.tool_use_id.clone()));
+        }
+    };
+    // A launch naming its child outright goes before any by name alone.
+    let mut by_name = Vec::new();
+    for launch in &rows {
+        match named_outright(conn, launch, &background)? {
+            Some(candidates) => take(launch, candidates),
+            None => by_name.push(launch),
+        }
+    }
+    for launch in by_name {
+        take(launch, named_alike(launch, &background));
+    }
+    if chosen == before {
+        return Ok(false);
+    }
+    conn.execute("DELETE FROM edges WHERE kind = 'launch'", [])?;
+    let mut insert = conn.prepare_cached(
+        "INSERT INTO edges (kind, parent, child, tool_use_id) VALUES ('launch', ?1, ?2, ?3)",
+    )?;
+    for (child, (parent, tool_use_id)) in chosen {
+        insert.execute(params![parent, child, tool_use_id])?;
+    }
+    Ok(true)
+}
+
+/// The orchestrators `launch` names outright, by the first rule that names
+/// any: its `--resume` session, else for each background row whose short
+/// id its result prints (in print order), the earliest link of that row's
+/// `/clear` chain that started at or after it. `None` when neither names
+/// any.
+fn named_outright(
+    conn: &Connection,
+    launch: &Launched,
+    background: &Background,
+) -> Result<Option<Vec<i64>>> {
+    if let Some(resume) = &launch.resume {
+        let resumed: Option<i64> = conn
+            .prepare_cached("SELECT id FROM agents WHERE session_id = ?1 AND agent_id IS NULL")?
+            .query_row([resume], |r| r.get(0))
+            .optional()?;
+        if let Some(id) = resumed {
+            return Ok(Some(vec![id]));
+        }
+    }
+    let printed: Vec<i64> = launch
+        .result
+        .as_deref()
+        .unwrap_or_default()
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .filter_map(|token| {
+            let chain = background.chains.get(background.short_ids.get(token)?)?;
+            chain
+                .iter()
+                .find(|l| since(l.start, launch.at))
+                .map(|l| l.id)
+        })
+        .collect();
+    Ok((!printed.is_empty()).then_some(printed))
+}
+
+/// The background-lane orchestrators named as `launch`'s `--name` that
+/// started at or after it, earliest first.
+fn named_alike(launch: &Launched, background: &Background) -> Vec<i64> {
+    let (Some(name), Some(at)) = (&launch.name, launch.at) else {
+        return Vec::new();
+    };
+    background
+        .named
+        .get(&name.trim().to_lowercase())
+        .into_iter()
+        .flatten()
+        .filter(|l| l.start.is_some_and(|start| start >= at))
+        .map(|l| l.id)
+        .collect()
+}
+
 /// Whether `agent` is `ancestor` or reaches it walking up `up`.
 fn descends(agent: i64, ancestor: i64, up: &HashMap<i64, Vec<i64>>) -> bool {
     let mut seen = HashSet::new();
@@ -466,6 +947,41 @@ fn descends(agent: i64, ancestor: i64, up: &HashMap<i64, Vec<i64>>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{Store, query_plan};
+    use crate::tail::test_dir;
+
+    /// `events` rows carry their whole record inline, ahead of
+    /// `tool_results`: the rebuild reads every event once, each tool_result
+    /// finding its dispatch by index. Driven from the dispatch edges, it
+    /// read every event once per edge: 823 s to open a real v20 store
+    /// (#108).
+    #[test]
+    fn the_dispatch_and_launch_results_rebuild_reads_the_events_once() {
+        let dir = test_dir("model-dispatch-plan");
+        let db = dir.join("strate.db");
+        drop(Store::open(&db).expect("open"));
+        let conn = Store::open_reader(&db).expect("reader");
+        assert_eq!(
+            query_plan(&conn, DISPATCH_RESULTS_SQL),
+            [
+                "SCAN e",
+                "SCAN j VIRTUAL TABLE INDEX 1:",
+                "SEARCH d USING INDEX edges_tool_use (tool_use_id=?)",
+                "USE TEMP B-TREE FOR GROUP BY",
+            ]
+        );
+        assert_eq!(
+            query_plan(&conn, LAUNCH_RESULTS_SQL),
+            [
+                "SCAN e",
+                "SCAN j VIRTUAL TABLE INDEX 1:",
+                "SEARCH l USING COVERING INDEX sqlite_autoindex_launches_1 (tool_use_id=?)",
+                "USE TEMP B-TREE FOR GROUP BY",
+            ]
+        );
+        drop(conn);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
 
     #[test]
     fn a_walk_up_finds_an_ancestor_through_any_parent_and_ends_on_a_cycle() {

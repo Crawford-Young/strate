@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::{Result, account, live, model};
 use crate::cost::SYNTHETIC;
-use crate::discovery::{AgentRef, Graph, Link, Unresolved, scalar_text};
+use crate::discovery::{AgentRef, Graph, Link, Unresolved, meta_finished, scalar_text};
 use crate::tail::{Batch, TailEvent};
 
 /// The agent a transcript belongs to, read from where it sits in the
@@ -55,15 +55,19 @@ fn owner_of(path: &Path) -> Owner {
 
 /// Stores a batch's events and its checkpoint, then relinks the batch's
 /// session ([`relink`]), ends the waits left open on its `/clear` chain's
-/// earlier links, re-resolves the agents it touched in the model,
-/// recomputes the rollups it touches, and rebuilds the message edges when
-/// it stored a cross-session message.
+/// earlier links, re-reads a subagent's meta `finished` until it is set,
+/// re-resolves the agents it touched in the model, recomputes the rollups
+/// it touches, and rebuilds the launch edges (when it stored a launch or
+/// its result, or changed what [`launch_inputs`] reads) and the message
+/// edges (when those changed, or it stored a cross-session message).
 pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
     let owner = owner_of(&batch.path);
     let file = text_of(&batch.path);
     let mut agent = None;
     let mut requests = BTreeSet::new();
     let mut messaged = false;
+    let mut launched = false;
+    let inputs = launch_inputs(conn, &owner.session_id)?;
     for event in &batch.events {
         match event {
             TailEvent::Record { offset, value, .. } => {
@@ -74,6 +78,7 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
                 let stored = record(conn, &owner, id, &file, *offset, value)?;
                 requests.extend(stored.request);
                 messaged |= stored.message;
+                launched |= stored.launch;
             }
             // The file was rewritten: its uuid-less events would block the
             // new content at the same offsets. Events with a uuid stay and
@@ -89,10 +94,23 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
     if agent.is_some() {
         end_cleared_waits(conn, &owner.session_id)?;
     }
+    // A linked subagent's (not a teammate's) records start no discovery pass, so its batch
+    // reads the meta's `finished` too (#108). The meta is mostly written
+    // after its last record, so a later pass usually reads it first.
+    if let (Some(id), Some(agent_id)) = (agent, owner.agent_id.as_deref()) {
+        let (finished, subagent): (bool, bool) = conn
+            .prepare_cached("SELECT finished IS 1, kind = 'subagent' FROM agents WHERE id = ?1")?
+            .query_row([id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        if subagent && !finished {
+            set_finished(conn, id, meta_finished(&batch.path, agent_id))?;
+        }
+    }
     model::batch(conn, &owner.session_id, agent)?;
     let touched = account::touched(conn, &owner.session_id, &requests)?;
     account::rollup(conn, touched.iter().map(String::as_str))?;
-    if messaged {
+    if launched || launch_inputs(conn, &owner.session_id)? != inputs {
+        model::relaunch(conn, messaged)?;
+    } else if messaged {
         model::messages(conn)?;
     }
     if let Some(c) = batch.checkpoint {
@@ -144,6 +162,23 @@ fn relink(conn: &Connection, session_id: &str) -> Result<()> {
         .execute(params![pair[0], pair[1]])?;
     }
     Ok(())
+}
+
+/// What a launch edge reads of `session_id`'s orchestrator: its row, name,
+/// start and process root. A batch on the session changes nothing else
+/// they read, so one leaving these alone keeps the launch edges.
+type LaunchInputs = Option<(i64, Option<String>, Option<String>, Option<String>)>;
+
+fn launch_inputs(conn: &Connection, session_id: &str) -> Result<LaunchInputs> {
+    conn.prepare_cached(
+        "SELECT a.id, a.name, s.started_at, s.process_root FROM sessions AS s
+         JOIN agents AS a ON a.session_id = s.session_id AND a.agent_id IS NULL
+         WHERE s.session_id = ?1",
+    )?
+    .query_row([session_id], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    })
+    .optional()
 }
 
 /// [`relink`]s every stored session: a v1 store's upgrade.
@@ -270,6 +305,8 @@ struct Stored {
     request: Option<String>,
     /// A cross-session message, sent or received.
     message: bool,
+    /// A `claude --bg` launch, or a launch's result.
+    launch: bool,
 }
 
 /// Stores one record; a record not seen before also updates its agent
@@ -410,10 +447,44 @@ fn record(
             text("timestamp"),
         ])?;
     }
+    // A dispatch's tool_result: its subagent's dispatch result, the first
+    // stored (the graph's edge looks it up when it comes later).
+    if let Some(results) = &acct.tool_results {
+        let status = match value["toolUseResult"]["status"].as_str() {
+            Some("async_launched") => "async_launched",
+            _ => "answered",
+        };
+        conn.prepare_cached(DISPATCH_ANSWERED_SQL)?
+            .execute(params![results, status])?;
+    }
+    let launch = if acct.tool_uses.is_some() || acct.tool_results.is_some() {
+        model::launch_record(conn, agent, value, true)?
+    } else {
+        false
+    };
     Ok(Stored {
         request: acct.usage.and(acct.request_key),
         message: acct.sent_msg_id.is_some() || acct.peer_msg_id.is_some(),
+        launch,
     })
+}
+
+/// Sets dispatch result `?2` on each subagent not yet answered whose
+/// dispatch one of tool_result ids `?1` (a JSON array) answers, the ids
+/// outermost (CROSS JOIN) so each finds its edge by index.
+const DISPATCH_ANSWERED_SQL: &str = "UPDATE agents SET dispatch_result = ?2
+    WHERE dispatch_result IS NULL AND id IN (SELECT d.child FROM json_each(?1) AS j
+        CROSS JOIN edges AS d ON d.kind = 'dispatch' AND d.tool_use_id = j.value)";
+
+/// Sets agent row `id`'s meta `finished`: true sticks, anything else
+/// changes nothing already stored.
+fn set_finished(conn: &Connection, id: i64, finished: Option<bool>) -> Result<()> {
+    conn.prepare_cached(
+        "UPDATE agents SET finished = CASE WHEN ?2 IS 1 THEN 1 ELSE coalesce(finished, ?2) END
+         WHERE id = ?1",
+    )?
+    .execute(params![id, finished])?;
+    Ok(())
 }
 
 /// Stores the sessions, agents and edges of a discovery graph. Only adds
@@ -479,6 +550,7 @@ pub(super) fn graph(conn: &Connection, g: &Graph) -> Result<()> {
             meta.effort,
             meta.name,
         ])?;
+        set_finished(conn, id, meta.finished)?;
     }
     // Every agent exists now, so parents listed after their children
     // resolve.
@@ -574,6 +646,15 @@ fn edge(
     team_name: Option<&str>,
     team_dir: Option<&str>,
 ) -> Result<()> {
+    // A dispatch edge stored with this tool_use already has its result:
+    // ingest sets it from a tool_result stored after the edge.
+    let known = kind == "dispatch"
+        && conn
+            .prepare_cached(
+                "SELECT EXISTS (SELECT 1 FROM edges
+                     WHERE kind = 'dispatch' AND child = ?1 AND tool_use_id IS ?2)",
+            )?
+            .query_row(params![child, tool_use_id], |r| r.get::<_, bool>(0))?;
     conn.prepare_cached(
         "INSERT INTO edges (kind, parent, child, tool_use_id, team_name, team_dir)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -593,12 +674,49 @@ fn edge(
     ])?;
     conn.prepare_cached("UPDATE agents SET unresolved = NULL WHERE id = ?1")?
         .execute([child])?;
+    // A new dispatch whose tool_result was stored first: its result now.
+    if let ("dispatch", Some(tool_use_id), false) = (kind, tool_use_id, known) {
+        conn.prepare_cached(
+            "UPDATE agents SET dispatch_result = (
+                 SELECT CASE WHEN json_extract(e.raw, '$.toolUseResult.status') IS 'async_launched'
+                     THEN 'async_launched' ELSE 'answered' END
+                 FROM events AS e
+                 WHERE e.session_id = agents.session_id AND e.tool_results IS NOT NULL
+                     AND instr(e.tool_results, ?2) > 0
+                 ORDER BY e.id LIMIT 1)
+             WHERE id = ?1 AND dispatch_result IS NULL",
+        )?
+        .execute(params![child, format!("\"{tool_use_id}\"")])?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{Store, query_plan};
+    use crate::tail::test_dir;
+
+    /// A tool_result's ids find their dispatch edges by index, not by
+    /// walking every dispatch edge per record (#108).
+    #[test]
+    fn a_tool_result_finds_its_dispatch_by_index() {
+        let dir = test_dir("ingest-dispatch-plan");
+        let db = dir.join("strate.db");
+        drop(Store::open(&db).expect("open"));
+        let conn = Store::open_reader(&db).expect("reader");
+        assert_eq!(
+            query_plan(&conn, DISPATCH_ANSWERED_SQL),
+            [
+                "SEARCH agents USING INTEGER PRIMARY KEY (rowid=?)",
+                "LIST SUBQUERY 1",
+                "SCAN j VIRTUAL TABLE INDEX 1:",
+                "SEARCH d USING INDEX edges_tool_use (tool_use_id=?)",
+            ]
+        );
+        drop(conn);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
 
     #[test]
     fn owner_comes_from_the_transcript_layout() {

@@ -992,8 +992,10 @@ fn the_model_serializes_in_the_webview_shape() {
         keys,
         [
             "agentId",
+            "background",
             "charge",
             "chargeSource",
+            "finished",
             "id",
             "kind",
             "lane",
@@ -1005,6 +1007,10 @@ fn the_model_serializes_in_the_webview_shape() {
         ]
     );
     assert_eq!(json["lane"], "interactive");
+    assert_eq!(
+        (&json["finished"], &json["background"]),
+        (&json!(false), &json!(false))
+    );
     assert_eq!(json["chargeSource"], "name");
     assert_eq!(json["charge"]["kind"], "issue");
     assert_eq!(
