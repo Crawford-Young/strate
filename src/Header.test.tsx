@@ -26,6 +26,7 @@ const waits: NeedsYou[] = [1, 2, 3].map((id) => ({
   waitingFor: 'AskUserQuestion',
   sinceMs: null,
   workstream: id,
+  bgId: null,
 }))
 
 // happy-dom has no layout, so this can't show the strip scrolling or the chip staying on one line.

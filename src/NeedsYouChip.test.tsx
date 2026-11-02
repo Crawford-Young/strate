@@ -26,6 +26,7 @@ function wait(over: Partial<NeedsYou>): NeedsYou {
     waitingFor: null,
     sinceMs: null,
     workstream: null,
+    bgId: null,
     ...over,
   }
 }
@@ -54,6 +55,14 @@ const hook = wait({
   workstream: 3,
 })
 const tabless = wait({ sessionId: '7f3a9c1e-0000', sinceMs: minutesAgo(66), workstream: 4 })
+
+// A background job parked on the user: its registry short id, not its session, is what attaches.
+const parked = wait({
+  sessionId: 's-parked-0000',
+  sinceMs: minutesAgo(30),
+  workstream: 4,
+  bgId: 'abcd1234',
+})
 
 afterEach(() => {
   vi.useRealTimers()
@@ -170,6 +179,36 @@ describe('row actions', () => {
     const copy = screen.getByRole('button', { name: 'copy resume for dog-eat-dog-18' })
     await act(async () => fireEvent.click(copy))
     expect(copy).toHaveTextContent('copy failed')
+  })
+
+  it('says parked with its age on a parked job, and keeps a live wait as it was', () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    vi.setSystemTime(NOW)
+    show([parked, tabless])
+    open()
+    expect(rows().map((r) => r.textContent)).toEqual([
+      'dog-eat-dog-18blocked1h 6mcopy resume',
+      'dog-eat-dog-18parked30mcopy attach',
+    ])
+  })
+
+  it('copies claude attach with the registry id for a parked job, not its session', async () => {
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue()
+    show([parked])
+    open()
+    const copy = screen.getByRole('button', { name: 'copy attach for dog-eat-dog-18' })
+    await act(async () => fireEvent.click(copy))
+    expect(writeText).toHaveBeenCalledWith('claude attach abcd1234')
+    expect(copy).toHaveTextContent('copied')
+  })
+
+  it('still goes to the tab of a parked job that has one', () => {
+    show([wait({ ...parked, workstream: 2 })])
+    open()
+    expect(within(row(0)).getByText('parked')).toBeInTheDocument()
+    expect(
+      within(row(0)).getByRole('button', { name: 'go to tab for ticket-strate-68' }),
+    ).toBeInTheDocument()
   })
 
   it('copies for a unit whose director has no tab', async () => {

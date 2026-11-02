@@ -463,6 +463,7 @@ describe('needs-you chip', () => {
     waitingFor: null,
     sinceMs: null,
     workstream: null,
+    bgId: null,
     ...over,
   })
   // A background session blocked with no tab, and a permission prompt on a tabbed one.

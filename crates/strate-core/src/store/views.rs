@@ -144,6 +144,10 @@ pub struct NeedsYou {
     /// The tab of the session's own chain, at any depth; that tab's
     /// [`Workstream::director`] is the root tab it counts toward.
     pub workstream: Option<i64>,
+    /// A parked background job's short id in the agent registry (`claude
+    /// agents --json`), the `<id>` of `claude attach <id>` (#120); `None`
+    /// on every other wait, and on a parked job the registry gave no id.
+    pub bg_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -732,8 +736,11 @@ pub fn needs_you(conn: &Connection) -> Result<Vec<NeedsYou>> {
 /// [`needs_you`]'s rows, each on its chain's own tab.
 fn waits(conn: &Connection, tabs: &Tabs) -> Result<Vec<NeedsYou>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT n.source, n.session_id, n.agent_id, n.waiting_for, n.since_ms
+        "SELECT n.source, n.session_id, n.agent_id, n.waiting_for, n.since_ms,
+             CASE WHEN r.kind = 'background' AND r.state IS 'blocked' AND r.bg_id <> ''
+                 THEN r.bg_id END
          FROM needs_you AS n
+         LEFT JOIN registry AS r ON r.id = n.registry
          WHERE n.source = 'hook' OR NOT EXISTS (SELECT 1 FROM needs_you AS h
              WHERE h.source = 'hook' AND h.session_id = n.session_id
                AND abs(h.since_ms - n.since_ms) <= ?1)
@@ -751,6 +758,7 @@ fn waits(conn: &Connection, tabs: &Tabs) -> Result<Vec<NeedsYou>> {
             agent_id: r.get(2)?,
             waiting_for: r.get(3)?,
             since_ms: r.get(4)?,
+            bg_id: r.get(5)?,
         })
     })?
     .collect()
@@ -1907,6 +1915,39 @@ mod tests {
     }
 
     #[test]
+    fn only_a_parked_background_job_carries_its_registry_short_id() {
+        // p: a background job blocked on the user. q: the same job with no
+        // short id. i: an interactive wait. w: a background job waiting on a
+        // named prompt, which is a live wait, not a parked one.
+        let sql = "INSERT INTO sessions (session_id) VALUES ('p'), ('q'), ('i'), ('w');
+             INSERT INTO registry (key, kind, session_id, bg_id, cwd, started_at_ms, status,
+                 state, waiting_for, first_seen_ms, last_seen_ms, gone, waiting_since_ms) VALUES
+                 ('p', 'background', 'p', 'abcd1234', '/w', 1, NULL, 'blocked', NULL, 1, 9, 0, 1),
+                 ('q', 'background', 'q', '', '/w', 1, NULL, 'blocked', NULL, 1, 9, 0, 2),
+                 ('i', 'interactive', 'i', NULL, '/w', 1, 'waiting', NULL, 'input', 1, 9, 0, 3),
+                 ('w', 'background', 'w', 'ffff0000', '/w', 1, 'waiting', NULL, 'input', 1, 9, 0,
+                     4);";
+        let (dir, store) = seeded("views-parked-short-id", sql);
+        let rows: Vec<_> = needs_you(&store.conn)
+            .expect("needs_you")
+            .into_iter()
+            .map(|n| (n.session_id, n.bg_id))
+            .collect();
+        let row = |s: &str, id: Option<&str>| (Some(s.to_string()), id.map(String::from));
+        assert_eq!(
+            rows,
+            [
+                row("p", Some("abcd1234")),
+                row("q", None),
+                row("i", None),
+                row("w", None),
+            ]
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
     fn a_v17_registry_wait_starts_at_its_last_change() {
         let dir = crate::tail::test_dir("views-v17-wait-start");
         let db = dir.join("strate.db");
@@ -2107,12 +2148,14 @@ mod tests {
             waiting_for: None,
             since_ms: None,
             workstream: None,
+            bg_id: None,
         });
         got.sort();
         assert_eq!(
             got,
             [
                 "agentId",
+                "bgId",
                 "sessionId",
                 "sinceMs",
                 "source",
