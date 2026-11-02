@@ -6,7 +6,7 @@ import type {
   StackedBarDatum,
   StackedBarSeries,
 } from '@crawfordyoung/ui'
-import type { Audit, AuditNode, AuditPath, Slice } from './api'
+import type { Audit, AuditNode, AuditPath, Slice } from './audit-types'
 
 const HOUR = 3_600_000
 
@@ -139,14 +139,13 @@ function palette(
   return { named, other: rest.length > tokens.length ? OTHER : null }
 }
 
-/** The agent types' colours: the orchestrator always --chart-6, the others 1..4. */
-export const agentTypePalette = (slices: Slice[]) =>
-  palette(slices, [1, 2, 3, 4], { orchestrator: 6 })
+/** The roles' colours: `root` (a root agent with no parsed role) always --chart-6, the others 1..4. */
+export const rolePalette = (slices: Slice[]) => palette(slices, [1, 2, 3, 4], { root: 6 })
 
-/** The models' colours, starting off the agent types' first ones. */
+/** The models' colours, starting off the roles' first ones. */
 export const modelPalette = (slices: Slice[]) => palette(slices, [4, 3, 2, 1, 6])
 
-export const agentTypeLabel = (key: string) => key || 'Unknown'
+export const roleLabel = (key: string) => key || 'Unknown'
 
 export const modelLabel = (key: string) => key || 'No requests'
 

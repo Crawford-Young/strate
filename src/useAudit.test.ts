@@ -1,10 +1,10 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { audit, node } from '../tests/audit-fixtures'
-import { auditRollup, type AuditFilter } from './api'
+import { auditRollup, type AuditFilter } from './audit-types'
 import { useAudit } from './useAudit'
 
-vi.mock('./api', () => ({ auditRollup: vi.fn() }))
+vi.mock('./audit-types', () => ({ auditRollup: vi.fn() }))
 
 const rollupMock = vi.mocked(auditRollup)
 

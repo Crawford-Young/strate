@@ -1,5 +1,5 @@
 // The Audit export: the full tree under the filter as RFC 4180 CSV, one row per node.
-import type { Audit, AuditNode, AuditPath } from './api'
+import type { Audit, AuditNode, AuditPath } from './audit-types'
 
 type Cell = string | number | boolean | null
 

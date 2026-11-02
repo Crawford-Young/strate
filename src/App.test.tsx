@@ -5,7 +5,6 @@ import { defaultLayoutOf, dragTo, resetGroups } from '../tests/resizable-mock'
 import { fitView, resetFlow } from '../tests/xyflow-mock'
 import {
   agentTranscript,
-  auditRollup,
   liveGraph,
   needsYou,
   onStoreChanged,
@@ -18,6 +17,7 @@ import {
   type Workstream,
 } from './api'
 import { App } from './App'
+import { auditRollup } from './audit-types'
 import { REFIT_MS } from './Canvas'
 import { PREFS_KEY } from './layout'
 
@@ -28,9 +28,9 @@ vi.mock('./api', () => ({
   liveGraph: vi.fn(),
   needsYou: vi.fn(),
   onStoreChanged: vi.fn(),
-  auditRollup: vi.fn(),
   auditRefresh: vi.fn(),
 }))
+vi.mock('./audit-types', () => ({ auditRollup: vi.fn() }))
 
 vi.mock('./elk', async () => {
   const { default: ELK } = await import('elkjs/lib/elk.bundled.js')

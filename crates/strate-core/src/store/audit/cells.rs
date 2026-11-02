@@ -1,4 +1,4 @@
-//! The `audit_cells` in a filter, with the charges, sessions, Session rows
+//! The `audit_cells` in a filter, with the charges, sessions, chain rows
 //! and subagents they belong to, each resolved once.
 
 use std::collections::hash_map::Entry;
@@ -7,14 +7,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use rusqlite::{Connection, Row};
 
 use super::gh::{Gh, GhPr};
-use super::{AuditFilter, Tokens};
+use super::{AuditFilter, Tokens, role_key};
 use crate::charge::{Charge, ChargeKind};
 use crate::store::Result;
 use crate::time::parse_timestamp;
 
 /// The cells in a filter, with what they belong to.
 pub(crate) struct Cells {
-    /// In day order, the orchestrator's first.
+    /// In day order, the root agent's first.
     pub(crate) list: Vec<Cell>,
     /// The repos the range's cells are charged in, whatever the repo
     /// filter.
@@ -22,7 +22,7 @@ pub(crate) struct Cells {
     /// Some cell in the range is in no repo.
     pub(crate) unlinked: bool,
     charges: Charges,
-    rows: Vec<SessionRow>,
+    rows: Vec<ChainRow>,
     row_index: HashMap<RowKey, usize>,
     sessions: HashMap<String, Session>,
     agents: HashMap<(String, String), Agent>,
@@ -31,9 +31,9 @@ pub(crate) struct Cells {
 /// One cell in the filter: where it sits and what it adds.
 pub(crate) struct Cell {
     pub(crate) session_id: String,
-    /// `None`: the orchestrator.
+    /// `None`: the root agent.
     pub(crate) agent_id: Option<String>,
-    /// Its index in [`Cells`]' Session rows; see [`Cells::row`].
+    /// Its index in [`Cells`]' chain rows; see [`Cells::row`].
     row: usize,
     pub(crate) day: String,
     pub(crate) model: Option<String>,
@@ -47,9 +47,10 @@ pub(crate) struct Share {
     pub(crate) unpriced: i64,
     pub(crate) tokens: Tokens,
     pub(crate) agent_ms: i64,
-    /// Active and waiting on the session line: the orchestrator's cells only.
+    /// Active and waiting on the session line: the root agent's cells only.
     pub(crate) line: Time,
-    /// The cell's own active and waiting, for its Agent node.
+    /// The cell's own active and waiting, for its Agent node: the same as
+    /// `line` on a root agent's cell.
     pub(crate) own: Time,
     pub(crate) sessions: i64,
     pub(crate) agents: i64,
@@ -104,7 +105,7 @@ impl CellRow {
 }
 
 impl Cells {
-    /// Cells come in day order, the orchestrator's first, so a session or
+    /// Cells come in day order, the root agent's first, so a session or
     /// subagent counts on its first cell in the filter. Idle-only cells are
     /// left out: they add nothing, and would show a session on a day it
     /// only sat open.
@@ -151,6 +152,7 @@ impl Cells {
             if !filter.repos.is_empty() && !filter.repos.iter().any(|r| r == slug) {
                 continue;
             }
+            out.lead(at, &row.session_id);
             let first_in_row = seen_sessions.insert((row.session_id.clone(), charge));
             let mut share = Share {
                 cost_usd: row.cost_usd,
@@ -183,7 +185,19 @@ impl Cells {
         Ok(out)
     }
 
-    /// The index of the Session row of `session_id`'s chain in `charge`,
+    /// Makes `session_id` lead chain row `at` when it starts before the
+    /// row's lead so far (no start: 0), the first such on a tie.
+    fn lead(&mut self, at: usize, session_id: &str) {
+        let session = &self.sessions[session_id];
+        let start = session.start.unwrap_or(0);
+        let row = &mut self.rows[at];
+        if row.start.is_none_or(|s| start < s) {
+            row.start = Some(start);
+            row.label.clone_from(&session.label);
+        }
+    }
+
+    /// The index of the chain row of `session_id`'s chain in `charge`,
     /// placed once.
     fn row(
         &mut self,
@@ -206,10 +220,12 @@ impl Cells {
             c => place(gh, c, &[]),
         };
         let charge = charge.map(Charge::key).unwrap_or_default();
-        self.rows.push(SessionRow {
+        self.rows.push(ChainRow {
             key: format!("{}/{charge}", key.0),
             charge,
             place,
+            start: None,
+            label: String::new(),
         });
         self.row_index.insert(key, self.rows.len() - 1);
         Ok(self.rows.len() - 1)
@@ -223,9 +239,26 @@ impl Cells {
         })
     }
 
-    /// The Session row `cell` belongs to.
-    pub(crate) fn row_of(&self, cell: &Cell) -> &SessionRow {
+    /// The chain row `cell` belongs to.
+    pub(crate) fn row_of(&self, cell: &Cell) -> &ChainRow {
         &self.rows[cell.row]
+    }
+
+    /// `cell`'s role: its agent's own (`agents.role`), else a subagent's or
+    /// teammate's stored type, else `root` for a root agent, else `""`
+    /// (unknown).
+    pub(crate) fn role(&self, cell: &Cell) -> &str {
+        match &cell.agent_id {
+            None => role_key(self.session(cell).role.as_deref(), None, true),
+            Some(id) => {
+                let a = self.agent(cell, id);
+                role_key(
+                    a.and_then(|a| a.role.as_deref()),
+                    a.and_then(|a| a.agent_type.as_deref()),
+                    false,
+                )
+            }
+        }
     }
 
     /// The session `cell` is from. [`Cells::load`] read every cell's.
@@ -241,7 +274,7 @@ impl Cells {
             .get(&(cell.session_id.clone(), agent_id.to_string()))
     }
 
-    /// The repo of the agent `agent_id` (`None`: the orchestrator) of
+    /// The repo of the agent `agent_id` (`None`: the root agent) of
     /// `session_id`'s effective charge; `None` for a topic or no charge.
     pub(crate) fn repo_of(&self, session_id: &str, agent_id: Option<&str>) -> Option<&str> {
         let charge = self.charges.of(session_id, agent_id)?;
@@ -286,13 +319,13 @@ fn charge_repo(c: &Charge) -> Option<&str> {
     }
 }
 
-/// A Session row's chain and charge (`None`: Unlinked).
+/// A chain row's chain and charge (`None`: Unlinked).
 type RowKey = (String, Option<i64>);
 
 /// Every agent's effective charge, read once: `agent_charges` is a
 /// recursive view over every agent, so it is read whole, never per cell.
 struct Charges {
-    /// Per agent (session, agent id; `None`: the orchestrator), its charge
+    /// Per agent (session, agent id; `None`: the root agent), its charge
     /// (`None`: Unlinked).
     agents: HashMap<(String, Option<String>), Option<i64>>,
     by_id: HashMap<i64, Charge>,
@@ -368,7 +401,7 @@ impl Charges {
             .flatten()
     }
 
-    /// The sessions of Session row `key` (a chain in a charge), newest
+    /// The sessions of chain row `key` (a chain in a charge), newest
     /// first: by start (none last), then id.
     fn row_sessions(&self, key: &RowKey) -> Vec<&str> {
         let mut sessions: Vec<&(Option<i64>, String)> = self
@@ -392,7 +425,7 @@ impl Charges {
     }
 }
 
-/// Where a Session row's work belongs, by its charge.
+/// Where a chain row's work belongs, by its charge.
 #[derive(Clone)]
 pub(crate) enum Place {
     /// No charge.
@@ -439,13 +472,20 @@ impl Place {
     }
 }
 
-/// A Session row: a `/clear` chain's sessions within one charge.
-pub(crate) struct SessionRow {
+/// A chain row: a `/clear` chain's sessions within one charge, the unit
+/// work is placed by. Its root agent's node is keyed, labelled and sorted
+/// by it.
+pub(crate) struct ChainRow {
     /// `<chain>/<charge key>`, `<chain>/` with no charge.
     pub(crate) key: String,
     /// Its charge key, `""` with none.
     pub(crate) charge: String,
     pub(crate) place: Place,
+    /// The start of its earliest session with a cell in the filter (no
+    /// start: 0); `None` until its first cell.
+    pub(crate) start: Option<i64>,
+    /// That session's label.
+    pub(crate) label: String,
 }
 
 /// Where work charged `charge` belongs: a PR charge under the issue it
@@ -531,12 +571,14 @@ fn linked_pr(prs: &[GhPr], links: &[PrLink], repo: &str) -> Option<i64> {
     })
 }
 
-/// A session as its Session row shows it.
+/// A session as its root agent's node shows it.
 pub(crate) struct Session {
     /// Its process root, else its id: what its `/clear` chain shares.
     chain: String,
-    /// Its orchestrator's name, else its registry name, else its id.
+    /// Its root agent's name, else its registry name, else its id.
     pub(crate) label: String,
+    /// Its root agent's role (`agents.role`).
+    pub(crate) role: Option<String>,
     /// Its first record.
     pub(crate) start: Option<i64>,
     /// Its first record to its last activity: the latest record its
@@ -546,7 +588,7 @@ pub(crate) struct Session {
 
 /// A session's chain, start, last activity (the latest record its timeline
 /// counts, read from the `events_session_time` index alone: v10, #46) and
-/// names.
+/// names and its root agent's role.
 const SESSION_SQL: &str = "SELECT
          (SELECT ifnull(process_root, session_id) FROM sessions WHERE session_id = ?1),
          (SELECT started_at FROM sessions WHERE session_id = ?1),
@@ -554,6 +596,7 @@ const SESSION_SQL: &str = "SELECT
           WHERE session_id = ?1 AND timestamp IS NOT NULL
             AND ifnull(type, '') NOT IN ('custom-title', 'ai-title', 'cost-state')),
          (SELECT name FROM agents WHERE session_id = ?1 AND agent_id IS NULL),
+         (SELECT role FROM agents WHERE session_id = ?1 AND agent_id IS NULL),
          (SELECT name FROM registry WHERE session_id = ?1 AND name <> ''
           ORDER BY gone, last_seen_ms DESC, id DESC LIMIT 1)";
 
@@ -565,17 +608,26 @@ impl Session {
             Option<String>,
             Option<String>,
             Option<String>,
+            Option<String>,
         );
-        let (chain, start, last, name, listed): Read = conn
+        let (chain, start, last, name, role, listed): Read = conn
             .prepare_cached(SESSION_SQL)?
             .query_row([session_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
             })?;
         let start = start.as_deref().and_then(parse_timestamp);
         let last = last.as_deref().and_then(parse_timestamp);
         Ok(Self {
             chain: chain.unwrap_or_else(|| session_id.to_string()),
             label: name.or(listed).unwrap_or_else(|| session_id.to_string()),
+            role,
             start,
             span: start.map(|s| (s, last.unwrap_or(s).max(s))),
         })
@@ -585,7 +637,7 @@ impl Session {
 /// [`Agent::load_all`]'s query: each subagent's first and last record from
 /// the `events_timeline` index.
 const AGENTS_SQL: &str = "SELECT a.session_id, a.agent_id,
-     coalesce(a.name, a.description, a.agent_type), a.agent_type, a.run_ms,
+     coalesce(a.name, a.description, a.agent_type), a.agent_type, a.run_ms, a.role,
      (SELECT min(e.timestamp) FROM events AS e INDEXED BY events_timeline
       WHERE e.session_id = a.session_id AND e.agent_id = a.agent_id
         AND e.timestamp IS NOT NULL),
@@ -602,6 +654,8 @@ const AGENTS_SQL: &str = "SELECT a.session_id, a.agent_id,
 pub(crate) struct Agent {
     pub(crate) label: String,
     pub(crate) agent_type: Option<String>,
+    /// Its own role (`agents.role`).
+    pub(crate) role: Option<String>,
     pub(crate) run_ms: Option<i64>,
     /// Its first record to its last.
     pub(crate) span: Option<(i64, i64)>,
@@ -630,7 +684,8 @@ impl Agent {
                         label: r.get::<_, Option<String>>(2)?.unwrap_or(agent_id),
                         agent_type: r.get(3)?,
                         run_ms: r.get(4)?,
-                        span: at(5)?.zip(at(6)?),
+                        role: r.get(5)?,
+                        span: at(6)?.zip(at(7)?),
                     },
                 ))
             })?
@@ -642,6 +697,7 @@ impl Agent {
         Self {
             label: agent_id.to_string(),
             agent_type: None,
+            role: None,
             run_ms: None,
             span: None,
         }
@@ -690,7 +746,7 @@ mod tests {
     }
 
     /// A session's links are read by its key: no scan of `github_links`
-    /// for every Session row (#67).
+    /// for every chain row (#67).
     #[test]
     fn a_sessions_links_are_read_by_index() {
         let dir = test_dir("links-plan");

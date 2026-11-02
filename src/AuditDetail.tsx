@@ -2,12 +2,12 @@
 // It reads only while mounted, and not while Audit is hidden.
 import { Alert, AlertDescription, Button, DayTimeline, EmptyState } from '@crawfordyoung/ui'
 import { X } from 'lucide-react'
-import type { AuditFilter, AuditPath } from './api'
+import type { AuditFilter, AuditPath } from './audit-types'
 import { shortDay } from './audit'
 import { useTimeline } from './useTimeline'
 
 // Legend order, which also sets each kind's colour. The agent spans are non-idle subagent time,
-// not the table column's wall time, and run in the sub lane under the orchestrator's.
+// not the table column's wall time, and run in the sub lane under the root agent's.
 const KINDS = [
   { key: 'active', label: 'Active' },
   { key: 'wait', label: 'Waiting on you' },

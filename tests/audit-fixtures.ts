@@ -1,5 +1,5 @@
 // Builders for Audit rollups in tests: every metric zero unless a test sets it.
-import type { Audit, AuditNode, Headline, Metrics, NodeKind, Slice } from '../src/api'
+import type { Audit, AuditNode, Headline, Metrics, NodeKind, Slice } from '../src/audit-types'
 
 export function metrics(over: Partial<Metrics> = {}): Metrics {
   return {
@@ -15,7 +15,7 @@ export function metrics(over: Partial<Metrics> = {}): Metrics {
     open: false,
     progress: null,
     byDay: [],
-    byAgentType: [],
+    byRole: [],
     byModel: [],
     ...over,
   }

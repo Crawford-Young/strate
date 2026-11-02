@@ -83,16 +83,43 @@ describe('toCsv', () => {
   })
 
   it('keys each row by its node path, so same-named siblings stay apart', () => {
+    // Two root agents of different /clear chains, named alike.
     const csv = toCsv(
       audit([
         node('repo', 'acme/web', {}, [
-          node('session', 's-1', {}, [], { label: 'acme-web-3' }),
-          node('session', 's-2', {}, [], { label: 'acme-web-3' }),
+          node('agent', 'p-1/', {}, [], { label: 'acme-web-3' }),
+          node('agent', 'p-2/', {}, [], { label: 'acme-web-3' }),
         ]),
       ]),
     )
-    expect(csv).toContain(',"[[""repo"",""acme/web""],[""session"",""s-1""]]",')
-    expect(csv).toContain(',"[[""repo"",""acme/web""],[""session"",""s-2""]]",')
+    expect(csv).toContain(',"[[""repo"",""acme/web""],[""agent"",""p-1/""]]",')
+    expect(csv).toContain(',"[[""repo"",""acme/web""],[""agent"",""p-2/""]]",')
+  })
+
+  it('puts the agents one level under the PR, with no session level or column', () => {
+    const rows = lines(
+      toCsv(
+        audit([
+          node('repo', 'acme/web', {}, [
+            node('issue', '3', {}, [
+              node('pr', '4', {}, [
+                node('agent', 'p-1/acme-web-3', {}, [], { label: 'acme-web-3' }),
+                node('agent', 's-1/a-1', {}, [], { label: 'implementer' }),
+              ]),
+            ]),
+          ]),
+        ]),
+      ),
+    )
+    expect(rows[0]?.startsWith('Kind,Level 1,Level 2,Level 3,Level 4,Path,')).toBe(true)
+    expect(rows[0]).not.toMatch(/Session,|Level 5/)
+    expect(rows.slice(1).map((r) => r.split(',').slice(0, 5))).toEqual([
+      ['repo', 'acme/web', '', '', ''],
+      ['issue', 'acme/web', '3', '', ''],
+      ['pr', 'acme/web', '3', '4', ''],
+      ['agent', 'acme/web', '3', '4', 'acme-web-3'],
+      ['agent', 'acme/web', '3', '4', 'implementer'],
+    ])
   })
 
   it('writes every metric as a number, an unknown one empty', () => {
