@@ -46,6 +46,8 @@ export interface NeedsYou {
   waitingFor: string | null
   sinceMs: number | null
   workstream: number | null
+  /** A parked background job's id in `claude agents --json`, for `claude attach <id>`; else null. */
+  bgId: string | null
 }
 
 /** How an agent runs, kebab-case. Lanes added later (e.g. `cloud`) arrive as their own string. */

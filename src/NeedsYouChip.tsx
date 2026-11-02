@@ -1,6 +1,6 @@
 // The header's "N need you" chip and its popover: every wait on the user, tab or not (#69).
 // Longest wait first; a tabbed wait's action goes to its tab, a tab-less one's copies the command
-// that resumes it.
+// that resumes it, or for a parked background job, attaches to it (#120).
 import {
   Button,
   Popover,
@@ -25,7 +25,7 @@ interface NeedsYouChipProps {
   onGoToTab: (id: number) => void
 }
 
-type Action = { kind: 'tab'; tab: number } | { kind: 'copy'; sessionId: string } | null
+type Action = { kind: 'tab'; tab: number } | { kind: 'copy'; command: string; label: string } | null
 
 interface Row {
   key: string
@@ -43,14 +43,20 @@ function toRow(wait: NeedsYou, sessions: Workstream[], tabIds: Set<number>): Row
     tab != null
       ? { kind: 'tab', tab }
       : wait.sessionId !== null
-        ? { kind: 'copy', sessionId: wait.sessionId }
+        ? wait.bgId !== null
+          ? { kind: 'copy', command: `claude attach ${wait.bgId}`, label: 'copy attach' }
+          : { kind: 'copy', command: `claude --resume ${wait.sessionId}`, label: 'copy resume' }
         : null
   return {
     key: `${wait.source}:${wait.sessionId}:${wait.agentId}`,
     name:
       ws?.name ?? (wait.sessionId ? `session ${wait.sessionId.slice(0, 8)}` : 'unknown session'),
     // A registry wait with nothing named is a background session blocked on you.
-    what: wait.waitingFor ?? (wait.source === 'registry' ? 'blocked' : 'waiting'),
+    // A parked job is a background session blocked on you, not a live wait.
+    what:
+      wait.bgId !== null
+        ? 'parked'
+        : (wait.waitingFor ?? (wait.source === 'registry' ? 'blocked' : 'waiting')),
     sinceMs: wait.sinceMs,
     action,
   }
@@ -98,7 +104,7 @@ export function NeedsYouChip({ waits, sessions, tabs, onGoToTab }: NeedsYouChipP
 
 type Copied = 'idle' | 'copied' | 'failed'
 
-const COPY_LABEL = { idle: 'copy resume', copied: 'copied', failed: 'copy failed' } as const
+const COPIED_LABEL = { copied: 'copied', failed: 'copy failed' } as const
 
 /** One dense line: dot, name, what it waits for, how long, then its action. */
 function WaitRow({ row, onGoToTab }: { row: Row; onGoToTab: (id: number) => void }) {
@@ -130,8 +136,8 @@ function WaitRow({ row, onGoToTab }: { row: Row; onGoToTab: (id: number) => void
       </div>
       {action?.kind === 'tab' && actionButton('go to tab', () => onGoToTab(action.tab))}
       {action?.kind === 'copy' &&
-        actionButton(COPY_LABEL[copied], () => {
-          navigator.clipboard.writeText(`claude --resume ${action.sessionId}`).then(
+        actionButton(copied === 'idle' ? action.label : COPIED_LABEL[copied], () => {
+          navigator.clipboard.writeText(action.command).then(
             () => setCopied('copied'),
             () => setCopied('failed'),
           )
