@@ -169,9 +169,10 @@ impl Store {
     }
 
     /// Rebuilds the agent model (#107) from the stored rows, in one
-    /// transaction: every agent's role and own charge, and the message
-    /// edges. Ingest keeps it current on its own, so this is only for a
-    /// rebuild; it is idempotent.
+    /// transaction: every agent's role, own charge and dispatch result, the
+    /// `claude --bg` launches re-read from the stored events, and the
+    /// launch and message edges (#108). Ingest keeps it current on its own,
+    /// so this is only for a rebuild; it is idempotent.
     pub fn rebuild_model(&mut self) -> Result<()> {
         let tx = self.transaction()?;
         model::rebuild(&tx.tx)?;
@@ -185,9 +186,15 @@ impl Ingest<'_> {
     /// continuation edges. Then it re-resolves the agents the batch touched
     /// in the agent model, recomputes the cost, time and context rollups of
     /// that session and of any session sharing one of the batch's requests,
-    /// and rebuilds the `message` edges when the batch stored a
-    /// cross-session message. All of these are functions of the stored rows,
-    /// so batches in any order converge to a cold build.
+    /// and rebuilds the `launch` edges (when the batch stored a `claude
+    /// --bg` launch or its result, or moved its session orchestrator's name,
+    /// start or process root) and the `message` edges (when the launch
+    /// edges changed or the batch stored a cross-session message). All of
+    /// these are functions of the stored rows, so batches in any order
+    /// converge to a cold build. Meta.json `finished` is the exception,
+    /// read from disk: a subagent's batch re-reads it until it is set, but
+    /// the meta is mostly written after the last record, so a discovery
+    /// pass usually reads it.
     pub fn batch(&self, batch: &Batch) -> Result<()> {
         ingest::batch(&self.tx, batch)
     }
@@ -739,6 +746,81 @@ mod tests {
             .query_row("SELECT count(*) FROM agents", [], |r| r.get(0))
             .expect("agents");
         assert_eq!(agents, 3, "every agent kept");
+        let version: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("version");
+        assert_eq!(version, migrate::MIGRATIONS.len() as i64, "the latest");
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_v22_store_derives_its_launches_and_dispatch_results_on_upgrade() {
+        let dir = test_dir("store-v22-every-lane");
+        let db = dir.join("strate.db");
+        let mut v22 = Connection::open(&db).expect("v22 db");
+        migrate::migrate(&mut v22, &migrate::MIGRATIONS[..22]).expect("v22");
+        // s1 dispatched w1 in the background and ran `claude --bg`, which
+        // printed s2's short id: s2's only link is that launch.
+        v22.execute_batch(
+            r#"INSERT INTO sessions (session_id, path, started_at) VALUES
+                   ('s1', '/p/s1.jsonl', '2026-10-20T10:00:00.000Z'),
+                   ('s2', '/p/s2.jsonl', '2026-10-20T10:01:05.000Z');
+               INSERT INTO agents (id, session_id, agent_id, kind) VALUES
+                   (1, 's1', NULL, 'orchestrator'), (2, 's1', 'w1', 'subagent'),
+                   (3, 's2', NULL, 'orchestrator');
+               INSERT INTO edges (id, kind, parent, child, tool_use_id) VALUES
+                   (7, 'dispatch', 1, 2, 'toolu_w1');
+               INSERT INTO registry (key, kind, session_id, bg_id, cwd, started_at_ms,
+                       first_seen_ms, last_seen_ms)
+               VALUES ('bg:abcd1234', 'background', 's2', 'abcd1234', '/work/x', 1, 1, 1);
+               INSERT INTO events (session_id, agent_id, type, uuid, timestamp, file,
+                       byte_offset, raw, tool_uses, tool_results)
+               VALUES ('s1', NULL, 'user', 'e1', '2026-10-20T10:00:30.000Z', '/p/s1.jsonl', 0,
+                       '{"type":"user","message":{"content":[{"type":"tool_result",
+                         "tool_use_id":"toolu_w1","content":"Lorem."}]},
+                         "toolUseResult":{"status":"async_launched"}}', NULL, '["toolu_w1"]'),
+                      ('s1', NULL, 'assistant', 'e2', '2026-10-20T10:01:00.000Z',
+                       '/p/s1.jsonl', 100,
+                       '{"type":"assistant","message":{"content":[{"type":"tool_use",
+                         "id":"toolu_l1","name":"Bash",
+                         "input":{"command":"claude --bg -n lorem"}}]}}',
+                       '[["toolu_l1","Bash"]]', NULL),
+                      ('s1', NULL, 'user', 'e3', '2026-10-20T10:01:01.000Z', '/p/s1.jsonl', 200,
+                       '{"type":"user","message":{"content":[{"type":"tool_result",
+                         "tool_use_id":"toolu_l1","content":"Started abcd1234."}]}}',
+                       NULL, '["toolu_l1"]');"#,
+        )
+        .expect("v22 rows");
+        drop(v22);
+
+        let store = Store::open_in(&db, "UTC").expect("upgrade");
+        let launch: (i64, String, Option<String>, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT agent, tool_use_id, name, result FROM launches",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .expect("one launch");
+        assert_eq!(
+            launch,
+            (
+                1,
+                "toolu_l1".into(),
+                Some("lorem".into()),
+                Some("Started abcd1234.".into())
+            )
+        );
+        let model = views::agent_model(&store.conn).expect("model");
+        let s2 = model.iter().find(|a| a.id == 3).expect("s2");
+        assert_eq!(
+            (s2.parent, s2.parent_via.as_deref()),
+            (Some(1), Some("launch"))
+        );
+        let w1 = model.iter().find(|a| a.id == 2).expect("w1");
+        assert_eq!((w1.finished, w1.background), (false, true));
         let version: i64 = store
             .conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))

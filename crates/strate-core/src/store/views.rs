@@ -707,10 +707,11 @@ type Row = (GraphAgent, Option<(i64, String)>);
 /// state and registry wait come from the session's listing ([`listings`]),
 /// and workers' states read its liveness.
 ///
-/// A worker has finished once its dispatch is answered or its task
-/// notification arrives. A background dispatch's tool_result is the
-/// immediate launch result (`toolUseResult.status` `async_launched`), not
-/// an answer: its end is the notification (#42). A teammate rests
+/// A worker has finished once its dispatch is answered, its task
+/// notification arrives or its meta.json says so (#108). A background
+/// dispatch's tool_result is the immediate launch result
+/// (`toolUseResult.status` `async_launched`), not an answer: its end is
+/// the notification (#42). A teammate rests
 /// ([`rests`]) from its newest idle notice in this session's own
 /// transcript, the lead's, matched by its meta name, or idle hook.
 /// The session's answers are read once ([`answered`]), not per agent: a
@@ -728,7 +729,7 @@ fn session_agents(
              a.description, a.model, a.cost_usd, a.context_tokens, a.context_pct,
              a.hook_state,
              EXISTS (SELECT 1 FROM needs_you AS n WHERE n.agent = a.id AND n.source = 'hook'),
-             EXISTS (SELECT 1 FROM events AS n
+             a.finished IS 1 OR EXISTS (SELECT 1 FROM events AS n
                  WHERE n.session_id = a.session_id AND n.notification_task = a.agent_id),
              (SELECT p.parent FROM edges AS p
                  WHERE p.child = a.id AND p.kind IN ('dispatch', 'teammate')),

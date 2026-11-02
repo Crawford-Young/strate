@@ -1,0 +1,766 @@
+//! Every lane (#108): a worker's finished and background state, and the
+//! `launch` edge from a `claude --bg` command to the background session it
+//! started, read through `views::agent_model`. Synthetic records, graphs
+//! and registry rows go straight into a store in a temp dir; the
+//! fixture-wide cases are in tests/model.rs.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use serde_json::{Value, json};
+use strate_core::discovery::{AgentRef, Graph, Link, SubagentMeta, SubagentNode, discover};
+use strate_core::registry::{Kind, RegistryEntry, RegistryEvent};
+use strate_core::store::Store;
+use strate_core::store::views::{self, Lane, ModelAgent};
+use strate_core::tail::{Batch, TailEvent};
+
+mod common;
+
+use common::{Temp, batch as whole, fixture_home, records, transcripts};
+
+// ---- builders -----------------------------------------------------------------
+
+/// A store fed in-memory batches of transcripts under `<temp>/projects/-work-x`.
+struct Home {
+    t: Temp,
+    store: Store,
+    next: HashMap<PathBuf, u64>,
+}
+
+impl Home {
+    fn new(name: &str) -> Self {
+        let t = Temp::new(name);
+        let store = Store::open_in(t.db(), "UTC").expect("open");
+        Self {
+            t,
+            store,
+            next: HashMap::new(),
+        }
+    }
+
+    /// Where a transcript of `session` (or its subagent `agent`) sits.
+    fn transcript(&self, session: &str, agent: Option<&str>) -> PathBuf {
+        let project = self.t.path().join("projects/-work-x");
+        match agent {
+            None => project.join(format!("{session}.jsonl")),
+            Some(a) => project
+                .join(session)
+                .join("subagents")
+                .join(format!("agent-{a}.jsonl")),
+        }
+    }
+
+    fn feed(&mut self, session: &str, agent: Option<&str>, lines: &[Value]) {
+        let path: Arc<Path> = self.transcript(session, agent).into();
+        let offset = self.next.entry(path.to_path_buf()).or_default();
+        let mut events = Vec::new();
+        for value in lines {
+            events.push(TailEvent::Record {
+                path: path.clone(),
+                offset: *offset,
+                value: value.clone(),
+            });
+            *offset += 100;
+        }
+        self.store
+            .ingest(&Batch {
+                path,
+                events,
+                checkpoint: None,
+            })
+            .expect("ingest");
+    }
+
+    /// Subagent `agent` of `session` dispatched by `parent` with
+    /// `toolu_<agent>`, its meta `finished` as given.
+    fn dispatched(
+        &self,
+        session: &str,
+        agent: &str,
+        parent: AgentRef,
+        finished: Option<bool>,
+    ) -> SubagentNode {
+        let tool_use_id = format!("toolu_{agent}");
+        SubagentNode {
+            session_id: session.into(),
+            agent_id: agent.into(),
+            path: self.transcript(session, Some(agent)),
+            meta: Some(SubagentMeta {
+                tool_use_id: Some(tool_use_id.clone()),
+                finished,
+                ..SubagentMeta::default()
+            }),
+            link: Link::Dispatch {
+                parent,
+                tool_use_id,
+            },
+        }
+    }
+
+    fn graph(&mut self, subagents: Vec<SubagentNode>) {
+        self.store
+            .ingest_graph(&Graph {
+                subagents,
+                ..Graph::default()
+            })
+            .expect("graph");
+    }
+
+    fn model(&self) -> Vec<ModelAgent> {
+        let reader = Store::open_reader(self.t.db()).expect("reader");
+        views::agent_model(&reader).expect("model")
+    }
+
+    fn agent(&self, session: &str, agent: Option<&str>) -> ModelAgent {
+        self.model()
+            .into_iter()
+            .find(|a| a.session_id == session && a.agent_id.as_deref() == agent)
+            .unwrap_or_else(|| panic!("no agent {session} {agent:?}"))
+    }
+
+    fn id(&self, session: &str, agent: Option<&str>) -> i64 {
+        self.agent(session, agent).id
+    }
+
+    /// The spawn parent of `session`'s orchestrator and how.
+    fn via(&self, session: &str) -> (Option<i64>, Option<String>) {
+        let a = self.agent(session, None);
+        (a.parent, a.parent_via)
+    }
+}
+
+fn orchestrator(session: &str) -> AgentRef {
+    AgentRef::Session {
+        session_id: session.into(),
+    }
+}
+
+fn at(time: &str) -> String {
+    format!("2026-10-20T{time}.000Z")
+}
+
+/// A user record at `time`.
+fn prompt(time: &str) -> Value {
+    json!({"type": "user", "timestamp": at(time), "cwd": "/work/x",
+        "message": {"role": "user", "content": "Lorem."}})
+}
+
+/// A user record at `time` in a transcript of `root`'s `/clear` chain.
+fn linked(root: &str, time: &str) -> Value {
+    let mut v = prompt(time);
+    v["session_id"] = json!(root);
+    v
+}
+
+fn title(name: &str) -> Value {
+    json!({"type": "custom-title", "customTitle": name})
+}
+
+/// An assistant record at `time` calling `tool` (`toolu_<id>`) on `command`.
+fn shell(time: &str, id: &str, tool: &str, command: &str) -> Value {
+    json!({"type": "assistant", "timestamp": at(time), "message": {"role": "assistant",
+        "content": [{"type": "tool_use", "id": format!("toolu_{id}"), "name": tool,
+            "input": {"command": command, "description": "Lorem"}}]}})
+}
+
+/// The tool_result of `toolu_<id>` at `time`, its text `text`.
+fn result(time: &str, id: &str, text: &str) -> Value {
+    json!({"type": "user", "timestamp": at(time), "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": format!("toolu_{id}"), "content": text}]},
+        "toolUseResult": {"stdout": text, "stderr": "", "interrupted": false}})
+}
+
+/// The immediate result of background dispatch `toolu_<id>`.
+fn async_launched(time: &str, id: &str) -> Value {
+    json!({"type": "user", "timestamp": at(time), "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": format!("toolu_{id}"),
+            "content": [{"type": "text", "text": "Async agent launched successfully."}]}]},
+        "toolUseResult": {"isAsync": true, "status": "async_launched", "agentId": id}})
+}
+
+/// The task notification of subagent `agent`.
+fn notified(time: &str, agent: &str) -> Value {
+    json!({"type": "user", "timestamp": at(time), "message": {"role": "user", "content":
+        format!("<task-notification>\n<task-id>{agent}</task-id>\n<status>completed</status>\n<summary>Lorem</summary>\n</task-notification>")}})
+}
+
+/// The SendMessage result of message `msg`, at `time`.
+fn sent(time: &str, msg: &str) -> Value {
+    json!({"type": "user", "timestamp": at(time), "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": format!("toolu_send_{msg}"), "content": "Lorem."}]},
+        "toolUseResult": {"success": true, "msg_id": msg}})
+}
+
+/// Message `msg` received from another session at `time`.
+fn peer(time: &str, msg: &str) -> Value {
+    json!({"type": "user", "timestamp": at(time), "message": {"role": "user",
+        "content": "Lorem ipsum."}, "origin": {"kind": "peer", "msg_id": msg, "name": "lorem"}})
+}
+
+/// A background registry row with short id `id` naming `session` as `name`.
+fn background(id: &str, session: &str, name: Option<&str>) -> RegistryEvent {
+    RegistryEvent::Appeared {
+        entry: RegistryEntry {
+            cwd: "/work/x".into(),
+            kind: Kind::Background,
+            started_at: 1,
+            pid: None,
+            id: Some(id.into()),
+            session_id: Some(session.into()),
+            name: name.map(str::to_string),
+            status: None,
+            waiting_for: None,
+            state: None,
+        },
+        at_ms: 1_000,
+    }
+}
+
+// ---- finished and background ----------------------------------------------------
+
+#[test]
+fn meta_finished_marks_a_worker_finished_and_sticks_across_later_scans() {
+    let mut h = Home::new("lanes-meta-finished");
+    h.feed("s1", None, &[prompt("10:00:00")]);
+    let w1 = h.dispatched("s1", "w1", orchestrator("s1"), Some(true));
+    let w2 = h.dispatched("s1", "w2", orchestrator("s1"), None);
+    h.graph(vec![w1, w2]);
+    assert!(h.agent("s1", Some("w1")).finished, "meta finished");
+    assert!(!h.agent("s1", Some("w2")).finished, "still running");
+    assert!(!h.agent("s1", None).finished, "an orchestrator never is");
+
+    // A later scan whose meta lacks `finished` (or says false) keeps it.
+    let w1 = h.dispatched("s1", "w1", orchestrator("s1"), None);
+    let w2 = h.dispatched("s1", "w2", orchestrator("s1"), Some(false));
+    h.graph(vec![w1, w2]);
+    assert!(h.agent("s1", Some("w1")).finished, "sticky");
+    assert!(!h.agent("s1", Some("w2")).finished);
+}
+
+#[test]
+fn a_batch_on_a_linked_subagents_transcript_rereads_its_meta() {
+    let mut h = Home::new("lanes-meta-reread");
+    h.feed("s1", None, &[prompt("10:00:00")]);
+    let w1 = h.dispatched("s1", "w1", orchestrator("s1"), None);
+    let meta = w1.path.with_file_name("agent-w1.meta.json");
+    std::fs::create_dir_all(meta.parent().expect("dir")).expect("dirs");
+    std::fs::write(&meta, r#"{"agentType":"x","toolUseId":"toolu_w1"}"#).expect("meta");
+    h.graph(vec![w1]);
+    h.feed("s1", Some("w1"), &[prompt("10:00:10")]);
+    assert!(!h.agent("s1", Some("w1")).finished);
+
+    // The engine discovers a linked subagent only once: its next batch reads
+    // the meta it finished in.
+    std::fs::write(
+        &meta,
+        r#"{"agentType":"x","toolUseId":"toolu_w1","finished":true}"#,
+    )
+    .expect("meta");
+    h.feed("s1", Some("w1"), &[prompt("10:00:20")]);
+    assert!(h.agent("s1", Some("w1")).finished);
+}
+
+#[test]
+fn a_dispatch_answer_or_task_notification_finishes_a_worker_and_async_marks_it_background() {
+    let mut h = Home::new("lanes-dispatch-results");
+    // w1's answer and w2's launch arrive before the graph, w3's after it.
+    h.feed(
+        "s1",
+        None,
+        &[
+            prompt("10:00:00"),
+            result("10:01:00", "w1", "Lorem."),
+            async_launched("10:02:00", "w2"),
+        ],
+    );
+    let nodes = ["w1", "w2", "w3", "w4"]
+        .map(|w| h.dispatched("s1", w, orchestrator("s1"), None))
+        .to_vec();
+    h.graph(nodes);
+    h.feed("s1", None, &[async_launched("10:03:00", "w3")]);
+
+    let state = |h: &Home, w: &str| {
+        let a = h.agent("s1", Some(w));
+        (a.finished, a.background)
+    };
+    assert_eq!(state(&h, "w1"), (true, false), "answered");
+    assert_eq!(state(&h, "w2"), (false, true), "launched in the background");
+    assert_eq!(state(&h, "w3"), (false, true));
+    assert_eq!(state(&h, "w4"), (false, false), "no result yet");
+
+    h.feed("s1", None, &[notified("10:09:00", "w2")]);
+    assert_eq!(state(&h, "w2"), (true, true), "its task notification");
+    let s1 = h.agent("s1", None);
+    assert_eq!((s1.finished, s1.background), (false, false));
+}
+
+#[test]
+fn the_live_graph_draws_no_worker_whose_meta_says_finished() {
+    let mut h = Home::new("lanes-live-finished");
+    h.store
+        .apply_registry(&[background("aaaa0001", "s1", None)])
+        .expect("registry");
+    h.feed("s1", None, &[prompt("10:00:00")]);
+    let w1 = h.dispatched("s1", "w1", orchestrator("s1"), Some(true));
+    let w2 = h.dispatched("s1", "w2", orchestrator("s1"), None);
+    h.graph(vec![w1, w2]);
+    let reader = Store::open_reader(h.t.db()).expect("reader");
+    let graph = views::live_graph(&reader, h.id("s1", None))
+        .expect("query")
+        .expect("a graph");
+    let drawn: Vec<Option<&str>> = graph.agents.iter().map(|a| a.agent_id.as_deref()).collect();
+    assert_eq!(drawn, [None, Some("w2")]);
+}
+
+// ---- launch edges -----------------------------------------------------------------
+
+#[test]
+fn a_launch_links_the_session_its_resume_id_names() {
+    let mut h = Home::new("lanes-launch-resume");
+    h.feed("s2", None, &[prompt("09:00:00")]);
+    h.feed(
+        "s1",
+        None,
+        &[
+            prompt("10:00:00"),
+            shell("10:01:00", "l1", "Bash", "claude --bg --resume s2 -n lorem"),
+            result("10:01:01", "l1", "Started abcd1234."),
+        ],
+    );
+    assert_eq!(h.via("s2"), (Some(h.id("s1", None)), Some("launch".into())));
+}
+
+#[test]
+fn a_launch_links_the_background_row_whose_short_id_its_result_prints() {
+    let mut h = Home::new("lanes-launch-id");
+    h.store
+        .apply_registry(&[
+            background("abcd1234", "s3", None),
+            background("abcd123", "s4", None),
+        ])
+        .expect("registry");
+    h.feed("s3", None, &[prompt("10:01:05")]);
+    h.feed("s4", None, &[prompt("10:01:05")]);
+    // PowerShell, a subagent's transcript, and the result in a later batch.
+    h.feed(
+        "s1",
+        Some("w1"),
+        &[shell(
+            "10:01:00",
+            "l1",
+            "PowerShell",
+            r#"& "C:\Users\x\.local\bin\claude.exe" --bg -n other "Lorem.""#,
+        )],
+    );
+    assert_eq!(h.via("s3"), (None, None), "no result yet");
+    h.feed(
+        "s1",
+        Some("w1"),
+        &[result(
+            "10:01:01",
+            "l1",
+            "Started background session abcd1234.\n",
+        )],
+    );
+    assert_eq!(
+        h.via("s3"),
+        (Some(h.id("s1", Some("w1"))), Some("launch".into()))
+    );
+    assert_eq!(h.via("s4"), (None, None), "a whole token only");
+}
+
+#[test]
+fn a_launch_links_the_earliest_background_session_named_as_it_since_it_ran() {
+    let mut h = Home::new("lanes-launch-name");
+    h.feed(
+        "s1",
+        None,
+        &[
+            prompt("10:00:00"),
+            shell("10:01:00", "l1", "Bash", "claude --bg -n ' Lorem-Unit '"),
+            result("10:01:01", "l1", "Lorem."),
+            shell("10:01:02", "l2", "Bash", "claude --bg -n lorem-unit"),
+            result("10:01:03", "l2", "Lorem."),
+        ],
+    );
+    // s5 started before both launches; s7 (by its own title) and s6 (by
+    // its registry name) after, s7 first. s8 has no transcript, so no
+    // start. Each launch takes the earliest session not taken yet.
+    h.store
+        .apply_registry(&[
+            background("aaaa0001", "s5", Some("lorem-unit")),
+            background("aaaa0002", "s6", Some("LOREM-UNIT")),
+            background("aaaa0003", "s7", None),
+            background("aaaa0004", "s8", Some("lorem-unit")),
+        ])
+        .expect("registry");
+    h.feed("s5", None, &[prompt("09:59:00")]);
+    h.feed("s6", None, &[prompt("10:01:05")]);
+    h.feed("s7", None, &[title("lorem-unit"), prompt("10:01:04")]);
+    let s1 = Some(h.id("s1", None));
+    let launch = Some("launch".to_string());
+    assert_eq!(h.via("s7"), (s1, launch.clone()), "l1, by its title");
+    assert_eq!(h.via("s6"), (s1, launch), "l2, by its registry name");
+    assert_eq!(h.via("s5"), (None, None), "started before the launches");
+}
+
+#[test]
+fn a_resume_beats_a_printed_id_which_beats_a_name() {
+    let mut h = Home::new("lanes-launch-precedence");
+    h.store
+        .apply_registry(&[
+            background("abcd1234", "s3", Some("lorem")),
+            background("abcd5678", "s4", Some("lorem")),
+        ])
+        .expect("registry");
+    for s in ["s2", "s3", "s4"] {
+        h.feed(s, None, &[prompt("10:02:00")]);
+    }
+    h.feed(
+        "s1",
+        None,
+        &[
+            prompt("10:00:00"),
+            shell("10:01:00", "l1", "Bash", "claude --bg -r s2 -n lorem"),
+            result("10:01:01", "l1", "abcd1234"),
+            shell("10:01:10", "l2", "Bash", "claude --bg -n lorem"),
+            result("10:01:11", "l2", "abcd5678"),
+        ],
+    );
+    let s1 = Some(h.id("s1", None));
+    let launch = Some("launch".to_string());
+    assert_eq!(h.via("s2"), (s1, launch.clone()), "resume");
+    assert_eq!(h.via("s4"), (s1, launch), "printed id");
+    assert_eq!(h.via("s3"), (None, None), "its name alone loses to l2's id");
+}
+
+#[test]
+fn a_launch_beats_a_message_and_a_child_takes_its_earliest_launch() {
+    let mut h = Home::new("lanes-launch-message");
+    // s6 messages s2 first; s1 and later s9 both launch it.
+    h.feed("s6", None, &[sent("10:00:30", "m1")]);
+    h.feed("s2", None, &[peer("10:00:31", "m1"), prompt("10:02:00")]);
+    h.feed(
+        "s9",
+        None,
+        &[
+            shell("10:01:30", "l9", "Bash", "claude --bg --resume s2"),
+            result("10:01:31", "l9", "Lorem."),
+        ],
+    );
+    h.feed(
+        "s1",
+        None,
+        &[
+            shell("10:01:00", "l1", "Bash", "claude --bg --resume s2"),
+            result("10:01:01", "l1", "Lorem."),
+        ],
+    );
+    assert_eq!(h.via("s2"), (Some(h.id("s1", None)), Some("launch".into())));
+}
+
+#[test]
+fn a_launch_closing_a_spawn_cycle_is_refused() {
+    let mut h = Home::new("lanes-launch-cycle");
+    // s1's subagent w1 relaunches s1 in the background: s1 -> w1 -> s1.
+    h.feed("s1", None, &[prompt("10:00:00")]);
+    h.feed(
+        "s1",
+        Some("w1"),
+        &[
+            shell("10:01:00", "l1", "Bash", "claude --bg --resume s1"),
+            result("10:01:01", "l1", "Lorem."),
+        ],
+    );
+    let w1 = h.dispatched("s1", "w1", orchestrator("s1"), None);
+    h.graph(vec![w1]);
+    assert_eq!(h.via("s1"), (None, None));
+    let w1 = h.agent("s1", Some("w1"));
+    assert_eq!(w1.parent_via.as_deref(), Some("dispatch"));
+}
+
+#[test]
+fn a_printed_short_id_links_the_first_link_of_its_chain_since_the_launch() {
+    let mut h = Home::new("lanes-launch-id-clear");
+    h.feed(
+        "s1",
+        None,
+        &[
+            shell("10:01:00", "l1", "Bash", "claude --bg -n lorem"),
+            result("10:01:01", "l1", "Started abcd1234."),
+        ],
+    );
+    // The launch started s3, which then /cleared into s3b: the registry
+    // row, keyed by its short id, now names s3b.
+    h.store
+        .apply_registry(&[background("abcd1234", "s3", None)])
+        .expect("registry");
+    h.feed("s3", None, &[linked("s3", "10:01:05")]);
+    h.feed("s3b", None, &[linked("s3", "10:30:00")]);
+    h.store
+        .apply_registry(&[background("abcd1234", "s3b", None)])
+        .expect("registry");
+    assert_eq!(h.via("s3"), (Some(h.id("s1", None)), Some("launch".into())));
+    assert_eq!(h.via("s3b"), (None, None), "a later link of the chain");
+}
+
+#[test]
+fn a_launch_naming_its_child_by_id_beats_an_earlier_launch_by_name_alone() {
+    let mut h = Home::new("lanes-launch-two-pass");
+    h.store
+        .apply_registry(&[
+            background("abcd1234", "s3", Some("lorem")),
+            background("abcd5678", "s4", Some("lorem")),
+        ])
+        .expect("registry");
+    h.feed("s3", None, &[prompt("10:01:20")]);
+    h.feed("s4", None, &[prompt("10:01:30")]);
+    // s1's launch by name ran first; s9's later one printed s3's short id.
+    h.feed(
+        "s1",
+        None,
+        &[
+            shell("10:01:00", "l1", "Bash", "claude --bg -n lorem"),
+            result("10:01:01", "l1", "Lorem."),
+        ],
+    );
+    h.feed(
+        "s9",
+        None,
+        &[
+            shell("10:01:10", "l9", "Bash", "claude --bg -n other"),
+            result("10:01:11", "l9", "Started abcd1234."),
+        ],
+    );
+    let launch = Some("launch".to_string());
+    assert_eq!(h.via("s3"), (Some(h.id("s9", None)), launch.clone()));
+    assert_eq!(
+        h.via("s4"),
+        (Some(h.id("s1", None)), launch),
+        "l1 takes the next lorem still free"
+    );
+}
+
+#[test]
+fn launches_go_in_time_order_however_their_timestamps_are_spelled() {
+    let mut h = Home::new("lanes-launch-time-order");
+    h.store
+        .apply_registry(&[background("aaaa0001", "s3", Some("lorem"))])
+        .expect("registry");
+    h.feed("s3", None, &[prompt("10:01:01")]);
+    // As text, s1's earlier "…10:01:00Z" sorts after s9's "…10:01:00.500Z".
+    let mut l1 = shell("10:01:00", "l1", "Bash", "claude --bg -n lorem");
+    l1["timestamp"] = json!("2026-10-20T10:01:00Z");
+    let mut l9 = shell("10:01:00", "l9", "Bash", "claude --bg -n lorem");
+    l9["timestamp"] = json!("2026-10-20T10:01:00.500Z");
+    h.feed("s9", None, &[l9]);
+    h.feed("s1", None, &[l1]);
+    assert_eq!(h.via("s3"), (Some(h.id("s1", None)), Some("launch".into())));
+}
+
+#[test]
+fn a_batch_rebuilds_the_launch_edges_only_when_it_changes_what_they_read() {
+    let mut h = Home::new("lanes-launch-inputs");
+    h.store
+        .apply_registry(&[background("aaaa0001", "s3", Some("lorem"))])
+        .expect("registry");
+    h.feed(
+        "s1",
+        None,
+        &[shell("10:01:00", "l1", "Bash", "claude --bg -n lorem")],
+    );
+    h.feed("s3", None, &[prompt("10:01:05")]);
+    let launched = (Some(h.id("s1", None)), Some("launch".to_string()));
+    assert_eq!(h.via("s3"), launched);
+
+    // The edge is wiped behind the store's back, so a batch that rebuilds
+    // the launch edges shows by restoring it. Rebuilding on every
+    // orchestrator batch cost a full pass over every launch (#108).
+    let raw = rusqlite::Connection::open(h.t.db()).expect("raw");
+    let wipe = || {
+        raw.execute("DELETE FROM edges WHERE kind = 'launch'", [])
+            .expect("wipe")
+    };
+    wipe();
+    h.feed("s3", None, &[prompt("10:05:00")]);
+    h.feed("s1", None, &[prompt("10:06:00")]);
+    assert_eq!(h.via("s3"), (None, None), "no start, name or chain moved");
+    h.feed("s3", None, &[title("Lorem")]);
+    assert_eq!(h.via("s3"), launched, "a new name");
+    wipe();
+    h.feed("s3", None, &[prompt("10:01:04")]);
+    assert_eq!(h.via("s3"), launched, "an earlier start");
+    wipe();
+    h.feed("s3", None, &[linked("s0", "10:07:00")]);
+    assert_eq!(h.via("s3"), launched, "joined a chain");
+}
+
+// ---- lanes-home: cold and incremental -----------------------------------------------
+
+const L1: &str = "5e55f2f2-0000-4000-8000-0000000000e1";
+const L2: &str = "5e55f2f2-0000-4000-8000-0000000000e2";
+const L3: &str = "5e55f2f2-0000-4000-8000-0000000000e3";
+const L4: &str = "5e55f2f2-0000-4000-8000-0000000000e4";
+
+fn home() -> PathBuf {
+    fixture_home("lanes-home")
+}
+
+/// The registry row the generator describes: L3, started by L2's launch.
+fn registry() -> Vec<RegistryEvent> {
+    vec![background("c0ffee01", L3, Some("lorem-unit"))]
+}
+
+fn cold(t: &Temp) -> Vec<ModelAgent> {
+    let mut store = Store::open_in(t.db(), "UTC").expect("open");
+    store
+        .ingest_graph(&discover(&home()).expect("discover"))
+        .expect("graph");
+    for path in transcripts(&home()) {
+        store.ingest(&whole(&path)).expect("ingest");
+    }
+    store.apply_registry(&registry()).expect("registry");
+    drop(store);
+    views::agent_model(&Store::open_reader(t.db()).expect("reader")).expect("model")
+}
+
+/// Each agent keyed by (session, agent id): its lane, parent (by key) and
+/// how, finished and background.
+type Keyed = (
+    (String, Option<String>),
+    Lane,
+    Option<(String, Option<String>)>,
+    Option<String>,
+    bool,
+    bool,
+);
+
+fn keyed(model: &[ModelAgent]) -> Vec<Keyed> {
+    let keys: HashMap<i64, (String, Option<String>)> = model
+        .iter()
+        .map(|a| (a.id, (a.session_id.clone(), a.agent_id.clone())))
+        .collect();
+    let mut out: Vec<Keyed> = model
+        .iter()
+        .map(|a| {
+            (
+                keys[&a.id].clone(),
+                a.lane,
+                a.parent.map(|p| keys[&p].clone()),
+                a.parent_via.clone(),
+                a.finished,
+                a.background,
+            )
+        })
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+#[test]
+fn lanes_home_reads_as_its_generator_describes() {
+    let t = Temp::new("lanes-home-cold");
+    let model = keyed(&cold(&t));
+    let key = |s: &str, a: Option<&str>| (s.to_string(), a.map(str::to_string));
+    let row = |s: &str, a: Option<&str>| {
+        model
+            .iter()
+            .find(|k| k.0 == key(s, a))
+            .unwrap_or_else(|| panic!("{s} {a:?}"))
+            .clone()
+    };
+    let l1 = Some(key(L1, None));
+    let dispatch = Some("dispatch".to_string());
+    let worker = |a: &str, finished: bool, background: bool| {
+        (
+            key(L1, Some(a)),
+            Lane::Subagent,
+            l1.clone(),
+            dispatch.clone(),
+            finished,
+            background,
+        )
+    };
+    assert_eq!(
+        row(L1, Some("a9100000000000001")),
+        worker("a9100000000000001", true, false),
+        "answered"
+    );
+    assert_eq!(
+        row(L1, Some("a9100000000000002")),
+        worker("a9100000000000002", true, true),
+        "meta finished"
+    );
+    assert_eq!(
+        row(L1, Some("a9100000000000003")),
+        worker("a9100000000000003", false, true),
+        "still running"
+    );
+    assert_eq!(
+        row(L1, Some("a9100000000000004")),
+        worker("a9100000000000004", true, true),
+        "its task notification"
+    );
+    assert_eq!(
+        row(L3, None),
+        (
+            key(L3, None),
+            Lane::BackgroundSession,
+            Some(key(L2, None)),
+            Some("launch".into()),
+            false,
+            false
+        ),
+        "the launch beats L4's message"
+    );
+    for s in [L1, L2, L4] {
+        assert_eq!(row(s, None).2, None, "{s}");
+    }
+}
+
+/// `path`'s lines `range` as one batch.
+fn part(path: &Path, range: std::ops::Range<usize>) -> Option<Batch> {
+    let events: Vec<TailEvent> = records(path, range).into_iter().map(|(e, _)| e).collect();
+    (!events.is_empty()).then(|| Batch {
+        path: path.into(),
+        events,
+        checkpoint: None,
+    })
+}
+
+#[test]
+fn lanes_home_built_in_any_order_equals_a_cold_build() {
+    let ct = Temp::new("lanes-cold");
+    let want = keyed(&cold(&ct));
+
+    // The registry first, then every transcript's second half in reverse
+    // order, the graph, and the first halves in order.
+    let t = Temp::new("lanes-incremental");
+    let mut store = Store::open_in(t.db(), "UTC").expect("open");
+    store.apply_registry(&registry()).expect("registry");
+    let paths = transcripts(&home());
+    let halves: Vec<usize> = paths
+        .iter()
+        .map(|p| records(p, 0..usize::MAX).len().div_ceil(2))
+        .collect();
+    for (path, half) in paths.iter().zip(&halves).rev() {
+        if let Some(b) = part(path, *half..usize::MAX) {
+            store.ingest(&b).expect("second half");
+        }
+    }
+    store
+        .ingest_graph(&discover(&home()).expect("discover"))
+        .expect("graph");
+    for (path, half) in paths.iter().zip(&halves) {
+        if let Some(b) = part(path, 0..*half) {
+            store.ingest(&b).expect("first half");
+        }
+    }
+    let reader = Store::open_reader(t.db()).expect("reader");
+    assert_eq!(keyed(&views::agent_model(&reader).expect("model")), want);
+
+    // A rebuild from the stored rows changes nothing.
+    store.rebuild_model().expect("rebuild");
+    assert_eq!(keyed(&views::agent_model(&reader).expect("model")), want);
+}
