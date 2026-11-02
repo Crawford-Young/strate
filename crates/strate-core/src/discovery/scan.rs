@@ -230,7 +230,13 @@ fn read_object(path: &Path, warnings: &mut Vec<Warning>) -> Option<Map<String, V
 /// read now: a linked subagent's records start no discovery pass, so its
 /// batch reads it too (#108). `None` when the meta is missing, unreadable or says nothing.
 pub(crate) fn meta_finished(transcript: &Path, agent_id: &str) -> Option<bool> {
-    read_meta(transcript, agent_id, &mut Vec::new())?.finished
+    meta_of(transcript, agent_id)?.finished
+}
+
+/// The meta of the subagent whose transcript is `transcript`, read now,
+/// with no warning; `None` when it is missing or unreadable.
+pub(crate) fn meta_of(transcript: &Path, agent_id: &str) -> Option<SubagentMeta> {
+    read_meta(transcript, agent_id, &mut Vec::new())
 }
 
 fn read_meta(

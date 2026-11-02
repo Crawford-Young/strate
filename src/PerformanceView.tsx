@@ -82,7 +82,7 @@ function Panel({ title, children }: { title?: string; children: ReactNode }) {
   return (
     <section
       aria-label={title}
-      className="min-w-0 overflow-x-auto rounded-lg border border-border bg-surface px-3.5 py-3"
+      className="relative min-w-0 overflow-x-auto rounded-lg border border-border bg-surface px-3.5 py-3"
     >
       {title && <h3 className="mb-2 text-xs font-medium text-muted-foreground">{title}</h3>}
       {children}

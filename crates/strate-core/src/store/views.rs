@@ -1063,9 +1063,28 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
     // A finished worker is left to the Audit (#81).
     rows.retain(|(a, _)| a.agent_id.is_none() || a.state != AgentState::Done);
     let drawn_ids: Vec<i64> = rows.iter().map(|(a, _)| a.id).collect();
+    let heads: HashMap<String, i64> = rows
+        .iter()
+        .filter(|(a, _)| a.agent_id.is_none())
+        .map(|(a, _)| (a.session_id.clone(), a.id))
+        .collect();
     let mut agents = Vec::with_capacity(rows.len());
     let mut edges = Vec::new();
     for (mut agent, edge) in rows {
+        // A worker nothing links yet (no meta, no discovery pass) hangs
+        // under its session's orchestrator, its nearest drawn ancestor
+        // for sure: never edgeless (#109).
+        let edge = edge.or_else(|| {
+            let head = heads
+                .get(&agent.session_id)
+                .filter(|_| agent.agent_id.is_some())?;
+            let kind = if agent.kind == "teammate" {
+                "teammate"
+            } else {
+                "dispatch"
+            };
+            Some((*head, kind.to_string()))
+        });
         // One whose parent is not drawn (a finished dispatcher, a lead
         // outside the graph, a spawner on an earlier link or in a chain
         // that is not live) hangs under its nearest drawn ancestor, else

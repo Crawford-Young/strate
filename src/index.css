@@ -8,3 +8,11 @@
 :root {
   color-scheme: dark;
 }
+
+/* The app shell fills the window and its panels scroll; the page itself never does, whatever
+   escapes a panel (every scroll box is `relative` too, so sr-only text clips inside it). */
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+}

@@ -139,7 +139,7 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
         onLayoutChanged={onLayout}
         className="min-h-0 flex-1"
       >
-        <ResizablePanel id="canvas" minSize={`${MIN_SIZE.canvas}%`}>
+        <ResizablePanel id="canvas" minSize={`${MIN_SIZE.canvas}%`} className="relative">
           <main
             ref={canvasRef}
             tabIndex={-1}
@@ -161,6 +161,7 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
           panelRef={panels.refs.console}
           collapsible
           minSize={`${MIN_SIZE.console}%`}
+          className="relative"
         >
           {panels.prefs.console.open && (
             <aside aria-label="Console" className="flex h-full flex-col bg-surface">

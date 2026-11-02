@@ -131,7 +131,7 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
     // The page never scrolls: the main panel does, alone.
     <div
       hidden={hidden}
-      className="flex h-screen flex-col overflow-hidden bg-background text-foreground"
+      className="relative flex h-screen flex-col overflow-hidden bg-background text-foreground"
     >
       <AuditControls
         title={
@@ -174,7 +174,7 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
         }
       />
       <ResizablePanelGroup id="strate-audit" orientation="vertical" className="min-h-0 flex-1">
-        <ResizablePanel id="audit-main" minSize="20%">
+        <ResizablePanel id="audit-main" minSize="20%" className="relative">
           {/* The panel's own box scrolls (react-resizable-panels sets overflow: auto on it), so
               main is not a scroll box too: nested, the two drew two scrollbars (#54). */}
           <main aria-busy={main.pending} className="space-y-4 p-4 aria-busy:opacity-70">
@@ -248,7 +248,7 @@ export function AuditView({ hidden, onBack }: AuditViewProps) {
         {shown && (
           <>
             <ResizableHandle />
-            <ResizablePanel id="audit-detail" defaultSize="38%" minSize="15%">
+            <ResizablePanel id="audit-detail" defaultSize="38%" minSize="15%" className="relative">
               <AuditDetail
                 filter={filter}
                 path={shown.path}

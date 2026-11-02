@@ -20,6 +20,7 @@ import {
 import { App } from './App'
 import { REFIT_MS } from './Canvas'
 import { PREFS_KEY } from './layout'
+import { scrollBoxes, unpositioned } from '../tests/scroll-boxes'
 
 vi.mock('./api', () => ({
   agentTranscript: vi.fn(),
@@ -1030,5 +1031,31 @@ describe('audit view', () => {
     await settle()
     expect(fitView).toHaveBeenCalledOnce()
     expect(fitView).toHaveBeenCalledWith({ maxZoom: 1 })
+  })
+})
+
+describe('page', () => {
+  it('makes every scroll box a containing block, so sr-only text never grows the page', async () => {
+    transcriptMock.mockResolvedValue([
+      {
+        kind: 'tool_call',
+        id: 'toolu_1',
+        name: 'Bash',
+        args: 'Bash(bun test)',
+        status: 'success',
+        result: 'ok',
+        resultTruncated: false,
+        resultAt: null,
+        todos: null,
+        timestamp: null,
+      },
+    ])
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
+    await screen.findByRole('list', { name: 'Agent transcript' })
+    const boxes = scrollBoxes(document.body)
+    // The tab strip, both live panels, the canvas, the transcript and the hidden Audit's own.
+    expect(boxes.length).toBeGreaterThanOrEqual(6)
+    expect(unpositioned(boxes)).toEqual([])
   })
 })

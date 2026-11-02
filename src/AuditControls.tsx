@@ -42,7 +42,7 @@ export function AuditControls({
   actions,
 }: AuditControlsProps) {
   return (
-    <div className="flex min-h-12 flex-none flex-wrap items-center gap-3 border-b border-border bg-surface px-3 py-2">
+    <header className="flex min-h-12 flex-none flex-wrap items-center gap-3 border-b border-border bg-surface px-3 py-2">
       {title}
       <ToggleGroup
         type="single"
@@ -110,7 +110,7 @@ export function AuditControls({
       </ToggleGroup>
       <div className="flex-1" />
       {actions}
-    </div>
+    </header>
   )
 }
 

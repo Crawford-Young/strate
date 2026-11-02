@@ -50,7 +50,7 @@ export function Header({
           onWheel={(e) => {
             if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) e.currentTarget.scrollLeft += e.deltaY
           }}
-          className="h-full w-auto min-w-0 overflow-x-auto border-b-0 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+          className="relative h-full w-auto min-w-0 overflow-x-auto border-b-0 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
         >
           {liveSessions.map((ws) => (
             <OrchestratorTab key={ws.id} ws={ws} />

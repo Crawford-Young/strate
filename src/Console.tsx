@@ -148,7 +148,7 @@ export function AgentTranscript({ agent, working, version, labelledBy }: AgentTr
         const el = e.currentTarget
         follow.current = el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_SLACK_PX
       }}
-      className="min-h-0 flex-1 overflow-y-auto p-3"
+      className="relative min-h-0 flex-1 overflow-y-auto p-3"
     >
       {/* Records are only ever appended, so an index keys each one for good. */}
       <Transcript>{loaded.value.map((e, i) => entry(e, i, working))}</Transcript>
