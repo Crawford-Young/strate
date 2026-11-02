@@ -1,6 +1,7 @@
 // The header's "N need you" chip and its popover: every wait on the user, tab or not (#69).
 // Longest wait first; a tabbed wait's action goes to its tab, a tab-less one's copies the command
-// that resumes it, or for a parked background job, attaches to it (#120).
+// that resumes it, or for a parked background job, attaches to it (#120): a click anywhere on a
+// parked row copies, the button stays the keyboard path.
 import {
   Button,
   Popover,
@@ -25,7 +26,10 @@ interface NeedsYouChipProps {
   onGoToTab: (id: number) => void
 }
 
-type Action = { kind: 'tab'; tab: number } | { kind: 'copy'; command: string; label: string } | null
+type Action =
+  | { kind: 'tab'; tab: number }
+  | { kind: 'copy'; command: string; label: string; wholeRow: boolean }
+  | null
 
 interface Row {
   key: string
@@ -44,8 +48,18 @@ function toRow(wait: NeedsYou, sessions: Workstream[], tabIds: Set<number>): Row
       ? { kind: 'tab', tab }
       : wait.sessionId !== null
         ? wait.bgId !== null
-          ? { kind: 'copy', command: `claude attach ${wait.bgId}`, label: 'copy attach' }
-          : { kind: 'copy', command: `claude --resume ${wait.sessionId}`, label: 'copy resume' }
+          ? {
+              kind: 'copy',
+              command: `claude attach ${wait.bgId}`,
+              label: 'copy attach',
+              wholeRow: true,
+            }
+          : {
+              kind: 'copy',
+              command: `claude --resume ${wait.sessionId}`,
+              label: 'copy resume',
+              wholeRow: false,
+            }
         : null
   return {
     key: `${wait.source}:${wait.sessionId}:${wait.agentId}`,
@@ -116,14 +130,27 @@ function WaitRow({ row, onGoToTab }: { row: Row; onGoToTab: (id: number) => void
       variant="link"
       size="sm"
       aria-label={`${label} for ${row.name}`}
-      onClick={onClick}
+      onClick={(e) => {
+        // A parked row copies on click too; the button's own click must not bubble into a second.
+        e.stopPropagation()
+        onClick()
+      }}
       className="mr-1 h-7 flex-none px-2 text-xs"
     >
       {label}
     </Button>
   )
+  const copy = (command: string) =>
+    navigator.clipboard.writeText(command).then(
+      () => setCopied('copied'),
+      () => setCopied('failed'),
+    )
+  const wholeRow = action?.kind === 'copy' && action.wholeRow ? action : null
   return (
-    <li className="flex items-center gap-1 rounded hover:bg-item-hover [&+&]:border-t [&+&]:border-border">
+    <li
+      onClick={wholeRow ? () => copy(wholeRow.command) : undefined}
+      className={`flex items-center gap-1 rounded hover:bg-item-hover [&+&]:border-t [&+&]:border-border${wholeRow ? ' cursor-pointer' : ''}`}
+    >
       <div className="flex min-w-0 flex-1 items-center gap-2 px-2 py-1.5">
         <StatusDot state="needs-you" />
         <span className="max-w-[9.5em] truncate font-mono text-[13px]">{row.name}</span>
@@ -136,12 +163,9 @@ function WaitRow({ row, onGoToTab }: { row: Row; onGoToTab: (id: number) => void
       </div>
       {action?.kind === 'tab' && actionButton('go to tab', () => onGoToTab(action.tab))}
       {action?.kind === 'copy' &&
-        actionButton(copied === 'idle' ? action.label : COPIED_LABEL[copied], () => {
-          navigator.clipboard.writeText(action.command).then(
-            () => setCopied('copied'),
-            () => setCopied('failed'),
-          )
-        })}
+        actionButton(copied === 'idle' ? action.label : COPIED_LABEL[copied], () =>
+          copy(action.command),
+        )}
     </li>
   )
 }
