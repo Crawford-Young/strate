@@ -69,15 +69,20 @@ export function ResizablePanelGroup({
   )
 }
 
+/** The real panel's content box scrolls (`overflow: auto`) and takes `className`; so does this. */
+export const panelClass = (className?: string) => `overflow-auto ${className ?? ''}`.trim()
+
 export function ResizablePanel({
   id,
   panelRef,
   collapsible,
+  className,
   children,
 }: {
   id?: string | number
   collapsible?: boolean
   panelRef?: Ref<PanelImperativeHandle | null>
+  className?: string
   children?: ReactNode
 }) {
   const groupId = useContext(GroupId)
@@ -94,7 +99,11 @@ export function ResizablePanel({
     isCollapsed: () => groups.get(groupId)?.layout[panelId] === 0,
     getSize: () => ({ asPercentage: groups.get(groupId)?.layout[panelId] ?? 0, inPixels: 0 }),
   }))
-  return <section data-testid={`panel-${panelId}`}>{children}</section>
+  return (
+    <section data-testid={`panel-${panelId}`} className={panelClass(className)}>
+      {children}
+    </section>
+  )
 }
 
 export function ResizableHandle() {

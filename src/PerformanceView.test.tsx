@@ -10,6 +10,7 @@ import {
   day,
 } from '../tests/performance-fixtures'
 import type { Headline, Performance } from './api'
+import { scrollBoxes, unpositioned } from '../tests/scroll-boxes'
 import { PerformanceView } from './PerformanceView'
 
 const HOUR = 3_600_000
@@ -524,5 +525,14 @@ describe('waste & rework', () => {
   it('has no lane under no report when nothing went unreported', () => {
     show()
     expect(tile('No report back', region('Waste & rework'))).toEqual(['0', 'no task notification'])
+  })
+})
+
+describe('layout', () => {
+  it('makes each of its scroll boxes a containing block, so its sr-only tables clip inside', () => {
+    show()
+    const boxes = scrollBoxes(document.body)
+    expect(boxes.length).toBeGreaterThan(0)
+    expect(unpositioned(boxes)).toEqual([])
   })
 })

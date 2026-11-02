@@ -2,6 +2,7 @@
 // It reads only while mounted, and not while Audit is hidden.
 import { Alert, AlertDescription, Button, DayTimeline, EmptyState } from '@crawfordyoung/ui'
 import { X } from 'lucide-react'
+import { useId } from 'react'
 import type { AuditFilter, AuditPath } from './api'
 import { shortDay } from './audit'
 import { useTimeline } from './useTimeline'
@@ -27,13 +28,16 @@ interface AuditDetailProps {
 
 export function AuditDetail({ filter, path, label, active, version, onClose }: AuditDetailProps) {
   const { days, error } = useTimeline(filter, path, active, version)
+  const headingId = useId()
   return (
     <aside
       aria-label="Row detail"
       className="flex h-full flex-col border-t border-border bg-surface"
     >
       <header className="flex flex-none items-center gap-3 border-b border-border px-4 py-2">
-        <h2 className="truncate text-sm font-semibold">{label}</h2>
+        <h2 id={headingId} className="truncate text-sm font-semibold">
+          {label}
+        </h2>
         <p className="flex-1 truncate text-xs text-muted-foreground">
           Active, waiting and subagent time (non-idle) per day.
         </p>
@@ -41,7 +45,13 @@ export function AuditDetail({ filter, path, label, active, version, onClose }: A
           <X aria-hidden className="size-4" />
         </Button>
       </header>
-      <div className="min-h-0 flex-1 overflow-auto p-4">
+      {/* A stop of its own, so the keyboard can scroll the timeline; the heading names it. */}
+      <div
+        role="region"
+        aria-labelledby={headingId}
+        tabIndex={0}
+        className="relative min-h-0 flex-1 overflow-auto p-4"
+      >
         {error !== null && (
           <Alert variant="destructive">
             <AlertDescription>{error}</AlertDescription>

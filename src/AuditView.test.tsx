@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { audit, headline, node, slice } from '../tests/audit-fixtures'
 import { agentRow, performance } from '../tests/performance-fixtures'
+import { scrollBoxes, unpositioned } from '../tests/scroll-boxes'
 import {
   auditPerformance,
   auditRefresh,
@@ -35,15 +36,22 @@ vi.mock('./performance', async (importOriginal) => {
 })
 // happy-dom has no layout, so the panels are the stand-in group; the panel also shows its
 // default size, which the stand-in ignores.
-vi.mock('@crawfordyoung/ui', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@crawfordyoung/ui')>()),
-  ...(await import('../tests/resizable-mock')),
-  ResizablePanel: ({ id, defaultSize, children }: Record<string, never>) => (
-    <section data-testid={`panel-${id}`} data-default-size={defaultSize}>
-      {children}
-    </section>
-  ),
-}))
+vi.mock('@crawfordyoung/ui', async (importOriginal) => {
+  const stand = await import('../tests/resizable-mock')
+  return {
+    ...(await importOriginal<typeof import('@crawfordyoung/ui')>()),
+    ...stand,
+    ResizablePanel: ({ id, defaultSize, className, children }: Record<string, never>) => (
+      <section
+        data-testid={`panel-${id}`}
+        data-default-size={defaultSize}
+        className={stand.panelClass(className)}
+      >
+        {children}
+      </section>
+    ),
+  }
+})
 
 const rollupMock = vi.mocked(auditRollup)
 const performanceMock = vi.mocked(auditPerformance)
@@ -748,6 +756,15 @@ describe('row detail', () => {
     expect(screen.getByTestId('panel-audit-detail')).toContainElement(detail())
   })
 
+  it('scrolls its timeline in a keyboard-reachable region named by its heading', async () => {
+    await show()
+    selectFix()
+    await within(detail()).findByText('#11 closed')
+    const scroller = within(detail()).getByRole('region', { name: '#11 Fix' })
+    expect(scroller).toHaveAttribute('tabindex', '0')
+    expect(scroller).toContainElement(within(detail()).getByText('#11 closed'))
+  })
+
   it('says its agent time is non-idle, unlike the wall time of the table column', async () => {
     await show()
     selectFix()
@@ -874,9 +891,10 @@ describe('control bar', () => {
   it('is the only bar: the Audit heading at its start, ‹ Live at its end, going back', async () => {
     const onBack = vi.fn()
     await show({ onBack })
-    expect(screen.queryByRole('banner')).toBeNull()
     const heading = screen.getByRole('heading', { level: 1, name: 'Audit' })
     const bar = heading.parentElement as HTMLElement
+    // The page's one banner: the live header is not drawn.
+    expect(screen.getAllByRole('banner')).toEqual([bar])
     expect(bar.firstElementChild).toBe(heading)
     expect(within(bar).getByRole('radio', { name: '7d' })).toBeInTheDocument()
     expect(within(bar).getByRole('group', { name: 'Repos' })).toBeInTheDocument()
@@ -887,5 +905,29 @@ describe('control bar', () => {
     expect(buttons.slice(-3)).toEqual(['Refresh GitHub', 'Export CSV', 'Live'])
     fireEvent.click(screen.getByRole('button', { name: 'Live' }))
     expect(onBack).toHaveBeenCalledOnce()
+  })
+})
+
+describe('page structure', () => {
+  it('puts its heading and controls in the banner and its content in main, outside both the detail', async () => {
+    await show()
+    const banner = screen.getByRole('banner')
+    expect(banner).toContainElement(screen.getByRole('heading', { name: 'Audit' }))
+    expect(banner).toContainElement(screen.getByLabelText('Range'))
+    expect(screen.getByRole('main')).toContainElement(region('Breakdown'))
+    fireEvent.click(rowButton('acme/web'))
+    const detail = screen.getByRole('complementary', { name: 'Row detail' })
+    expect(banner).not.toContainElement(detail)
+    expect(screen.getByRole('main')).not.toContainElement(detail)
+  })
+
+  it('makes every scroll box a containing block, so sr-only text clips inside it', async () => {
+    await show()
+    fireEvent.click(rowButton('acme/web'))
+    await within(screen.getByRole('complementary', { name: 'Row detail' })).findAllByText('Oct 12')
+    const boxes = scrollBoxes(document.body)
+    // The main panel, the detail panel, the detail's own scroller and the view itself at least.
+    expect(boxes.length).toBeGreaterThanOrEqual(4)
+    expect(unpositioned(boxes)).toEqual([])
   })
 })

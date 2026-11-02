@@ -313,6 +313,174 @@ fn the_live_graph_draws_no_worker_whose_meta_says_finished() {
     assert_eq!(drawn, [None, Some("w2")]);
 }
 
+// ---- a worker's edge before discovery ----------------------------------------------
+
+/// Writes subagent `agent`'s meta as Claude Code does at spawn, before the
+/// transcript's first record.
+fn spawn_meta(h: &Home, session: &str, agent: &str, meta: &str) {
+    let path = h
+        .transcript(session, Some(agent))
+        .with_file_name(format!("agent-{agent}.meta.json"));
+    std::fs::create_dir_all(path.parent().expect("dir")).expect("dirs");
+    std::fs::write(path, meta).expect("meta");
+}
+
+/// The live graph's edges of tab `session`, as (kind, parent, child) agent ids.
+fn drawn_edges(h: &Home, session: &str) -> Vec<(String, Option<String>, Option<String>)> {
+    let reader = Store::open_reader(h.t.db()).expect("reader");
+    let graph = views::live_graph(&reader, h.id(session, None))
+        .expect("query")
+        .expect("a graph");
+    let key = |id: i64| {
+        graph
+            .agents
+            .iter()
+            .find(|a| a.id == id)
+            .expect("a drawn agent")
+            .agent_id
+            .clone()
+    };
+    let mut edges: Vec<_> = graph
+        .edges
+        .iter()
+        .map(|e| (e.kind.clone(), key(e.parent), key(e.child)))
+        .collect();
+    edges.sort();
+    edges
+}
+
+#[test]
+fn a_nested_background_dispatch_hangs_under_its_dispatcher_before_discovery_links_it() {
+    // The live sequence (#109 QA): code-20's subagent qa dispatches a
+    // background haiku. The discovery pass that links it re-reads every
+    // transcript, which took ~20 s on a real home, so the child's records
+    // land and it is drawn before any pass stores its dispatch edge.
+    let mut h = Home::new("lanes-nested-unlinked");
+    h.store
+        .apply_registry(&[background("aaaa0001", "s1", None)])
+        .expect("registry");
+    h.feed(
+        "s1",
+        None,
+        &[
+            prompt("10:00:00"),
+            shell("10:00:01", "qa", "Agent", "Lorem"),
+        ],
+    );
+    let qa = h.dispatched("s1", "qa", orchestrator("s1"), None);
+    h.graph(vec![qa]);
+    h.feed(
+        "s1",
+        Some("qa"),
+        &[
+            prompt("10:00:02"),
+            shell("10:00:03", "hk", "Agent", "Lorem"),
+        ],
+    );
+    spawn_meta(
+        &h,
+        "s1",
+        "hk",
+        r#"{"agentType":"claude","toolUseId":"toolu_hk","parentAgentId":"qa","spawnDepth":2,
+            "requestShape":"background"}"#,
+    );
+    h.feed("s1", Some("hk"), &[prompt("10:00:04")]);
+    h.feed("s1", Some("qa"), &[async_launched("10:00:04", "hk")]);
+    // And one the orchestrator dispatched: its meta names no parent agent.
+    h.feed("s1", None, &[shell("10:00:05", "w2", "Agent", "Lorem")]);
+    spawn_meta(
+        &h,
+        "s1",
+        "w2",
+        r#"{"agentType":"x","toolUseId":"toolu_w2","spawnDepth":1}"#,
+    );
+    h.feed("s1", Some("w2"), &[prompt("10:00:06")]);
+
+    let edge = |kind: &str, parent: Option<&str>, child: &str| {
+        (
+            kind.to_string(),
+            parent.map(str::to_string),
+            Some(child.to_string()),
+        )
+    };
+    assert_eq!(
+        drawn_edges(&h, "s1"),
+        [
+            edge("dispatch", None, "qa"),
+            edge("dispatch", None, "w2"),
+            edge("dispatch", Some("qa"), "hk"),
+        ],
+        "each under its dispatcher, from its spawn meta"
+    );
+    assert!(
+        h.agent("s1", Some("hk")).background,
+        "its launch result reads through the edge"
+    );
+}
+
+#[test]
+fn a_worker_whose_tool_use_is_not_stored_yet_hangs_under_the_parent_its_meta_names() {
+    let mut h = Home::new("lanes-meta-parent");
+    h.store
+        .apply_registry(&[background("aaaa0001", "s1", None)])
+        .expect("registry");
+    h.feed("s1", None, &[prompt("10:00:00")]);
+    let qa = h.dispatched("s1", "qa", orchestrator("s1"), None);
+    h.graph(vec![qa]);
+    h.feed("s1", Some("qa"), &[prompt("10:00:02")]);
+    // The child's batch beat its dispatcher's tool_use record; one naming
+    // itself, or an agent not stored, names no parent.
+    spawn_meta(
+        &h,
+        "s1",
+        "hk",
+        r#"{"toolUseId":"toolu_hk","parentAgentId":"qa","spawnDepth":2}"#,
+    );
+    spawn_meta(&h, "s1", "me", r#"{"parentAgentId":"me"}"#);
+    spawn_meta(&h, "s1", "lo", r#"{"parentAgentId":"lorem"}"#);
+    for w in ["hk", "me", "lo"] {
+        h.feed("s1", Some(w), &[prompt("10:00:04")]);
+    }
+    let edge = |parent: Option<&str>, child: &str| {
+        (
+            "dispatch".to_string(),
+            parent.map(str::to_string),
+            Some(child.to_string()),
+        )
+    };
+    assert_eq!(
+        drawn_edges(&h, "s1"),
+        [
+            edge(None, "lo"),
+            edge(None, "me"),
+            edge(None, "qa"),
+            edge(Some("qa"), "hk"),
+        ]
+    );
+}
+
+#[test]
+fn a_worker_with_no_meta_yet_hangs_under_its_sessions_orchestrator() {
+    let mut h = Home::new("lanes-no-meta");
+    h.store
+        .apply_registry(&[background("aaaa0001", "s1", None)])
+        .expect("registry");
+    h.feed("s1", None, &[prompt("10:00:00")]);
+    let qa = h.dispatched("s1", "qa", orchestrator("s1"), None);
+    h.graph(vec![qa]);
+    h.feed("s1", Some("qa"), &[prompt("10:00:02")]);
+    // No meta, so nothing names its dispatcher: at worst it hangs under its
+    // nearest drawn ancestor, never edgeless (#109).
+    h.feed("s1", Some("w9"), &[prompt("10:00:04")]);
+    assert_eq!(
+        drawn_edges(&h, "s1"),
+        [
+            ("dispatch".to_string(), None, Some("qa".to_string())),
+            ("dispatch".to_string(), None, Some("w9".to_string())),
+        ]
+    );
+}
+
 // ---- launch edges -----------------------------------------------------------------
 
 #[test]

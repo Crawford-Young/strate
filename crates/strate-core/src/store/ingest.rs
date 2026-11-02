@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::{Result, account, live, model};
 use crate::cost::SYNTHETIC;
-use crate::discovery::{AgentRef, Graph, Link, Unresolved, meta_finished, scalar_text};
+use crate::discovery::{AgentRef, Graph, Link, Unresolved, meta_finished, meta_of, scalar_text};
 use crate::tail::{Batch, TailEvent};
 
 /// The agent a transcript belongs to, read from where it sits in the
@@ -104,6 +104,9 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
         if subagent && !finished {
             set_finished(conn, id, meta_finished(&batch.path, agent_id))?;
         }
+        if subagent {
+            link_from_meta(conn, id, &owner.session_id, &batch.path, agent_id)?;
+        }
     }
     model::batch(conn, &owner.session_id, agent)?;
     let touched = account::touched(conn, &owner.session_id, &requests)?;
@@ -127,6 +130,60 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
         ])?;
     }
     Ok(())
+}
+
+/// Stores subagent `id`'s dispatch edge while none links it yet, by
+/// discovery's rule over the store instead of the files: the meta Claude
+/// Code writes at spawn (before the first record) names a `toolUseId`,
+/// and the stored agent of this session whose record holds that tool_use
+/// dispatched it, else the stored sibling its `parentAgentId` names. The
+/// discovery pass that links a new subagent re-reads every transcript
+/// (4 s release on a real 2.3 GB home, ~20 s seen live in a debug build),
+/// so a short-lived worker was drawn and gone with no edge (#109). A
+/// teammate (`teamName`) and a worker with no meta are left to discovery.
+fn link_from_meta(
+    conn: &Connection,
+    id: i64,
+    session_id: &str,
+    transcript: &Path,
+    agent_id: &str,
+) -> Result<()> {
+    let linked: bool = conn
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM edges
+                 WHERE child = ?1 AND kind IN ('dispatch', 'teammate'))",
+        )?
+        .query_row([id], |r| r.get(0))?;
+    let Some(meta) = (!linked).then(|| meta_of(transcript, agent_id)).flatten() else {
+        return Ok(());
+    };
+    if meta.team_name.is_some() {
+        return Ok(());
+    }
+    let dispatcher = match &meta.tool_use_id {
+        Some(tool_use_id) => conn
+            .prepare_cached(
+                "SELECT a.id FROM events AS e
+                 JOIN agents AS a ON a.session_id = e.session_id AND a.agent_id IS e.agent_id
+                 WHERE e.session_id = ?1 AND e.tool_uses IS NOT NULL
+                     AND instr(e.tool_uses, ?2) > 0 AND a.id <> ?3
+                 ORDER BY e.id LIMIT 1",
+            )?
+            .query_row(params![session_id, format!("\"{tool_use_id}\""), id], |r| {
+                r.get(0)
+            })
+            .optional()?,
+        None => None,
+    };
+    let sibling = match meta.parent_agent_id.as_deref().filter(|p| *p != agent_id) {
+        Some(parent) => agent_row(conn, session_id, Some(parent))?,
+        None => None,
+    };
+    let Some(parent) = dispatcher.or(sibling) else {
+        return Ok(());
+    };
+    let tool_use_id = dispatcher.and(meta.tool_use_id.as_deref());
+    edge(conn, "dispatch", Some(parent), id, tool_use_id, None, None)
 }
 
 /// Sets `session_id`'s start, its orchestrator's earliest record time,
