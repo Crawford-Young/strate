@@ -83,7 +83,7 @@ describe('toCsv', () => {
   })
 
   it('keys each row by its node path, so same-named siblings stay apart', () => {
-    // Two root agents of different /clear chains, named alike.
+    // Two main agents of different /clear chains, named alike.
     const csv = toCsv(
       audit([
         node('repo', 'acme/web', {}, [

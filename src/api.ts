@@ -156,8 +156,7 @@ export interface AuditFilter {
   repos: string[]
 }
 
-export type NodeKind =
-  'root' | 'repo' | 'topic' | 'unlinked' | 'epic' | 'issue' | 'pr' | 'session' | 'agent'
+export type NodeKind = 'root' | 'repo' | 'topic' | 'unlinked' | 'epic' | 'issue' | 'pr' | 'agent'
 
 export interface Tokens {
   input: number
@@ -194,8 +193,11 @@ export interface Metrics {
   progress: Progress | null
   /** By local day. */
   byDay: Slice[]
-  /** By agent type: `orchestrator`, a subagent's or teammate's type (`teammate` when none is recorded), or `''` (unknown). */
-  byAgentType: Slice[]
+  /**
+   * By role: the agent's parsed role if set; else a subagent's or teammate's type (`teammate`
+   * when none is recorded); else `main` for a main agent; else `''` (unknown).
+   */
+  byRole: Slice[]
   /** By model (`''`: a cell with no requests). */
   byModel: Slice[]
 }
@@ -209,7 +211,9 @@ export interface Slice {
 
 export interface AuditNode {
   /**
-   * `session` is a `/clear` chain within one charge; `topic` is a top-level node per topic charge.
+   * `topic` is a top-level node per topic charge. `agent` is a main agent (the main agent of one
+   * `/clear` chain's sessions within one charge, keyed `<process root>/<charge key>`) or a
+   * subagent (keyed `<session id>/<agent id>`), each main agent followed by its chain's subagents.
    */
   kind: NodeKind
   /** Unique among its siblings. */
@@ -255,7 +259,7 @@ export interface Audit {
 export type AuditPath = [NodeKind, string][]
 
 /**
- * `active`: the orchestrator at work. `wait`: it waits on you. `agent`: a
+ * `active`: the main agent at work. `wait`: it waits on you. `agent`: a
  * subagent at work; parallel ones overlap.
  */
 export type SpanKind = 'active' | 'wait' | 'agent'
@@ -290,7 +294,7 @@ export interface OutcomeDay {
   day: string
   issuesClosed: number
   usdPerClosedIssue: number | null
-  /** Orchestrator active time, not subagent time. */
+  /** Main-agent active time, not subagent time. */
   activeMsPerClosedIssue: number | null
   /** With linked work; a PR closing several issues counts once. */
   prsMerged: number
@@ -311,14 +315,14 @@ export interface Outcome {
   openIssues: number
 }
 
-/** One agent type on one model, or the orchestrator on one model. */
+/** One role on one model, main agents apart. */
 export interface AgentRow {
-  /** `orchestrator` on an orchestrator row; `""` when unknown. */
-  agentType: string
-  /** `""` when unknown. */
+  /** As `Metrics.byRole`: `main` on a main agent with no parsed role; `''` when unknown. */
+  role: string
+  /** `''` when unknown. */
   model: string
-  /** An orchestrator row: no dispatches, so every count is 0. */
-  orchestrator: boolean
+  /** A main-agent row (a session's main agent): no dispatches, so every count is 0. */
+  main: boolean
   /** Each dispatch with a cell in the range, once. */
   dispatches: number
   /** Completed with no `NEEDS_CONTEXT:` line in the final report. */
@@ -349,7 +353,7 @@ export interface BottleneckDay {
   promptWaitMs: number
   /** Proxy: a blocked dispatch's last record to its parent's next prompt or dispatch. */
   blockedMs: number
-  /** The orchestrator's active time. */
+  /** The main agent's active time. */
   activeMs: number
   blockedReports: number
   /** Permission prompts that started this day: the answered ones' waits. */
@@ -373,7 +377,8 @@ export interface Bottleneck {
 }
 
 export interface LaneCount {
-  agentType: string
+  /** As `AgentRow.role`. */
+  role: string
   model: string
   count: number
 }
@@ -391,12 +396,12 @@ export interface Waste {
   blocked: number
   dispatches: number
   noReport: number
-  /** The agent type and model with the most no-report dispatches. */
+  /** The role and model with the most no-report dispatches. */
   noReportTop: LaneCount | null
   compactions: number
   /** `/clear` successors started in the range. */
   clears: number
-  /** Agents, orchestrators too, whose deepest request reached 80% of the window. */
+  /** Agents, main agents too, whose deepest request reached 80% of the window. */
   contextPeaksOver80: number
   deepestPeak: Peak | null
   /** Requests retried after an API error. */
@@ -415,7 +420,7 @@ export interface Waste {
 /** The Audit performance read: every section under the same filter (days, repos). */
 export interface Performance {
   outcome: Outcome
-  /** Orchestrator rows first, then by $ (most first). */
+  /** Main-agent rows first, then by $ (most first). */
   agents: AgentRow[]
   bottleneck: Bottleneck
   waste: Waste

@@ -1,9 +1,9 @@
-//! What an Audit root agent's elapsed time covers (#67, #107, #110): a
-//! root-agent node is a `/clear` chain's sessions within one charge, and
+//! What an Audit main agent's elapsed time covers (#67, #107, #110): a
+//! main-agent node is a `/clear` chain's sessions within one charge, and
 //! its elapsed is only those sessions' time in the date filter, so no
-//! stretch of wall time sits in two root agents' elapsed. A session another
+//! stretch of wall time sits in two main agents' elapsed. A session another
 //! one messaged counts under its own charge, not nested under its
-//! messager's root agent. Every db lives in a temp dir.
+//! messager's main agent. Every db lives in a temp dir.
 
 use rusqlite::Connection;
 use strate_core::discovery::discover;
@@ -44,27 +44,27 @@ fn tree(db: &Connection, from: &str, to: &str) -> AuditNode {
     audit(db, &filter).expect("audit").root
 }
 
-/// Whether `node` is a root agent's: an Agent node counting no subagent.
+/// Whether `node` is a main agent's: an Agent node counting no subagent.
 fn is_root_agent(node: &AuditNode) -> bool {
     node.kind == NodeKind::Agent && node.metrics.agents == 0
 }
 
-/// Every root-agent node under `node`.
-fn root_agents<'a>(node: &'a AuditNode, out: &mut Vec<&'a AuditNode>) {
+/// Every main-agent node under `node`.
+fn main_agents<'a>(node: &'a AuditNode, out: &mut Vec<&'a AuditNode>) {
     for c in &node.children {
         if is_root_agent(c) {
             out.push(c);
         }
-        root_agents(c, out);
+        main_agents(c, out);
     }
 }
 
-/// The one root-agent node anywhere in `root` labelled `label`.
-fn root_agent<'a>(root: &'a AuditNode, label: &str) -> &'a AuditNode {
+/// The one main-agent node anywhere in `root` labelled `label`.
+fn main_agent<'a>(root: &'a AuditNode, label: &str) -> &'a AuditNode {
     let mut all = Vec::new();
-    root_agents(root, &mut all);
+    main_agents(root, &mut all);
     let found: Vec<_> = all.into_iter().filter(|r| r.label == label).collect();
-    assert_eq!(found.len(), 1, "root agents labelled {label:?}");
+    assert_eq!(found.len(), 1, "main agents labelled {label:?}");
     found[0]
 }
 
@@ -76,7 +76,7 @@ fn child<'a>(node: &'a AuditNode, kind: NodeKind, key: &str) -> &'a AuditNode {
         .unwrap_or_else(|| panic!("no {kind:?} {key:?} under {:?}", node.label))
 }
 
-/// The labels of the root agents directly under `node`.
+/// The labels of the main agents directly under `node`.
 fn root_labels(node: &AuditNode) -> Vec<&str> {
     node.children
         .iter()
@@ -96,34 +96,34 @@ fn a_root_agents_elapsed_is_its_chains_own_links_in_its_charge() {
     let db = chain_home(&t);
     let root = tree(&db, "2026-10-08", "2026-10-08");
     // P1 and P3 (chain-repo-5), 55 s each; P2's hour in chain-repo-6
-    // between them is that root agent's, not this one's.
-    let five = root_agent(&root, "chain-repo-5");
+    // between them is that main agent's, not this one's.
+    let five = main_agent(&root, "chain-repo-5");
     assert_eq!(five.metrics.elapsed_ms, Some(2 * 55 * S));
     assert_eq!(five.metrics.sessions, 2);
     assert_eq!(
-        root_agent(&root, "chain-repo-6").metrics.elapsed_ms,
+        main_agent(&root, "chain-repo-6").metrics.elapsed_ms,
         Some(55 * S)
     );
     // L1 and L3 55 s, L2 121 s (its message at 11:02:01), without the
     // hours between the links.
-    let director = root_agent(&root, "director-chain");
+    let director = main_agent(&root, "director-chain");
     assert_eq!(director.metrics.elapsed_ms, Some((55 + 121 + 55) * S));
     // U1 from the message it received at 11:02:02 to 11:03:55 (113 s), U2
     // 55 s.
-    let unit = root_agent(&root, "ticket-chain-repo-7");
+    let unit = main_agent(&root, "ticket-chain-repo-7");
     assert_eq!(unit.metrics.elapsed_ms, Some((113 + 55) * S));
     // Each keyed by its process root and charge.
     assert_eq!(five.key, format!("{P1}/issue_chain-repo-5"));
     assert_eq!(director.key, format!("{L1}/topic_chain"));
     assert_eq!(unit.key, format!("{U1}/issue_chain-repo-7"));
     // The director is a topic; its unit sits under its own issue, not
-    // nested under the director's root agent.
+    // nested under the director's main agent.
     let topic = child(&root, NodeKind::Topic, "chain");
     assert_eq!(root_labels(topic), ["director-chain"]);
     let repo = child(&root, NodeKind::Repo, "chain-repo");
     let seven = child(repo, NodeKind::Issue, "7");
     assert_eq!(root_labels(seven), ["ticket-chain-repo-7"]);
-    // The unit's subagents follow its root agent: one from each link, so
+    // The unit's subagents follow its main agent: one from each link, so
     // siblings from two sessions, in run order.
     assert_eq!(
         keys(seven),
@@ -188,7 +188,7 @@ fn a_messaged_session_counts_under_its_own_charge_and_a_chain_spans_its_links_in
     let t = Temp::new("chain-rows-messaged");
     let db = synthetic(&t, MESSAGED);
     // Oct 2: u under its own issue, $1; w, with no charge of its own, under
-    // its messager's topic as a root agent of its own. No director: d1 has no
+    // its messager's topic as a main agent of its own. No director: d1 has no
     // cell that day, and nothing nests under it.
     let oct2 = tree(&db, "2026-10-02", "2026-10-02");
     let kinds: Vec<_> = oct2
@@ -200,27 +200,27 @@ fn a_messaged_session_counts_under_its_own_charge_and_a_chain_spans_its_links_in
     let three = child(child(&oct2, NodeKind::Repo, "x"), NodeKind::Issue, "3");
     assert_eq!(root_labels(three), ["ticket-x-3"]);
     assert_eq!(
-        root_agent(&oct2, "ticket-x-3").metrics.elapsed_ms,
+        main_agent(&oct2, "ticket-x-3").metrics.elapsed_ms,
         Some(20 * MIN)
     );
     assert_eq!(three.metrics.cost_usd, 1.0);
     let top = child(&oct2, NodeKind::Topic, "top");
     assert_eq!(top.label, "top");
     assert_eq!(root_labels(top), ["w"]);
-    assert_eq!(root_agent(&oct2, "w").metrics.elapsed_ms, Some(5 * MIN));
+    assert_eq!(main_agent(&oct2, "w").metrics.elapsed_ms, Some(5 * MIN));
 
-    // Oct 2 to 3: the director's root agent holds d2's ten minutes, not
+    // Oct 2 to 3: the director's main agent holds d2's ten minutes, not
     // d1's.
     let elapsed = |from: &str, to: &str| {
-        root_agent(&tree(&db, from, to), "director-top")
+        main_agent(&tree(&db, from, to), "director-top")
             .metrics
             .elapsed_ms
     };
     assert_eq!(elapsed("2026-10-02", "2026-10-03"), Some(10 * MIN));
-    // The whole range: d1's half hour and d2's ten minutes, one root agent.
+    // The whole range: d1's half hour and d2's ten minutes, one main agent.
     assert_eq!(elapsed("2026-10-01", "2026-10-03"), Some(40 * MIN));
     let all = tree(&db, "2026-10-01", "2026-10-03");
     let top = child(&all, NodeKind::Topic, "top");
     assert_eq!(root_labels(top), ["director-top", "w"]);
-    assert_eq!(root_agent(&all, "director-top").metrics.sessions, 2);
+    assert_eq!(main_agent(&all, "director-top").metrics.sessions, 2);
 }

@@ -4,10 +4,10 @@
 //!
 //! - Outcome: per local day of the range, every day, the issues closed as
 //!   completed and the PRs merged on it, each at its whole-life $ and
-//!   root-agent active time (all the work charged to it, in the range or
+//!   main-agent active time (all the work charged to it, in the range or
 //!   not), plus the range's spend with no outcome yet.
 //! - Agents: per role and model, each dispatch with a cell in the range
-//!   once, by outcome; root-agent rows per role and model, flagged.
+//!   once, by outcome; main-agent rows per role and model, flagged.
 //! - Bottleneck: per local day and repo, your own time in the loop, a
 //!   blocked proxy (a blocked dispatch's last record to its parent's next
 //!   typed prompt or Agent/SendMessage dispatch, on the day it went quiet),
@@ -51,7 +51,7 @@ const ALL_DAYS: (&str, &str) = ("0001-01-01", "9999-12-31");
 #[serde(rename_all = "camelCase")]
 pub struct Performance {
     pub outcome: Outcome,
-    /// Root-agent rows first, then by $ (most first).
+    /// Main-agent rows first, then by $ (most first).
     pub agents: Vec<AgentRow>,
     pub bottleneck: Bottleneck,
     pub waste: Waste,
@@ -81,7 +81,7 @@ pub struct OutcomeDay {
     pub day: String,
     pub issues_closed: i64,
     pub usd_per_closed_issue: Option<f64>,
-    /// Root-agent active time, not subagent time.
+    /// Main-agent active time, not subagent time.
     pub active_ms_per_closed_issue: Option<i64>,
     /// With linked work; a PR closing several issues counts once.
     pub prs_merged: i64,
@@ -90,17 +90,17 @@ pub struct OutcomeDay {
     pub spend_usd: f64,
 }
 
-/// One role on one model; a root-agent row is a session's main agents.
+/// One role on one model; a main-agent row is a session's main agents.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRow {
     /// The agent's own role, else a subagent's or teammate's type, else
-    /// `root` on a root-agent row; `""` when unknown.
+    /// `main` on a main-agent row; `""` when unknown.
     pub role: String,
     /// `""` when unknown.
     pub model: String,
-    /// A root-agent row: no dispatches, so every count is 0.
-    pub root: bool,
+    /// A main-agent row: no dispatches, so every count is 0.
+    pub main: bool,
     /// Each dispatch with a cell in the range, once.
     pub dispatches: i64,
     /// Completed with no `NEEDS_CONTEXT:` line in the final report.
@@ -143,7 +143,7 @@ pub struct BottleneckDay {
     pub prompt_wait_ms: i64,
     /// The blocked proxy, on the day the blocked dispatch went quiet.
     pub blocked_ms: i64,
-    /// The root agent's active time.
+    /// The main agent's active time.
     pub active_ms: i64,
     pub blocked_reports: i64,
     /// Permission prompts that started this day: answered ones' waits.
@@ -180,7 +180,7 @@ pub struct Waste {
     pub compactions: i64,
     /// `/clear` successors started in the range.
     pub clears: i64,
-    /// Agents, root agents too, whose deepest request reached 80% of
+    /// Agents, main agents too, whose deepest request reached 80% of
     /// their model's window.
     pub context_peaks_over_80: i64,
     pub deepest_peak: Option<Peak>,
@@ -283,7 +283,7 @@ fn newest_record(conn: &Connection) -> Result<Option<i64>> {
     Ok(newest.as_deref().and_then(parse_timestamp))
 }
 
-/// Agents by (session, agent id; `None`: the root agent).
+/// Agents by (session, agent id; `None`: the main agent).
 type AgentKey = (String, Option<String>);
 
 /// An `agents` row as this read needs it.
@@ -389,7 +389,7 @@ impl Read<'_> {
     }
 
     fn outcome(&self, cells: &Cells, in_range: &[&Cell]) -> Outcome {
-        // Whole life: per issue its $ and root-agent active ms; per PR
+        // Whole life: per issue its $ and main-agent active ms; per PR
         // (its own repo) its $ and merge time.
         let mut issues: HashMap<(&str, i64), (f64, i64)> = HashMap::new();
         let mut prs: HashMap<(&str, i64), (f64, Option<i64>)> = HashMap::new();
@@ -506,7 +506,7 @@ impl Read<'_> {
         let mut rows: HashMap<(bool, String, String), AgentRow> = HashMap::new();
         for cell in in_range {
             let lane = match &cell.agent_id {
-                // A root agent's cell with no model carries no request.
+                // A main agent's cell with no model carries no request.
                 None => match &cell.model {
                     Some(model) => {
                         let info = self.agents.get(&(cell.session_id.clone(), None));
@@ -544,8 +544,8 @@ impl Read<'_> {
         }
         let mut rows: Vec<AgentRow> = rows.into_values().map(AgentRow::finish).collect();
         rows.sort_by(|a, b| {
-            b.root
-                .cmp(&a.root)
+            b.main
+                .cmp(&a.main)
                 .then(b.cost_usd.total_cmp(&a.cost_usd))
                 .then_with(|| (&a.role, &a.model).cmp(&(&b.role, &b.model)))
         });
@@ -676,13 +676,13 @@ impl Read<'_> {
                 model: r.model.clone(),
                 count: r.no_report,
             });
-        // Peaks: the dispatches and the root agents with cells in range.
-        let roots: HashSet<AgentKey> = in_range
+        // Peaks: the dispatches and the main agents with cells in range.
+        let mains: HashSet<AgentKey> = in_range
             .iter()
             .filter(|c| c.agent_id.is_none())
             .map(|c| (c.session_id.clone(), None))
             .collect();
-        let peaks: Vec<(f64, &str)> = roots
+        let peaks: Vec<(f64, &str)> = mains
             .iter()
             .filter_map(|k| self.agents.get(k))
             .chain(dispatches.iter().filter_map(|d| d.info))
@@ -771,7 +771,7 @@ impl Read<'_> {
     }
 
     /// `/clear` successors (continuation children) that started in the
-    /// range, their root agent charged in the filter.
+    /// range, their main agent charged in the filter.
     fn clears(&self, cells: &Cells) -> Result<i64> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT s.session_id, s.started_at FROM edges AS e
@@ -891,11 +891,11 @@ struct EventCounts {
 }
 
 impl AgentRow {
-    fn new((root, role, model): (bool, String, String)) -> Self {
+    fn new((main, role, model): (bool, String, String)) -> Self {
         Self {
             role,
             model,
-            root,
+            main,
             dispatches: 0,
             completed: 0,
             blocked: 0,

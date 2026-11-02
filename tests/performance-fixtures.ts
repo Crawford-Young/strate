@@ -7,7 +7,7 @@ import type {
   Performance,
   PermissionWaits,
   Waste,
-} from '../src/audit-types'
+} from '../src/api'
 
 export const day = (over: Partial<OutcomeDay> = {}): OutcomeDay => ({
   day: '2026-10-12',
@@ -32,7 +32,7 @@ export const outcome = (over: Partial<Outcome> = {}): Outcome => ({
 export const agentRow = (over: Partial<AgentRow> = {}): AgentRow => ({
   role: 'implementer',
   model: 'sonnet-5-5',
-  root: false,
+  main: false,
   dispatches: 0,
   completed: 0,
   blocked: 0,

@@ -2,7 +2,7 @@ import { fireEvent, render, screen, within } from '@testing-library/react'
 import type { ComponentProps } from 'react'
 import { describe, expect, it } from 'vitest'
 import { node, slice } from '../tests/audit-fixtures'
-import type { AuditNode } from './audit-types'
+import type { AuditNode } from './api'
 import { shortDay } from './audit'
 import { AuditTable } from './AuditTable'
 
@@ -87,7 +87,7 @@ describe('level badges', () => {
                 '12',
                 {},
                 [
-                  // A root agent and its subagent: the charge tree has no session level.
+                  // A main agent and its subagent: the charge tree has no session level.
                   node('agent', '/work/acme/acme-11', {}, [], { label: 'acme-11' }),
                   node('agent', 's-1/a-1', {}, [], { label: 'implementer' }),
                 ],
@@ -119,12 +119,12 @@ describe('level badges', () => {
 })
 
 describe('breakdown columns', () => {
-  // Oct 5 and 7 have work; a root agent and an implementer on two models.
+  // Oct 5 and 7 have work; a main agent and an implementer on two models.
   const busy = node('repo', 'acme/web', {
     costUsd: 3,
     agentMs: 2 * HOUR,
     byDay: [slice('2026-10-05', 1, HOUR), slice('2026-10-07', 2, HOUR)],
-    byRole: [slice('implementer', 2, 2 * HOUR), slice('root', 1)],
+    byRole: [slice('implementer', 2, 2 * HOUR), slice('main', 1)],
     byModel: [slice('model-a', 1), slice('model-b', 2, 2 * HOUR)],
   })
   // Only the implementer: its one segment keeps the implementer's colour.
@@ -134,7 +134,7 @@ describe('breakdown columns', () => {
     byModel: [slice('model-b', 1)],
   })
   const tree = root([busy, solo], {
-    byRole: [slice('implementer', 3, 2 * HOUR), slice('root', 1), slice('', 0.5)],
+    byRole: [slice('implementer', 3, 2 * HOUR), slice('main', 1), slice('', 0.5)],
     byModel: [slice('model-a', 1), slice('model-b', 3, 2 * HOUR)],
   })
   const days = ['2026-10-05', '2026-10-06', '2026-10-07']
@@ -160,7 +160,7 @@ describe('breakdown columns', () => {
     render(table([busy], { root: tree }))
     const r = within(row('acme/web'))
     expect(r.getByRole('img', { name: /^By role/ })).toHaveAccessibleName(
-      'By role: root $1.00 (33%), implementer $2.00 (67%)',
+      'By role: main agent $1.00 (33%), implementer $2.00 (67%)',
     )
     expect(r.getByRole('img', { name: /^By model/ })).toHaveAccessibleName(
       'By model: model-b $2.00 (67%), model-a $1.00 (33%)',
@@ -211,7 +211,7 @@ describe('breakdown columns', () => {
           swatch: li.querySelector('span')?.className.match(/bg-chart-\d/)?.[0],
         }))
     expect(legend('Role colours')).toEqual([
-      { label: 'root', swatch: 'bg-chart-6' },
+      { label: 'main agent', swatch: 'bg-chart-6' },
       { label: 'implementer', swatch: 'bg-chart-1' },
       { label: 'Unknown', swatch: 'bg-chart-2' },
     ])

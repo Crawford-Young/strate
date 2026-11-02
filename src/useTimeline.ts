@@ -1,4 +1,4 @@
-import { auditTimeline, type AuditFilter, type AuditPath, type TimelineDay } from './audit-types'
+import { auditTimeline, type AuditFilter, type AuditPath, type TimelineDay } from './api'
 import { useLoad } from './hooks'
 
 /**

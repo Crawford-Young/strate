@@ -14,7 +14,7 @@ use crate::time::parse_timestamp;
 
 /// The cells in a filter, with what they belong to.
 pub(crate) struct Cells {
-    /// In day order, the root agent's first.
+    /// In day order, the main agent's first.
     pub(crate) list: Vec<Cell>,
     /// The repos the range's cells are charged in, whatever the repo
     /// filter.
@@ -31,7 +31,7 @@ pub(crate) struct Cells {
 /// One cell in the filter: where it sits and what it adds.
 pub(crate) struct Cell {
     pub(crate) session_id: String,
-    /// `None`: the root agent.
+    /// `None`: the main agent.
     pub(crate) agent_id: Option<String>,
     /// Its index in [`Cells`]' chain rows; see [`Cells::row`].
     row: usize,
@@ -47,10 +47,10 @@ pub(crate) struct Share {
     pub(crate) unpriced: i64,
     pub(crate) tokens: Tokens,
     pub(crate) agent_ms: i64,
-    /// Active and waiting on the session line: the root agent's cells only.
+    /// Active and waiting on the session line: the main agent's cells only.
     pub(crate) line: Time,
     /// The cell's own active and waiting, for its Agent node: the same as
-    /// `line` on a root agent's cell.
+    /// `line` on a main agent's cell.
     pub(crate) own: Time,
     pub(crate) sessions: i64,
     pub(crate) agents: i64,
@@ -105,7 +105,7 @@ impl CellRow {
 }
 
 impl Cells {
-    /// Cells come in day order, the root agent's first, so a session or
+    /// Cells come in day order, the main agent's first, so a session or
     /// subagent counts on its first cell in the filter. Idle-only cells are
     /// left out: they add nothing, and would show a session on a day it
     /// only sat open.
@@ -245,7 +245,7 @@ impl Cells {
     }
 
     /// `cell`'s role: its agent's own (`agents.role`), else a subagent's or
-    /// teammate's stored type, else `root` for a root agent, else `""`
+    /// teammate's stored type, else `main` for a main agent, else `""`
     /// (unknown).
     pub(crate) fn role(&self, cell: &Cell) -> &str {
         match &cell.agent_id {
@@ -274,7 +274,7 @@ impl Cells {
             .get(&(cell.session_id.clone(), agent_id.to_string()))
     }
 
-    /// The repo of the agent `agent_id` (`None`: the root agent) of
+    /// The repo of the agent `agent_id` (`None`: the main agent) of
     /// `session_id`'s effective charge; `None` for a topic or no charge.
     pub(crate) fn repo_of(&self, session_id: &str, agent_id: Option<&str>) -> Option<&str> {
         let charge = self.charges.of(session_id, agent_id)?;
@@ -325,7 +325,7 @@ type RowKey = (String, Option<i64>);
 /// Every agent's effective charge, read once: `agent_charges` is a
 /// recursive view over every agent, so it is read whole, never per cell.
 struct Charges {
-    /// Per agent (session, agent id; `None`: the root agent), its charge
+    /// Per agent (session, agent id; `None`: the main agent), its charge
     /// (`None`: Unlinked).
     agents: HashMap<(String, Option<String>), Option<i64>>,
     by_id: HashMap<i64, Charge>,
@@ -473,7 +473,7 @@ impl Place {
 }
 
 /// A chain row: a `/clear` chain's sessions within one charge, the unit
-/// work is placed by. Its root agent's node is keyed, labelled and sorted
+/// work is placed by. Its main agent's node is keyed, labelled and sorted
 /// by it.
 pub(crate) struct ChainRow {
     /// `<chain>/<charge key>`, `<chain>/` with no charge.
@@ -571,13 +571,13 @@ fn linked_pr(prs: &[GhPr], links: &[PrLink], repo: &str) -> Option<i64> {
     })
 }
 
-/// A session as its root agent's node shows it.
+/// A session as its main agent's node shows it.
 pub(crate) struct Session {
     /// Its process root, else its id: what its `/clear` chain shares.
     chain: String,
-    /// Its root agent's name, else its registry name, else its id.
+    /// Its main agent's name, else its registry name, else its id.
     pub(crate) label: String,
-    /// Its root agent's role (`agents.role`).
+    /// Its main agent's role (`agents.role`).
     pub(crate) role: Option<String>,
     /// Its first record.
     pub(crate) start: Option<i64>,
@@ -588,7 +588,7 @@ pub(crate) struct Session {
 
 /// A session's chain, start, last activity (the latest record its timeline
 /// counts, read from the `events_session_time` index alone: v10, #46) and
-/// names and its root agent's role.
+/// names and its main agent's role.
 const SESSION_SQL: &str = "SELECT
          (SELECT ifnull(process_root, session_id) FROM sessions WHERE session_id = ?1),
          (SELECT started_at FROM sessions WHERE session_id = ?1),

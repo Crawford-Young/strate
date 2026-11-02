@@ -20,7 +20,7 @@ import type {
   Performance,
   PermissionWaits,
   Waste,
-} from './audit-types'
+} from './api'
 import { duration, money } from './format'
 import {
   bottleneckChart,
@@ -130,7 +130,7 @@ function OutcomeSection({ headline: h, outcome: o }: { headline: Headline; outco
         <StatTile
           label="Hours per closed issue"
           value={perIssueHours(perIssueMs)}
-          hint="active root-agent time"
+          hint="active main-agent time"
         />
         <StatTile label="$ per merged PR" value={money(perPr)} />
         <StatTile label="Issues closed" value={closed} hint="completed only" />
@@ -190,8 +190,8 @@ const Flag = ({ n }: { n: number }) => (n > 0 ? <Badge variant="warning">{n}</Ba
 
 /**
  * A sortable column over an agent row, its cell the value unless `cell` says otherwise. A
- * root-agent row has no dispatches: with `dispatch` set its cell is a dash and it sorts last,
- * as does a missing value. Root-agent rows are muted.
+ * main-agent row has no dispatches: with `dispatch` set its cell is a dash and it sorts last,
+ * as does a missing value. Main-agent rows are muted.
  */
 function agentColumn(
   header: string,
@@ -201,23 +201,23 @@ function agentColumn(
     dispatch = false,
   }: { cell?: (r: AgentRow) => ReactNode; dispatch?: boolean } = {},
 ): ColumnDef<AgentRow> {
-  const none = (r: AgentRow) => dispatch && r.root
+  const none = (r: AgentRow) => dispatch && r.main
   return {
     id: header,
     header,
     accessorFn: (r) => (none(r) ? undefined : (value(r) ?? undefined)),
     sortUndefined: 'last',
     cell: ({ row: { original: r } }) => (
-      <span className={r.root ? 'text-muted-foreground' : undefined}>
+      <span className={r.main ? 'text-muted-foreground' : undefined}>
         {none(r) ? '—' : cell(r)}
       </span>
     ),
   }
 }
 
-/** A row's role; a root agent's names it a root agent, after its parsed role if it has one. */
-const agentName = ({ role, root }: AgentRow) =>
-  !root ? named(role) : role === 'root' ? 'root agent' : `${named(role)} (root agent)`
+/** A row's role; a main agent's names it a main agent, after its parsed role if it has one. */
+const agentName = ({ role, main }: AgentRow) =>
+  !main ? named(role) : role === 'main' ? 'main agent' : `${named(role)} (main agent)`
 
 const inputTokens = ({ tokens: t }: AgentRow) => t.input + t.cacheRead + t.cacheWrite
 
@@ -253,7 +253,7 @@ const AGENT_COLUMNS: ColumnDef<AgentRow>[] = [
   }),
 ]
 
-const agentRowId = (r: AgentRow) => JSON.stringify([r.root, r.role, r.model])
+const agentRowId = (r: AgentRow) => JSON.stringify([r.main, r.role, r.model])
 
 function AgentsSection({ agents }: { agents: AgentRow[] }) {
   return (
@@ -370,7 +370,7 @@ function BottleneckSection({ bottleneck }: { bottleneck: Bottleneck }) {
             getRowId={repoRowId}
           />
           <p className="mt-2 text-xs text-muted-foreground">
-            Wait share can pass 100%: blocked and subagent permission time fall outside the root
+            Wait share can pass 100%: blocked and subagent permission time fall outside the main
             agent&apos;s active time.
           </p>
         </Panel>

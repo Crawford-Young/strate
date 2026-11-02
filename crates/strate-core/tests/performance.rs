@@ -551,14 +551,14 @@ fn agents_roll_up_per_role_and_model_with_root_agent_rows_flagged() {
     let rows: Vec<(&str, &str, bool)> = p
         .agents
         .iter()
-        .map(|a| (a.role.as_str(), a.model.as_str(), a.root))
+        .map(|a| (a.role.as_str(), a.model.as_str(), a.main))
         .collect();
-    // No name in perf-home parses to a role: root agents read `root`, the
+    // No name in perf-home parses to a role: main agents read `main`, the
     // subagents their type.
     assert_eq!(
         rows,
         [
-            ("root", "claude-opus-5-5", true),
+            ("main", "claude-opus-5-5", true),
             ("implementer", "claude-sonnet-5-5", false),
         ]
     );
@@ -572,7 +572,7 @@ fn agents_roll_up_per_role_and_model_with_root_agent_rows_flagged() {
         o.cost_usd,
         usd(&db, &format!("agent_id IS NULL AND {range}"))
     ));
-    // Every root agent request reads 10000 cached of 11000 input tokens.
+    // Every main agent request reads 10000 cached of 11000 input tokens.
     assert!(
         o.cache_hit_pct
             .is_some_and(|h| close(h, 100.0 * 10.0 / 11.0))
@@ -778,11 +778,12 @@ fn performance_serializes_in_camel_case_and_a_bad_day_is_an_error() {
     );
     assert!(json["agents"][1]["cacheHitPct"].is_number());
     assert_eq!(
-        (&json["agents"][0]["role"], &json["agents"][0]["root"]),
-        (&serde_json::json!("root"), &serde_json::json!(true))
+        (&json["agents"][0]["role"], &json["agents"][0]["main"]),
+        (&serde_json::json!("main"), &serde_json::json!(true))
     );
     let row = json["agents"][0].as_object().expect("row");
     assert!(!row.contains_key("agentType") && !row.contains_key("orchestrator"));
+    assert!(!row.contains_key("root"), "#110's key, now main");
     assert_eq!(json["waste"]["contextPeaksOver80"], 1);
     assert!(performance(&db, &filter("October", "2026-10-13", &[])).is_err());
 }
@@ -1050,14 +1051,14 @@ fn agent_rows_key_on_the_role_with_the_tree_fallbacks() {
     let rows: Vec<(&str, bool, f64, i64)> = p
         .agents
         .iter()
-        .map(|a| (a.role.as_str(), a.root, a.cost_usd, a.dispatches))
+        .map(|a| (a.role.as_str(), a.main, a.cost_usd, a.dispatches))
         .collect();
-    // Root agents first: their role, else `root`, with no dispatches. Then
+    // Main agents first: their role, else `main`, with no dispatches. Then
     // subagents: their role, else their type, else unknown. Each by $.
     assert_eq!(
         rows,
         [
-            ("root", true, 5.0 + 6.0, 0),
+            ("main", true, 5.0 + 6.0, 0),
             ("manager", true, 1.0, 0),
             ("", false, 4.0, 1),
             ("recon", false, 3.0, 1),
