@@ -1,6 +1,6 @@
 # CLAUDE.md — strate
 
-Stack and rationale: ADR-0001 (`docs/apps/strate/specs/2026-10-08-adr-0001-stack.md`, private docs repo). Apps-domain rules in `~/code/apps/CLAUDE.md` apply.
+Design: the v2 company spec (`docs/apps/strate/specs/2026-10-30-strate-v2-company.md`, private docs repo; it supersedes parts of the v1 design). Stack and rationale: ADR-0001 (`docs/apps/strate/specs/2026-10-08-adr-0001-stack.md`). Apps-domain rules in `~/code/apps/CLAUDE.md` apply.
 
 ## Gates
 
@@ -13,6 +13,7 @@ Every `strate-core` wave is also checked against the real `~/.claude` with a pro
 - Package manager and runtime is Bun (1.4.2, pinned in `packageManager`). Never npm, yarn or pnpm. `bunfig.toml` sets `[run] bun = true`, so every script and bin runs on the Bun runtime; no Node needed.
 - TypeScript is pinned `~6.0.3` because typescript-eslint's peer range is `<6.1.0`. Don't bump it until typescript-eslint widens.
 - Only the dark theme exists (`class="dark"` on `index.html`).
+- Strate only reads. No feature edits Claude Code settings, hooks, skills or agents, or responds to, stops or launches an agent (Epic I, #105). The gear, Harness and Terminal panels were cut in #106; don't bring them back.
 
 ## Traps
 
