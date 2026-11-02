@@ -11,7 +11,7 @@ import {
 } from '@crawfordyoung/ui'
 import { X } from 'lucide-react'
 import { useRef, useState, type RefObject } from 'react'
-import { liveGraph, needsYou, status, workstreams, type Workstream } from './api'
+import { liveGraph, needsYou, status, workstreams, type GraphAgent, type Workstream } from './api'
 import { Canvas, agentName } from './Canvas'
 import { AgentTranscript } from './Console'
 import { Header } from './Header'
@@ -40,6 +40,10 @@ interface LiveShellProps {
 
 /** The console heading's id: it names the transcript's scroll region. */
 const HEADING_ID = 'console-heading'
+
+/** An agent's charge key and where it came from, or that it has none. */
+const chargeLine = (a: GraphAgent) =>
+  a.chargeKey === null ? 'no charge' : `charge ${a.chargeKey} from ${a.chargeSource}`
 
 export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProps) {
   const version = useStoreVersion(hidden)
@@ -76,14 +80,23 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
     (currentGraphLoad && 'error' in currentGraphLoad ? currentGraphLoad.error : null)
   const selectedAgent = graph?.agents.find((a) => a.id === agentId)
   // A finished agent leaves the canvas but its transcript stays open, so the heading keeps its name.
-  const [lastNamed, setLastNamed] = useState<{ id: number; name: string } | null>(null)
-  if (selectedAgent && (lastNamed?.id !== agentId || lastNamed.name !== agentName(selectedAgent)))
-    setLastNamed({ id: selectedAgent.id, name: agentName(selectedAgent) })
-  const heading = selectedAgent
-    ? agentName(selectedAgent)
-    : lastNamed?.id === agentId
-      ? lastNamed.name
-      : 'Console'
+  const [lastNamed, setLastNamed] = useState<{ id: number; name: string; charge: string } | null>(
+    null,
+  )
+  const named = selectedAgent && {
+    id: selectedAgent.id,
+    name: agentName(selectedAgent),
+    charge: chargeLine(selectedAgent),
+  }
+  if (
+    named &&
+    (lastNamed?.id !== named.id ||
+      lastNamed.name !== named.name ||
+      lastNamed.charge !== named.charge)
+  )
+    setLastNamed(named)
+  const shown = named ?? (lastNamed?.id === agentId ? lastNamed : null)
+  const heading = shown ? shown.name : 'Console'
 
   const selectAgent = (id: number) => {
     setAgent(id)
@@ -152,9 +165,17 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
           {panels.prefs.console.open && (
             <aside aria-label="Console" className="flex h-full flex-col bg-surface">
               <div className="flex h-10 flex-none items-center gap-2 border-b border-border px-3">
-                <h2 id={HEADING_ID} className="min-w-0 flex-1 truncate text-sm font-semibold">
-                  {heading}
-                </h2>
+                <div className="flex min-w-0 flex-1 flex-col">
+                  <h2 id={HEADING_ID} className="truncate text-sm font-semibold">
+                    {heading}
+                  </h2>
+                  {/* Visible, so a sighted keyboard user reads what the node's chip only speaks. */}
+                  {shown && (
+                    <p className="truncate font-mono text-[11px] text-muted-foreground">
+                      {shown.charge}
+                    </p>
+                  )}
+                </div>
                 <Button
                   variant="ghost"
                   size="icon"

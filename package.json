@@ -26,7 +26,7 @@
     "*.{json,md,css,yml,yaml,html}": "prettier --write"
   },
   "dependencies": {
-    "@crawfordyoung/ui": "^0.31.0",
+    "@crawfordyoung/ui": "file:vendor/crawfordyoung-ui-0.31.0.tgz",
     "@tanstack/react-table": "^8.21.3",
     "@tauri-apps/api": "^2.12.4",
     "@xyflow/react": "^12.12.0",
