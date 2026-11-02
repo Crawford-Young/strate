@@ -3,11 +3,11 @@
 // React Flow. Selecting a node opens its transcript in the console.
 import {
   AgentNodeCard,
+  AgentNodeCharge,
   BorderTrace,
   Button,
   EmptyState,
   TabsContent,
-  badgeVariants,
 } from '@crawfordyoung/ui'
 import {
   Background,
@@ -33,10 +33,6 @@ import { useClock } from './hooks'
 import { useGraphLayout } from './useGraphLayout'
 
 export const agentName = (a: GraphAgent) => a.name ?? a.agentType ?? a.kind
-
-/** Where an agent's charge came from, or that it has none. */
-const chargeLine = (a: GraphAgent) =>
-  a.chargeKey === null ? 'no charge' : `charge from ${a.chargeSource}`
 
 interface CanvasProps {
   error: string | null
@@ -127,34 +123,14 @@ function AgentNode({
         className="w-48"
         name={a.role ?? agentName(a)}
         state={nodeState(a.state)}
-        // The $ rides with the state, so it shows with or without a gauge.
-        // The spaces keep the card's accessible name in words: "$1.23 needs you".
-        stateLabel={
-          <>
-            <span className="mr-1 font-normal tabular-nums text-muted-foreground">
-              {money(a.costUsd)}
-            </span>{' '}
-            {STATE_LABEL[a.state]}
-          </>
-        }
-        // The short lane keeps its room; a long charge key ellipsizes inside its chip.
-        detail={
-          <span className="flex min-w-0 items-center gap-1.5">
-            <span className="shrink-0">{laneLabel(a.lane)}</span>{' '}
-            {/* A Badge is a div, which a button can't hold; the chip takes its look on a span. */}
-            <span
-              data-slot="charge"
-              className={`${badgeVariants({ variant: 'outline' })} min-w-0 max-w-full font-mono`}
-            >
-              <span className="min-w-0 truncate">{a.chargeKey ?? 'unlinked'}</span>
-            </span>{' '}
-          </span>
-        }
+        lane={laneLabel(a.lane)}
+        charge={<AgentNodeCharge chargeKey={a.chargeKey} source={a.chargeSource} />}
+        cost={money(a.costUsd)}
+        stateLabel={STATE_LABEL[a.state]}
         context={a.contextPct ?? undefined}
         contextLabel={a.contextPct === null ? undefined : `${Math.round(a.contextPct)}%`}
         selected={selected}
-        // Hover and assistive tech both get the charge's source.
-        title={[a.description, chargeLine(a)].filter((line) => line !== null).join('\n')}
+        title={a.description ?? undefined}
         data-agent={a.id}
         onFocus={(e) => reveal(e.currentTarget)}
       />

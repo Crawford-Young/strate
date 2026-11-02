@@ -105,9 +105,9 @@ const node = (id: number) => screen.getByTestId(`node-${id}`)
 const y = (id: number) => Number(node(id).dataset.y)
 const pos = (id: number) => ({ x: node(id).dataset.x, y: node(id).dataset.y })
 const card = (name: string) => screen.getByRole('button', { name: new RegExp(name) })
-/** A card's charge chip: the last thing on its detail line. */
+/** A card's charge chip: the last thing on its meta row. */
 const chip = (card: HTMLElement) =>
-  card.querySelector('[data-slot="detail"] [data-slot="charge"]') as HTMLElement
+  card.querySelector('[data-slot="meta"] [data-slot="charge"]') as HTMLElement
 
 beforeEach(() => {
   resetFlow()
@@ -240,7 +240,7 @@ describe('node cards', () => {
     const node = card('director')
     // The role names the node; the charge has its own chip, so the full name isn't repeated.
     expect(node).not.toHaveTextContent('director_topic_company-model')
-    expect(chip(node)).toHaveTextContent(/^topic_company-model$/)
+    expect(chip(node)).toHaveTextContent(/^topic_company-model/)
     expect(node).toHaveTextContent('interactive')
     expect(node).toHaveTextContent('needs you')
     expect(node).toHaveTextContent('$1.23')
@@ -264,13 +264,15 @@ describe('node cards', () => {
     render(view({ graph }))
     await screen.findByTestId('flow')
     const node = card('builder')
-    const detail = node.querySelector('[data-slot="detail"]') as HTMLElement
-    expect(detail).toHaveTextContent(/^background\s+issue_strate-109$/)
+    const meta = node.querySelector('[data-slot="meta"]') as HTMLElement
+    // The chip also speaks its source, hidden from sight.
+    expect(meta).toHaveTextContent(/^background\s*issue_strate-109/)
+    expect(meta.lastElementChild).toBe(chip(node))
     // A long key ellipsizes inside its chip; the lane keeps its room.
     const key = within(node).getByText('issue_strate-109')
     expect(key).toHaveClass('min-w-0', 'truncate')
     expect(chip(node)).toHaveClass('min-w-0', 'max-w-full')
-    expect(within(detail).getByText('background')).toHaveClass('shrink-0')
+    expect(within(meta).getByText('background')).toHaveClass('shrink-0')
   })
 
   it("keeps the chip to the badge's own type, with no second weight stacked on it", async () => {
@@ -326,8 +328,8 @@ describe('node cards', () => {
   it('shows an Unlinked chip, and the $ with no priced request or gauge', async () => {
     render(view({ graph: { ...tiered, agents: [agent({ id: 1, name: 'loose' })], edges: [] } }))
     await screen.findByTestId('flow')
-    expect(chip(card('loose'))).toHaveTextContent(/^unlinked$/)
-    expect(card('loose')).toHaveAccessibleDescription('no charge')
+    expect(chip(card('loose'))).toHaveTextContent(/^unlinked/)
+    expect(card('loose')).toHaveAccessibleName(/no charge/)
     expect(card('loose')).toHaveTextContent('$—')
     expect(within(card('loose')).queryByRole('meter')).not.toBeInTheDocument()
   })
@@ -342,7 +344,8 @@ describe('node cards', () => {
     await screen.findByTestId('flow')
     expect(chip(card('helper'))).toHaveTextContent('pr_strate-12')
     // On the card itself, so keyboard and screen-reader users get it too, not only a mouse hover.
-    expect(card('helper')).toHaveAccessibleDescription('charge from parent')
+    expect(card('helper')).toHaveAccessibleName(/charge from parent/)
+    expect(chip(card('helper'))).toHaveAttribute('title', 'charge from parent')
   })
 
   it('names each lane, and shows one it does not know as it came', async () => {
@@ -362,7 +365,7 @@ describe('node cards', () => {
     expect(card('remote')).toHaveTextContent('cloud')
   })
 
-  it("offers the description, then the charge's source, on hover and as the card's description", async () => {
+  it("offers the description on hover and as the card's description, the source on the chip", async () => {
     const graph: LiveGraph = {
       ...tiered,
       agents: [
@@ -379,9 +382,11 @@ describe('node cards', () => {
     }
     render(view({ graph }))
     await screen.findByTestId('flow')
-    expect(card('builder')).toHaveAttribute('title', 'Build the shell\ncharge from name')
-    expect(card('builder')).toHaveAccessibleDescription(/Build the shell\s+charge from name/)
-    expect(card('quiet')).toHaveAttribute('title', 'no charge')
+    expect(card('builder')).toHaveAttribute('title', 'Build the shell')
+    expect(card('builder')).toHaveAccessibleDescription('Build the shell')
+    expect(chip(card('builder'))).toHaveAttribute('title', 'charge from name')
+    expect(card('quiet')).not.toHaveAttribute('title')
+    expect(chip(card('quiet'))).toHaveAttribute('title', 'no charge')
   })
 
   it('colours every gauge against the fixed nudge 80% and hard stop 95%', async () => {

@@ -595,7 +595,7 @@ describe('canvas', () => {
     expect(orchestrator).toHaveTextContent('$0.30')
     expect(orchestrator).toHaveTextContent('42%')
     const worker = screen.getByRole('button', { name: /implementer/ })
-    expect(worker).toHaveAttribute('title', 'Build the shell\nno charge')
+    expect(worker).toHaveAttribute('title', 'Build the shell')
     expect(worker).toHaveTextContent('subagent')
     expect(worker).toHaveTextContent('unlinked')
     expect(worker).toHaveTextContent('$0.12')
@@ -713,6 +713,42 @@ describe('console', () => {
     )
     expect(within(consolePanel()).getByRole('heading', { name: 'implementer' })).toBeInTheDocument()
     expect(within(consolePanel()).getByText('first')).toBeInTheDocument()
+  })
+
+  it("shows the selected agent's charge key and source as visible text in the heading area", async () => {
+    const charged = (a: GraphAgent): GraphAgent =>
+      a.id === 11 ? { ...a, chargeKey: 'issue_strate-109', chargeSource: 'branch' } : a
+    liveGraphMock.mockResolvedValue({ ...shellGraph, agents: shellGraph.agents.map(charged) })
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
+    const panel = consolePanel()
+    // Visible text (not sr-only, not a title), and the heading itself stays just the name.
+    const line = within(panel).getByText(/issue_strate-109/)
+    expect(line).toHaveTextContent('charge issue_strate-109 from branch')
+    expect(line).not.toHaveClass('sr-only')
+    expect(within(panel).getByRole('heading', { name: 'implementer' })).toBeInTheDocument()
+    // An agent with no charge says so.
+    fireEvent.click(screen.getByRole('button', { name: /teammate/ }))
+    expect(within(panel).getByText('no charge')).toBeInTheDocument()
+    expect(within(panel).queryByText(/issue_strate-109/)).not.toBeInTheDocument()
+  })
+
+  it('keeps the charge line of an agent that leaves the canvas', async () => {
+    const charged = (a: GraphAgent): GraphAgent =>
+      a.id === 11 ? { ...a, chargeKey: 'pr_strate-12', chargeSource: 'parent' } : a
+    liveGraphMock.mockResolvedValue({ ...shellGraph, agents: shellGraph.agents.map(charged) })
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
+    await within(consolePanel()).findByText(/pr_strate-12/)
+    liveGraphMock.mockResolvedValue({
+      ...shellGraph,
+      agents: shellGraph.agents.filter((a) => a.id !== 11),
+    })
+    act(() => storeChanged())
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: /implementer/ })).not.toBeInTheDocument(),
+    )
+    expect(within(consolePanel()).getByText('charge pr_strate-12 from parent')).toBeInTheDocument()
   })
 
   it('asks for an agent when none is selected', async () => {
