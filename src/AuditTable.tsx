@@ -25,7 +25,7 @@ import {
   type Measure,
   type Palette,
 } from './audit'
-import type { AuditNode, AuditPath, Metrics, NodeKind, Slice } from './audit-types'
+import type { AuditNode, AuditPath, Metrics, NodeKind, Slice } from './api'
 import { duration, money } from './format'
 
 /** Node kinds read from GitHub: only these can lack GitHub data worth flagging. */

@@ -67,7 +67,7 @@ impl Step {
         }
     }
 
-    /// Another cell's copy of this step: a root agent spans each of its
+    /// Another cell's copy of this step: a main agent spans each of its
     /// sessions. Every other step's copies are the same.
     fn widen(&mut self, other: &Self) {
         for span in &other.spans {
@@ -236,10 +236,10 @@ fn uncached_pr_step(number: i64) -> Step {
     step
 }
 
-/// `cell`'s Agent node. A root agent's cell: its chain row's root agent,
+/// `cell`'s Agent node. A main agent's cell: its chain row's main agent,
 /// keyed and labelled by the row, over its session. A subagent's: keyed
 /// `<session id>/<agent id>`, over its run. Siblings sort by their chain
-/// row's start, then its key, the root agent first, then the row's
+/// row's start, then its key, the main agent first, then the row's
 /// subagents by run start (none: 0), then key. The parts are joined by NUL,
 /// which no key holds, so the order is the parts' in turn.
 fn agent_step(cell: &Cell, cells: &Cells) -> Step {

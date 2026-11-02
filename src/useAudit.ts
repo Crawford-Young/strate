@@ -1,4 +1,4 @@
-import { auditRollup, type Audit, type AuditFilter } from './audit-types'
+import { auditRollup, type Audit, type AuditFilter } from './api'
 import { useCachedRead } from './useCachedRead'
 
 /**

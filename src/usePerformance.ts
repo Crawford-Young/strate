@@ -1,4 +1,4 @@
-import { auditPerformance, type AuditFilter, type Performance } from './audit-types'
+import { auditPerformance, type AuditFilter, type Performance } from './api'
 import { useCachedRead } from './useCachedRead'
 
 /** The performance read for `filter`'s days and repos, cached and reread as `useAudit` does. */

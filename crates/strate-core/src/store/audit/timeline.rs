@@ -24,9 +24,9 @@ use crate::time::{self, Cat};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SpanKind {
-    /// The root agent at work: not idle, not waiting on you.
+    /// The main agent at work: not idle, not waiting on you.
     Active,
-    /// The root agent waiting on you: a question, or the next prompt.
+    /// The main agent waiting on you: a question, or the next prompt.
     Wait,
     /// A subagent at work (not idle). Parallel ones overlap.
     Agent,
@@ -63,7 +63,7 @@ pub struct TimelineDay {
     pub marks: Vec<TimelineMark>,
 }
 
-/// A cell's time: its session, agent (`None`: the root agent) and day.
+/// A cell's time: its session, agent (`None`: the main agent) and day.
 type CellKey<'a> = (&'a str, Option<&'a str>, &'a str);
 
 /// The days in `filter` with work or a mark of the node at `path` (its
@@ -162,7 +162,7 @@ fn mark(step: &Step) -> Option<(i64, String)> {
 }
 
 /// How a run shows: idle shows nothing; a subagent's other time is agent
-/// time; the root agent's is waiting on a question or prompt, else active.
+/// time; the main agent's is waiting on a question or prompt, else active.
 fn kind(run: &Run) -> Option<SpanKind> {
     match (run.cat, &run.agent) {
         (Cat::Idle, _) => None,

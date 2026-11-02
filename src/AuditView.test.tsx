@@ -2,27 +2,27 @@ import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { audit, headline, node, slice } from '../tests/audit-fixtures'
 import { agentRow, performance } from '../tests/performance-fixtures'
-import { auditRefresh, onStoreChanged, writeExport } from './api'
-import { compact, dailyChart, shortDay } from './audit'
 import {
   auditPerformance,
+  auditRefresh,
   auditRollup,
   auditTimeline,
+  onStoreChanged,
+  writeExport,
   type Audit,
   type TimelineDay,
-} from './audit-types'
+} from './api'
+import { compact, dailyChart, shortDay } from './audit'
 import { AuditView } from './AuditView'
 import { totals } from './performance'
 
 vi.mock('./api', () => ({
-  auditRefresh: vi.fn(),
-  writeExport: vi.fn(),
-  onStoreChanged: vi.fn(),
-}))
-vi.mock('./audit-types', () => ({
   auditPerformance: vi.fn(),
+  auditRefresh: vi.fn(),
   auditRollup: vi.fn(),
   auditTimeline: vi.fn(),
+  onStoreChanged: vi.fn(),
+  writeExport: vi.fn(),
 }))
 // Spied, to see what a rerender recomputes.
 vi.mock('./audit', async (importOriginal) => {
@@ -73,7 +73,7 @@ const tree: Audit = audit(
         agentMs: 4 * HOUR,
         activeMs: 2 * HOUR,
         byDay: [slice('2026-10-12', 2.5, 3 * HOUR), slice('2026-10-13', 4, HOUR)],
-        byRole: [slice('implementer', 4, 4 * HOUR), slice('root', 2.5)],
+        byRole: [slice('implementer', 4, 4 * HOUR), slice('main', 2.5)],
         byModel: [slice('model-a', 6.5, 4 * HOUR)],
       },
       [
@@ -114,7 +114,7 @@ const tree: Audit = audit(
 )
 
 // The root holds every split key its rows do: the breakdown colours are picked over it.
-tree.root.metrics.byRole = [slice('implementer', 4, 4 * HOUR), slice('root', 2.5)]
+tree.root.metrics.byRole = [slice('implementer', 4, 4 * HOUR), slice('main', 2.5)]
 tree.root.metrics.byModel = [slice('model-a', 6.5, 4 * HOUR)]
 
 const timelineDays: TimelineDay[] = [

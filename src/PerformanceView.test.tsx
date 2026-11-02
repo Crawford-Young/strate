@@ -9,7 +9,7 @@ import {
   waste,
   day,
 } from '../tests/performance-fixtures'
-import type { Headline, Performance } from './audit-types'
+import type { Headline, Performance } from './api'
 import { PerformanceView } from './PerformanceView'
 
 const HOUR = 3_600_000
@@ -96,7 +96,7 @@ describe('outcome', () => {
   it('shows each tile over the whole range, with no delta', () => {
     show()
     expect(tile('$ per closed issue')).toEqual(['$8.22'])
-    expect(tile('Hours per closed issue')).toEqual(['0.72 h', 'active root-agent time'])
+    expect(tile('Hours per closed issue')).toEqual(['0.72 h', 'active main-agent time'])
     expect(tile('$ per merged PR')).toEqual(['$6.39'])
     expect(tile('Issues closed')).toEqual(['28', 'completed only'])
     expect(region('Outcome')).not.toHaveTextContent(/vs|Tiles:/)
@@ -112,7 +112,7 @@ describe('outcome', () => {
   it('shows dashes when nothing closed or merged', () => {
     show({ outcome: outcome() }, headline())
     expect(tile('$ per closed issue')).toEqual(['$—'])
-    expect(tile('Hours per closed issue')).toEqual(['—', 'active root-agent time'])
+    expect(tile('Hours per closed issue')).toEqual(['—', 'active main-agent time'])
     expect(tile('$ per merged PR')).toEqual(['$—'])
     expect(tile('Issues closed')).toEqual(['0', 'completed only'])
     expect(tile('Median elapsed')[0]).toBe('—')
@@ -147,9 +147,9 @@ describe('outcome', () => {
 describe('agents & models', () => {
   const agents = [
     agentRow({
-      role: 'root',
+      role: 'main',
       model: 'opus-5-5',
-      root: true,
+      main: true,
       costUsd: 289.16,
       tokens: { input: 500_000, output: 120_000, cacheRead: 8_000_000, cacheWrite: 1_500_000 },
       cacheHitPct: 98.3,
@@ -222,10 +222,10 @@ describe('agents & models', () => {
     expect(within(followups as HTMLElement).getByText('28')).not.toHaveClass('bg-warning')
   })
 
-  it('names and mutes root-agent rows, with dashes where dispatches would go', () => {
+  it('names and mutes main-agent rows, with dashes where dispatches would go', () => {
     show({ agents })
     expect(rows('Agents & models')[0]).toEqual([
-      'root agent',
+      'main agent',
       'opus-5-5',
       '—',
       '—',
@@ -240,20 +240,20 @@ describe('agents & models', () => {
     ])
     const row = within(region('Agents & models')).getAllByRole('row')[1] as HTMLElement
     expect(within(row).getByText('$289.16')).toHaveClass('text-muted-foreground')
-    expect(within(row).getByText('root agent')).toHaveClass('text-muted-foreground')
+    expect(within(row).getByText('main agent')).toHaveClass('text-muted-foreground')
     const lane = within(region('Agents & models')).getAllByRole('row')[2] as HTMLElement
     expect(within(lane).getByText('implementer')).not.toHaveClass('text-muted-foreground')
   })
 
-  it('names a root agent with a parsed role as that role, still a root agent', () => {
+  it('names a main agent with a parsed role as that role, still a main agent', () => {
     show({
       agents: [
-        agentRow({ role: 'manager', model: 'opus-5-5', root: true }),
+        agentRow({ role: 'manager', model: 'opus-5-5', main: true }),
         agentRow({ role: 'manager', model: 'opus-5-5', dispatches: 1 }),
       ],
     })
     expect(rows('Agents & models').map((r) => r.slice(0, 3))).toEqual([
-      ['manager (root agent)', 'opus-5-5', '—'],
+      ['manager (main agent)', 'opus-5-5', '—'],
       ['manager', 'opus-5-5', '1'],
     ])
   })
@@ -276,10 +276,10 @@ describe('agents & models', () => {
     ])
   })
 
-  it('keeps the order it is given: root agents, then by $', () => {
+  it('keeps the order it is given: main agents, then by $', () => {
     show({ agents })
     expect(rows('Agents & models').map((r) => r[0])).toEqual([
-      'root agent',
+      'main agent',
       'implementer',
       'unknown',
     ])
@@ -289,16 +289,16 @@ describe('agents & models', () => {
     show({ agents })
     const lanes = () => rows('Agents & models').map((r) => r[0])
     sortBy('Agents & models', '$ total')
-    expect(lanes()).toEqual(['root agent', 'implementer', 'unknown'])
+    expect(lanes()).toEqual(['main agent', 'implementer', 'unknown'])
     sortBy('Agents & models', '$ total')
-    expect(lanes()).toEqual(['unknown', 'implementer', 'root agent'])
+    expect(lanes()).toEqual(['unknown', 'implementer', 'main agent'])
     for (let i = 0; i < 2; i++) {
       sortBy('Agents & models', 'Success')
-      expect(lanes()).toEqual(['implementer', 'root agent', 'unknown'])
+      expect(lanes()).toEqual(['implementer', 'main agent', 'unknown'])
     }
   })
 
-  it('sorts the root agent after the lanes by every dispatch column, either way', () => {
+  it('sorts the main agent after the lanes by every dispatch column, either way', () => {
     show({ agents })
     const dispatch = ['Dispatches', 'Success', 'Blocked', 'No report', 'Follow-ups', '$ / dispatch']
     for (const header of headers('Agents & models'))
@@ -307,7 +307,7 @@ describe('agents & models', () => {
         const lanes = rows('Agents & models').map((r) => r[0])
         expect(lanes).toHaveLength(3)
         if (dispatch.includes(header))
-          expect(lanes.indexOf('root agent')).toBeGreaterThan(lanes.indexOf('implementer'))
+          expect(lanes.indexOf('main agent')).toBeGreaterThan(lanes.indexOf('implementer'))
       }
   })
 })
@@ -442,7 +442,7 @@ describe('bottleneck', () => {
   it('notes that the wait share can pass 100%', () => {
     show({ days })
     expect(region('Per repo')).toHaveTextContent(
-      "Wait share can pass 100%: blocked and subagent permission time fall outside the root agent's active time.",
+      "Wait share can pass 100%: blocked and subagent permission time fall outside the main agent's active time.",
     )
   })
 

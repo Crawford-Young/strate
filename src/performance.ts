@@ -1,6 +1,6 @@
 // Pure helpers for the Audit performance view: range means, and the bottleneck's sums.
 import type { StackedBarDatum, StackedBarSeries, TrendChartDatum } from '@crawfordyoung/ui'
-import type { AgentRow, BottleneckDay, OutcomeDay } from './audit-types'
+import type { AgentRow, BottleneckDay, OutcomeDay } from './api'
 import { shortDay } from './audit'
 
 const HOUR = 3_600_000

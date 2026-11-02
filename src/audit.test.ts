@@ -151,15 +151,15 @@ describe('repo chips', () => {
 })
 
 describe('breakdown colours', () => {
-  it('pins root agents to --chart-6, the other roles by $ to 1..4', () => {
+  it('pins main agents to --chart-6, the other roles by $ to 1..4', () => {
     const p = rolePalette([
       slice('implementer', 5),
-      slice('root', 9),
+      slice('main', 9),
       slice('recon', 1),
       slice('reviewer', 2),
     ])
     expect([...p.named]).toEqual([
-      ['root', 6],
+      ['main', 6],
       ['implementer', 1],
       ['reviewer', 2],
       ['recon', 3],
@@ -200,7 +200,7 @@ describe('breakdown colours', () => {
       ['d', 4],
     ])
     expect(p.other).toBe(5)
-    // Four roles besides root fit without folding.
+    // Four roles besides main fit without folding.
     expect(rolePalette(types.slice(0, 4)).other).toBeNull()
     expect(rolePalette(types.slice(0, 5)).other).toBe(5)
   })
@@ -219,8 +219,9 @@ describe('breakdown colours', () => {
     ])
   })
 
-  it('names the empty keys: an unknown role, a cell with no requests', () => {
+  it('names the empty keys and the main agent: an unknown role, a cell with no requests', () => {
     expect(roleLabel('')).toBe('Unknown')
+    expect(roleLabel('main')).toBe('main agent')
     expect(roleLabel('recon')).toBe('recon')
     expect(modelLabel('')).toBe('No requests')
     expect(modelLabel('model-a')).toBe('model-a')

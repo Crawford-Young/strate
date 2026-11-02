@@ -130,8 +130,8 @@ describe('commands', () => {
           open: false,
           progress: { completed: 1, total: 2 },
           byDay: [{ key: '2026-10-04', costUsd: 0.065, agentMs: 180000 }],
-          byAgentType: [
-            { key: 'orchestrator', costUsd: 0.065, agentMs: 0 },
+          byRole: [
+            { key: 'main', costUsd: 0.065, agentMs: 0 },
             { key: 'recon', costUsd: 0, agentMs: 180000 },
           ],
           byModel: [{ key: 'claude-opus-5-5', costUsd: 0.065, agentMs: 180000 }],
@@ -216,9 +216,9 @@ describe('commands', () => {
       },
       agents: [
         {
-          agentType: 'orchestrator',
+          role: 'main',
           model: 'claude-opus-5-5',
-          orchestrator: true,
+          main: true,
           dispatches: 0,
           completed: 0,
           blocked: 0,
@@ -232,9 +232,9 @@ describe('commands', () => {
           cacheHitPct: 90.9,
         },
         {
-          agentType: 'implementer',
+          role: 'implementer',
           model: 'claude-sonnet-5-5',
-          orchestrator: false,
+          main: false,
           dispatches: 8,
           completed: 2,
           blocked: 1,
@@ -281,7 +281,7 @@ describe('commands', () => {
         blocked: 1,
         dispatches: 8,
         noReport: 2,
-        noReportTop: { agentType: 'implementer', model: 'claude-sonnet-5-5', count: 2 },
+        noReportTop: { role: 'implementer', model: 'claude-sonnet-5-5', count: 2 },
         compactions: 1,
         clears: 1,
         contextPeaksOver80: 1,

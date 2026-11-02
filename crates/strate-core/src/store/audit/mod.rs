@@ -21,12 +21,12 @@
 //! false`, no epic, PR or progress, and is open; so is a PR it doesn't hold.
 //! Work is placed by chain row: a `/clear` chain (every file one process
 //! wrote, by its process root) within one charge. Under its place, a chain
-//! row is a root-agent node (its sessions' main agents' cells in that
+//! row is a main-agent node (its sessions' main agents' cells in that
 //! charge: keyed `<process root>/<charge key>`, labelled by its earliest
 //! session) followed by a node per subagent of its sessions in that charge
 //! (keyed `<session id>/<agent id>`, by run start); chain rows sort by
-//! their earliest session. A subagent charged apart from its root agent
-//! sits under its own charge, after any root agent its chain has there. A
+//! their earliest session. A subagent charged apart from its main agent
+//! sits under its own charge, after any main agent its chain has there. A
 //! session another one messaged or launched has its own charge, or
 //! inherits it, and nests under nobody. The repo filter reads a cell by its
 //! charge's repo (see [`AuditFilter`]).
@@ -37,10 +37,10 @@
 //! a key is what the node holds of that key's cells. Sessions count once
 //! per charge, on the first cell in the filter of each (session, charge);
 //! agents on the first cell of each subagent. Active and waiting come from
-//! the root agents' cells, which carry the session timeline, so they are
-//! additive from the root agents up. A subagent's node shows its own active
+//! the main agents' cells, which carry the session timeline, so they are
+//! additive from the main agents up. A subagent's node shows its own active
 //! and waiting time, which is not summed into its parent, since subagents
-//! run in parallel with their root agent. Elapsed and epic progress are per
+//! run in parallel with their main agent. Elapsed and epic progress are per
 //! level. Cells with no activity, requests or subagent run (a session
 //! sitting open overnight) are left out, so they put no node on a day.
 //!
@@ -71,15 +71,15 @@ pub use performance::{
 pub use timeline::{SpanKind, TimelineDay, TimelineMark, TimelineSpan, audit_timeline};
 
 /// An agent's role: its own (`agents.role`), else a subagent's or
-/// teammate's stored type, else `root` for a root agent, else `""`
-/// (unknown). A root agent has no stored type.
+/// teammate's stored type, else `main` for a main agent, else `""`
+/// (unknown). A main agent has no stored type.
 pub(crate) fn role_key<'a>(
     role: Option<&'a str>,
     agent_type: Option<&'a str>,
-    root: bool,
+    main: bool,
 ) -> &'a str {
-    if root {
-        role.unwrap_or("root")
+    if main {
+        role.unwrap_or("main")
     } else {
         role.or(agent_type).unwrap_or_default()
     }
@@ -109,7 +109,7 @@ pub enum NodeKind {
     Epic,
     Issue,
     Pr,
-    /// A root agent (a chain row's main agents) or a subagent: a leaf.
+    /// A main agent (a chain row's sessions' main agents) or a subagent: a leaf.
     Agent,
 }
 
@@ -150,7 +150,7 @@ pub struct Metrics {
     /// Subagents.
     pub agents: i64,
     /// First session start to the close (epic, issue) or merge (PR), else
-    /// to the last activity. A root agent's is the time its sessions cover
+    /// to the last activity. A main agent's is the time its sessions cover
     /// in range, a subagent's its run.
     pub elapsed_ms: Option<i64>,
     /// Elapsed runs to the last activity: the issue, epic or PR is open.
@@ -161,7 +161,7 @@ pub struct Metrics {
     pub by_day: Vec<Slice>,
     /// By role: the agent's own (`agents.role`, parsed from its name);
     /// else a subagent's or teammate's type (`teammate` for one spawned
-    /// with none recorded); else `root` for a root agent; else `""`
+    /// with none recorded); else `main` for a main agent; else `""`
     /// (unknown).
     pub by_role: Vec<Slice>,
     /// By model (`""`: a cell with no requests).
@@ -183,7 +183,7 @@ pub struct Slice {
 pub struct AuditNode {
     pub kind: NodeKind,
     /// Unique among its siblings: a repo slug, a topic, an issue or PR
-    /// number, a root agent's `<process root>/<charge key>` (`<process
+    /// number, a main agent's `<process root>/<charge key>` (`<process
     /// root>/` with no charge) or a subagent's `<session id>/<agent id>`.
     pub key: String,
     pub label: String,
