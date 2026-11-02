@@ -202,6 +202,34 @@ describe('row actions', () => {
     expect(copy).toHaveTextContent('copied')
   })
 
+  it('copies claude attach on a click anywhere on a parked row', async () => {
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue()
+    show([parked])
+    open()
+    await act(async () => fireEvent.click(within(row(0)).getByText('parked')))
+    expect(writeText).toHaveBeenCalledTimes(1)
+    expect(writeText).toHaveBeenCalledWith('claude attach abcd1234')
+    expect(within(row(0)).getByRole('button')).toHaveTextContent('copied')
+  })
+
+  it("copies once, not twice, when a parked row's button is clicked", async () => {
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue()
+    show([parked])
+    open()
+    await act(async () =>
+      fireEvent.click(screen.getByRole('button', { name: 'copy attach for dog-eat-dog-18' })),
+    )
+    expect(writeText).toHaveBeenCalledTimes(1)
+  })
+
+  it('leaves a click on a resume row itself doing nothing', async () => {
+    const writeText = vi.spyOn(navigator.clipboard, 'writeText').mockResolvedValue()
+    show([tabless])
+    open()
+    await act(async () => fireEvent.click(within(row(0)).getByText('blocked')))
+    expect(writeText).not.toHaveBeenCalled()
+  })
+
   it('still goes to the tab of a parked job that has one', () => {
     show([wait({ ...parked, workstream: 2 })])
     open()
