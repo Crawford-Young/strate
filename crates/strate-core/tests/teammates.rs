@@ -166,7 +166,7 @@ fn the_performance_agents_table_shows_teammates_by_their_spawned_type() {
     let mut rows: Vec<(&str, bool, i64)> = p
         .agents
         .iter()
-        .map(|a| (a.agent_type.as_str(), a.orchestrator, a.dispatches))
+        .map(|a| (a.role.as_str(), a.root, a.dispatches))
         .collect();
     rows.sort_unstable();
     assert_eq!(
@@ -174,8 +174,8 @@ fn the_performance_agents_table_shows_teammates_by_their_spawned_type() {
         [
             ("general-purpose", false, 1),
             ("implementer", false, 1),
-            ("orchestrator", true, 0),
             ("reviewer", false, 1),
+            ("root", true, 0),
             ("teammate", false, 1),
         ]
     );

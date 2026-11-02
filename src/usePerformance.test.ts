@@ -1,10 +1,10 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { outcome, performance } from '../tests/performance-fixtures'
-import { auditPerformance, type AuditFilter } from './api'
+import { auditPerformance, type AuditFilter } from './audit-types'
 import { usePerformance } from './usePerformance'
 
-vi.mock('./api', () => ({ auditPerformance: vi.fn() }))
+vi.mock('./audit-types', () => ({ auditPerformance: vi.fn() }))
 
 const performanceMock = vi.mocked(auditPerformance)
 

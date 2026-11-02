@@ -1,5 +1,5 @@
 // The Audit tree table: one row per node, its level named by a badge, every spec metric,
-// sortable, expandable, and its $ or agent-hours split by day, agent type and model (#54).
+// sortable, expandable, and its $ or agent-hours split by day, role and model (#54).
 // Unlinked stays last under any sort, and a row's name selects it (by path) for the row
 // detail (#27 U2).
 import {
@@ -12,20 +12,20 @@ import {
 } from '@crawfordyoung/ui'
 import type { ColumnDef, Row } from '@tanstack/react-table'
 import { memo, useMemo, type ReactNode } from 'react'
-import type { AuditNode, AuditPath, Metrics, NodeKind, Slice } from './api'
 import {
-  agentTypeLabel,
-  agentTypePalette,
   compact,
   hoursLabel,
   measured,
   modelLabel,
   modelPalette,
+  roleLabel,
+  rolePalette,
   segments,
   shortDay,
   type Measure,
   type Palette,
 } from './audit'
+import type { AuditNode, AuditPath, Metrics, NodeKind, Slice } from './audit-types'
 import { duration, money } from './format'
 
 /** Node kinds read from GitHub: only these can lack GitHub data worth flagging. */
@@ -39,7 +39,6 @@ const LEVEL: Partial<Record<NodeKind, string>> = {
   epic: 'epic',
   issue: 'issue',
   pr: 'PR',
-  session: 'session',
   agent: 'agent',
 }
 
@@ -120,11 +119,7 @@ export const AuditTable = memo(function AuditTable({
 }: AuditTableProps) {
   const splits = useMemo(
     () => ({
-      agentType: {
-        name: 'Agent type',
-        palette: agentTypePalette(root.metrics.byAgentType),
-        label: agentTypeLabel,
-      },
+      role: { name: 'Role', palette: rolePalette(root.metrics.byRole), label: roleLabel },
       model: { name: 'Model', palette: modelPalette(root.metrics.byModel), label: modelLabel },
     }),
     [root],
@@ -136,7 +131,7 @@ export const AuditTable = memo(function AuditTable({
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap gap-x-8 gap-y-1.5">
-        <Legend split={splits.agentType} />
+        <Legend split={splits.role} />
         <Legend split={splits.model} />
       </div>
       <DataTable
@@ -213,7 +208,7 @@ interface ColumnsFor {
   disabled: boolean
   days: string[]
   measure: Measure
-  splits: { agentType: Split; model: Split }
+  splits: { role: Split; model: Split }
 }
 
 /** A breakdown column: not sortable, a bar per row. */
@@ -298,7 +293,7 @@ function columnsFor({
         />
       )
     }),
-    breakdown('By agent type', (n) => split(splits.agentType, n.metrics.byAgentType)),
+    breakdown('By role', (n) => split(splits.role, n.metrics.byRole)),
     breakdown('By model', (n) => split(splits.model, n.metrics.byModel)),
     plain('Tokens', tokenTotal, compact),
     plain('Sessions', (m) => m.sessions),

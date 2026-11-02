@@ -5,8 +5,10 @@
 //! and the root is the sum of the cells in the filter), the splits by day,
 //! agent type and model, the date-range and repo filters, Unlinked and the
 //! headline. Each charge kind's path (#107) over a synthetic store, and
-//! `tests/fixtures/model-home`: a subagent charged apart from its
-//! orchestrator, a topic, a messaged session and Unlinked. The row
+//! `tests/fixtures/model-home`: a subagent charged apart from its root
+//! agent, a topic, a messaged session and Unlinked. The charge tree (#110):
+//! root-agent and subagent nodes under each placed node, and the split by
+//! role. The row
 //! timeline (`audit_timeline`): hand values for demo-9 across a local
 //! midnight, and a property test (each day's spans sum to every node's
 //! cells that day). A nested epic (#47) over
@@ -29,6 +31,11 @@ use strate_core::store::views::{
 };
 
 const TORONTO: &str = "America/Toronto";
+/// demo-9 and issue_demo-9: the closed issue's two sessions.
+const A1: &str = "5e559a9a-0000-4000-8000-0000000000a1";
+const A2: &str = "5e559a9a-0000-4000-8000-0000000000a2";
+/// nest-5, with a background subagent.
+const N4: &str = "5e55a7a7-0000-4000-8000-0000000000b4";
 const FG: &str = "a9000000000000001";
 const BG: &str = "a9000000000000002";
 const S: i64 = 1000;
@@ -181,8 +188,15 @@ fn the_closed_issue_matches_its_hand_values() {
     assert_eq!(epic.label, "#8 Epic: lorem audit");
 }
 
+/// Whether `node` is a subagent's Agent node: it counts its one subagent,
+/// where a root agent counts none.
+fn is_subagent(node: &AuditNode) -> bool {
+    node.kind == NodeKind::Agent && node.metrics.agents > 0
+}
+
 #[test]
-fn sessions_sit_under_their_pr_or_directly_under_the_issue() {
+fn root_agents_and_subagents_sit_under_their_pr_or_directly_under_the_issue() {
+    use NodeKind::Agent;
     let t = Temp::new("levels");
     let db = build(&t);
     let tree = october(&db).root;
@@ -194,27 +208,54 @@ fn sessions_sit_under_their_pr_or_directly_under_the_issue() {
     assert!(!pr.metrics.open, "merged");
     // First session start Oct 4 14:00:00Z -> merged Oct 5 11:00:00Z.
     assert_eq!(pr.metrics.elapsed_ms, Some(21 * 3600 * S));
-    let first = labelled(pr, NodeKind::Session, "demo-9");
-    let second = labelled(pr, NodeKind::Session, "issue_demo-9");
+    // No Session level: each chain's root agent (keyed by its chain and
+    // charge), then that chain's subagents (keyed by session and agent),
+    // chains in start order.
+    let (first_key, second_key) = (format!("{A1}/issue_demo-9"), format!("{A2}/issue_demo-9"));
+    let (fg, bg) = (format!("{A1}/{FG}"), format!("{A2}/{BG}"));
+    assert_eq!(
+        kinds(pr),
+        [
+            (Agent, first_key.as_str()),
+            (Agent, fg.as_str()),
+            (Agent, second_key.as_str()),
+            (Agent, bg.as_str())
+        ]
+    );
+    let first = child(pr, Agent, &first_key);
+    let second = child(pr, Agent, &second_key);
+    assert_eq!(
+        (first.label.as_str(), second.label.as_str()),
+        ("demo-9", "issue_demo-9")
+    );
+    assert!(first.children.is_empty() && second.children.is_empty());
+    // A root agent's elapsed is its sessions' time.
     assert_eq!(first.metrics.elapsed_ms, Some(320 * S));
     assert_eq!(second.metrics.elapsed_ms, Some(910 * S));
+    assert_eq!(
+        (
+            first.metrics.sessions,
+            first.metrics.agents,
+            first.metrics.agent_ms
+        ),
+        (1, 0, 0)
+    );
 
-    // The agent level keeps its own active and waiting time.
-    let orchestrator = child(first, NodeKind::Agent, "");
-    let sub = child(first, NodeKind::Agent, FG);
-    assert_eq!(orchestrator.metrics.active_ms, 320 * S);
-    assert_eq!(orchestrator.metrics.agent_ms, 0);
+    // Each Agent node keeps its own active and waiting time.
+    let sub = child(pr, Agent, &fg);
+    assert_eq!(first.metrics.active_ms, 320 * S);
     assert_eq!(
         (sub.metrics.active_ms, sub.metrics.agent_ms),
         (60 * S, 60 * S)
     );
     assert_eq!(sub.metrics.elapsed_ms, Some(60 * S));
-    assert_eq!((sub.metrics.agents, orchestrator.metrics.agents), (1, 0));
-    assert_eq!(first.metrics.active_ms, 320 * S, "not 320 + 60");
+    assert_eq!(sub.metrics.agents, 1);
+    // The PR sums its root agents' active time, not its subagents' too.
+    assert_eq!(pr.metrics.active_ms, (320 + 150) * S, "not + 60 + 120");
 
-    // #10 is open with no PR: its session sits directly under it.
+    // #10 is open with no PR: its root agent sits directly under it.
     let demo10 = issue(&tree, "10");
-    let window = labelled(demo10, NodeKind::Session, "demo-10");
+    let window = labelled(demo10, Agent, "demo-10");
     assert!(demo10.metrics.open);
     assert_eq!(demo10.metrics.elapsed_ms, Some(30 * S));
     assert!(close(OPUS, window.metrics.cost_usd));
@@ -242,7 +283,7 @@ fn an_epic_with_its_own_session_is_one_node_with_direct_work() {
         direct.metrics.progress.is_none(),
         "progress stays on the epic"
     );
-    let window = labelled(direct, NodeKind::Session, "demo-8");
+    let window = labelled(direct, NodeKind::Agent, "demo-8");
     // 10:00:00Z -> 10:00:20Z, one opus request.
     assert_eq!(window.metrics.elapsed_ms, Some(20 * S));
     assert!(close(OPUS, direct.metrics.cost_usd));
@@ -286,7 +327,7 @@ fn a_nested_epic_is_one_node_under_its_parent() {
     assert_eq!(kinds(nest), [(NodeKind::Epic, "1"), (NodeKind::Issue, "5")]);
     let five = child(nest, NodeKind::Issue, "5");
     assert_eq!(five.label, "#5 Amet abroad");
-    labelled(five, NodeKind::Session, "nest-5");
+    labelled(five, NodeKind::Agent, "nest-5");
 
     // #2 is a sub-issue of #1 and the epic over #3: one Epic node under #1.
     let one = child(nest, NodeKind::Epic, "1");
@@ -305,12 +346,8 @@ fn a_nested_epic_is_one_node_under_its_parent() {
     let direct = child(two, NodeKind::Issue, "2");
     assert_eq!(direct.label, "Direct work");
     assert!(direct.metrics.progress.is_none());
-    labelled(direct, NodeKind::Session, "nest-2");
-    labelled(
-        child(two, NodeKind::Issue, "3"),
-        NodeKind::Session,
-        "nest-3",
-    );
+    labelled(direct, NodeKind::Agent, "nest-2");
+    labelled(child(two, NodeKind::Issue, "3"), NodeKind::Agent, "nest-3");
 
     // One opus request per session: #2 holds its own and #3's, #1 also #4's.
     assert!(close(2.0 * OPUS, two.metrics.cost_usd));
@@ -388,7 +425,8 @@ fn only_uncharged_sessions_are_unlinked() {
     assert!(!unlinked.github);
     // The fifth session was never named.
     assert_eq!(unlinked.children.len(), 1);
-    assert_eq!(unlinked.children[0].kind, NodeKind::Session);
+    assert_eq!(unlinked.children[0].kind, NodeKind::Agent);
+    assert_eq!(unlinked.children[0].metrics.agents, 0, "its root agent");
     assert!(close(SONNET, unlinked.metrics.cost_usd));
     assert_eq!(unlinked.metrics.sessions, 1);
 
@@ -401,7 +439,7 @@ fn only_uncharged_sessions_are_unlinked() {
     assert!(three.metrics.open && three.metrics.progress.is_none());
     // 16:00:00Z -> 16:00:20Z.
     assert_eq!(three.metrics.elapsed_ms, Some(20 * S));
-    labelled(three, NodeKind::Session, "other-3");
+    labelled(three, NodeKind::Agent, "other-3");
     assert!(close(OPUS, three.metrics.cost_usd));
     // Cached nodes say so.
     assert!(issue(&tree, "9").github);
@@ -432,8 +470,10 @@ fn with_no_github_cache_issues_sit_under_their_repo() {
     let demo9 = child(demo, NodeKind::Issue, "9");
     assert!(!demo9.github);
     assert_eq!(demo9.label, "demo #9");
-    // Both sessions directly under the issue, no PR level.
-    assert!(demo9.children.iter().all(|c| c.kind == NodeKind::Session));
+    // Both root agents and their subagents directly under the issue, no PR
+    // level.
+    assert_eq!(demo9.children.len(), 4);
+    assert!(demo9.children.iter().all(|c| c.kind == NodeKind::Agent));
     // The hand values of the cached build, unchanged.
     let m = &demo9.metrics;
     assert_eq!(
@@ -465,15 +505,14 @@ fn a_background_subagents_hours_are_its_own_run() {
     let tree = october(&db).root;
     let pr = child(issue(&tree, "9"), NodeKind::Pr, "12");
     // issue_demo-9 launches it async (the string flag): [20,140] s.
-    let second = labelled(pr, NodeKind::Session, "issue_demo-9");
-    assert_eq!(child(second, NodeKind::Agent, BG).metrics.agent_ms, 120 * S);
+    let bg = child(pr, NodeKind::Agent, &format!("{A2}/{BG}"));
+    assert_eq!(bg.metrics.agent_ms, 120 * S);
     let t = Temp::new("background-no-flag");
     let db = build_nest(&t);
     let tree = october(&db).root;
     let five = child(child(&tree, NodeKind::Repo, "nest"), NodeKind::Issue, "5");
     // nest-5 launches it async with no flag: [6,9] s.
-    let window = labelled(five, NodeKind::Session, "nest-5");
-    let bg = child(window, NodeKind::Agent, "a7000000000000001");
+    let bg = child(five, NodeKind::Agent, &format!("{N4}/a7000000000000001"));
     assert_eq!(bg.metrics.agent_ms, 3 * S);
 }
 
@@ -534,7 +573,7 @@ fn the_repo_filter_keeps_the_named_repos() {
 
 #[test]
 fn the_repo_filter_takes_the_empty_slug_as_unlinked() {
-    let t = Temp::new("unlinked");
+    let t = Temp::new("unlinked-filter");
     let db = build(&t);
     let run = |repos: &[&str]| {
         audit(&db, &filter("2026-10-01", "2026-10-31", repos))
@@ -593,7 +632,7 @@ fn at<'a>(node: &'a AuditNode, path: &[(NodeKind, String)]) -> Option<&'a AuditN
 #[derive(Debug, Clone, Copy)]
 enum Split {
     Day,
-    AgentType,
+    Role,
     Model,
 }
 
@@ -601,7 +640,7 @@ enum Split {
 fn split(m: &Metrics, by: Split) -> Vec<(&str, f64, i64)> {
     let slices = match by {
         Split::Day => &m.by_day,
-        Split::AgentType => &m.by_agent_type,
+        Split::Role => &m.by_role,
         Split::Model => &m.by_model,
     };
     slices
@@ -627,11 +666,11 @@ fn check_split_sums(node: &AuditNode, by: Split, path: &str) {
 }
 
 /// Every parent's slice under `by` for a key is the sum of its children's
-/// slices for that key, and an Agent node has one agent type.
+/// slices for that key, and a subagent's node has one role.
 fn check_split_children(node: &AuditNode, by: Split, path: &str) {
     let path = format!("{path}/{:?}:{}", node.kind, node.key);
-    if node.kind == NodeKind::Agent {
-        assert_eq!(node.metrics.by_agent_type.len(), 1, "{path}: agent types");
+    if is_subagent(node) {
+        assert_eq!(node.metrics.by_role.len(), 1, "{path}: roles");
     }
     if node.children.is_empty() {
         return;
@@ -684,37 +723,35 @@ fn nodes(node: &AuditNode) -> usize {
 }
 
 #[test]
-fn teammates_split_by_the_type_they_were_spawned_as() {
-    // teams-home: a lead and four teammates, each meta's agentType its name.
-    // Each splits under its spawned type (spawnedAgentType, else
-    // customAgentType), and the one with neither under `teammate` (#86).
+fn teammates_with_no_role_split_by_the_type_they_were_spawned_as() {
+    // teams-home: a lead and four teammates, each meta's agentType its name,
+    // no name parsing to a role. Each splits under its spawned type
+    // (spawnedAgentType, else customAgentType), the one with neither under
+    // `teammate` (#86), and the lead, a root agent with no role, under
+    // `root`.
     let t = Temp::new("teammates");
     drop(build_without_gh(&t, "teams-home"));
     let db = Store::open_reader(t.db()).expect("reader");
     let root = audit(&db, &filter("2026-10-09", "2026-10-09", &[]))
         .expect("audit")
         .root;
-    let types = split(&root.metrics, Split::AgentType);
+    let types = split(&root.metrics, Split::Role);
     let keys: Vec<_> = types.iter().map(|s| s.0).collect();
     let expected = [
         "general-purpose",
         "implementer",
-        "orchestrator",
         "reviewer",
+        "root",
         "teammate",
     ];
     assert_eq!(keys, expected);
-    let mates: i64 = types
-        .iter()
-        .filter(|s| s.0 != "orchestrator")
-        .map(|s| s.2)
-        .sum();
+    let mates: i64 = types.iter().filter(|s| s.0 != "root").map(|s| s.2).sum();
     assert_eq!(mates, root.metrics.agent_ms, "every teammate's wall");
     assert!(types.iter().all(|s| s.1 > 0.0), "each type has its $");
 }
 
 #[test]
-fn every_node_splits_its_spend_by_day_agent_type_and_model() {
+fn every_node_splits_its_spend_by_day_role_and_model() {
     let t = Temp::new("splits");
     let db = build(&t);
     for (from, to) in [
@@ -723,7 +760,7 @@ fn every_node_splits_its_spend_by_day_agent_type_and_model() {
         ("2026-10-05", "2026-10-05"),
     ] {
         let tree = audit(&db, &filter(from, to, &[])).expect("audit").root;
-        for by in [Split::Day, Split::AgentType, Split::Model] {
+        for by in [Split::Day, Split::Role, Split::Model] {
             check_split_sums(&tree, by, &format!("{from}..{to} {by:?}"));
             check_split_children(&tree, by, &format!("{from}..{to} {by:?}"));
         }
@@ -739,15 +776,15 @@ fn every_node_splits_its_spend_by_day_agent_type_and_model() {
         |m: &Metrics, by| -> Vec<String> { split(m, by).iter().map(|s| s.0.to_string()).collect() };
     let m = &root.metrics;
     assert_eq!(keys(m, Split::Day), ["2026-10-04", "2026-10-05"]);
-    assert_eq!(
-        keys(m, Split::AgentType),
-        ["implementer", "orchestrator", "recon"]
-    );
+    // No name in audit-home parses to a role: subagents by type, root
+    // agents `root`.
+    assert_eq!(keys(m, Split::Role), ["implementer", "recon", "root"]);
     assert_eq!(
         keys(m, Split::Model),
         ["claude-opus-5-5", "claude-sonnet-5-5"]
     );
-    assert_eq!(m.by_agent_type[2].agent_ms, 120 * S, "recon");
+    assert_eq!(m.by_role[1].agent_ms, 120 * S, "recon");
+    assert_eq!(m.by_role[2].agent_ms, 0, "root agents have no agent-hours");
     // The closed issue's PR: demo-9 on Oct 4, its -s2 across midnight.
     let pr = child(issue(&root, "9"), NodeKind::Pr, "12");
     assert_eq!(keys(&pr.metrics, Split::Day), ["2026-10-04", "2026-10-05"]);
@@ -784,11 +821,13 @@ fn check_sums(node: &AuditNode, path: &str) {
     assert_eq!(m.agent_ms, sum(|k| k.agent_ms), "{path}: agent ms");
     assert_eq!(m.sessions, sum(|k| k.sessions), "{path}: sessions");
     assert_eq!(m.agents, sum(|k| k.agents), "{path}: agents");
-    // Agents run in parallel: a session is not the sum of its agents.
-    if node.kind != NodeKind::Session {
-        assert_eq!(m.active_ms, sum(|k| k.active_ms), "{path}: active");
-        assert_eq!(m.wait_ms, sum(|k| k.wait_ms), "{path}: waiting");
-    }
+    // Subagents run in parallel with their root agent: a node's active and
+    // waiting are its root agents', not its subagents' too.
+    let line = || node.children.iter().filter(|c| !is_subagent(c));
+    let active: i64 = line().map(|c| c.metrics.active_ms).sum();
+    let wait: i64 = line().map(|c| c.metrics.wait_ms).sum();
+    assert_eq!(m.active_ms, active, "{path}: active");
+    assert_eq!(m.wait_ms, wait, "{path}: waiting");
     for c in &node.children {
         check_sums(c, &path);
     }
@@ -944,9 +983,9 @@ fn the_filter_and_tree_use_the_webview_shape() {
             "activeMs",
             "agentMs",
             "agents",
-            "byAgentType",
             "byDay",
             "byModel",
+            "byRole",
             "costUsd",
             "elapsedMs",
             "open",
@@ -981,6 +1020,12 @@ fn the_filter_and_tree_use_the_webview_shape() {
     );
     assert_eq!(root["children"][2]["kind"], "unlinked");
     assert_eq!(serde_json::json!(NodeKind::Topic), "topic");
+    // The Session level is gone (#110).
+    assert!(serde_json::from_value::<NodeKind>(serde_json::json!("session")).is_err());
+    assert_eq!(
+        serde_json::from_value::<NodeKind>(serde_json::json!("agent")).expect("kind"),
+        NodeKind::Agent
+    );
 }
 
 #[test]
@@ -1156,8 +1201,8 @@ const KINDS: &str = "
 ";
 
 #[test]
-fn each_charge_kind_places_its_session_on_its_own_path() {
-    use NodeKind::{Agent, Epic, Issue, Pr, Repo, Session, Topic, Unlinked};
+fn each_charge_kind_places_its_root_agent_on_its_own_path() {
+    use NodeKind::{Agent, Epic, Issue, Pr, Repo, Topic, Unlinked};
     let t = Temp::new("kinds");
     let db = synthetic(&t, KINDS);
     let a = lab(&db, "2026-10-01", "2026-10-31");
@@ -1171,37 +1216,37 @@ fn each_charge_kind_places_its_session_on_its_own_path() {
     let repo = child(root, Repo, "lab");
     assert_eq!(
         kinds(repo),
-        [(Epic, "1"), (Pr, "9"), (Session, "s2/repo_lab")]
+        [(Epic, "1"), (Pr, "9"), (Agent, "s2/repo_lab")]
     );
     assert!(close(1.0 + 2.0 + 3.0 + 4.0 + 6.0, repo.metrics.cost_usd));
     // An epic charge sits right under its epic, beside its sub-issues.
     let epic = child(repo, Epic, "1");
     assert_eq!(epic.label, "#1 Lorem");
-    assert_eq!(kinds(epic), [(Issue, "2"), (Session, "s1/epic_lab-1")]);
+    assert_eq!(kinds(epic), [(Issue, "2"), (Agent, "s1/epic_lab-1")]);
     assert!(close(1.0 + 3.0 + 6.0, epic.metrics.cost_usd));
     // A cached PR charge sits under the issue it closes, with that issue's
-    // own work (its only PR), each its own Session row.
+    // own work (its only PR), each its own root agent.
     let pr5 = child(child(epic, Issue, "2"), Pr, "5");
     assert!(pr5.github);
     assert_eq!(
         kinds(pr5),
-        [(Session, "s3/pr_lab-5"), (Session, "s6/issue_lab-2")]
+        [(Agent, "s3/pr_lab-5"), (Agent, "s6/issue_lab-2")]
     );
     assert!(close(3.0 + 6.0, pr5.metrics.cost_usd));
     let pr9 = child(repo, Pr, "9");
     assert_eq!((pr9.label.as_str(), pr9.github), ("PR #9", false));
     assert!(pr9.metrics.open);
-    assert_eq!(kinds(pr9), [(Session, "s4/pr_lab-9")]);
+    assert_eq!(kinds(pr9), [(Agent, "s4/pr_lab-9")]);
     // A topic is a top-level node of its own.
     let topic = child(root, Topic, "notes");
     assert_eq!((topic.label.as_str(), topic.github), ("notes", false));
-    assert_eq!(kinds(topic), [(Session, "s5/topic_notes")]);
+    assert_eq!(kinds(topic), [(Agent, "s5/topic_notes")]);
     assert!(close(5.0, topic.metrics.cost_usd));
-    let row = child(topic, Session, "s5/topic_notes");
-    assert_eq!(row.label, "s5", "no name: the session id");
-    assert_eq!(kinds(row), [(Agent, "")]);
+    let lead = child(topic, Agent, "s5/topic_notes");
+    assert_eq!(lead.label, "s5", "no name: the session id");
+    assert!(lead.children.is_empty(), "an Agent node is a leaf");
     let unlinked = child(root, Unlinked, "");
-    assert_eq!(kinds(unlinked), [(Session, "s7/")]);
+    assert_eq!(kinds(unlinked), [(Agent, "s7/")]);
     assert!(close(7.0, unlinked.metrics.cost_usd));
     assert!(close(28.0, root.metrics.cost_usd));
     assert_eq!(root.metrics.sessions, 7);
@@ -1210,6 +1255,121 @@ fn each_charge_kind_places_its_session_on_its_own_path() {
         (a.repos.clone(), a.unlinked),
         (vec!["lab".to_string()], true)
     );
+}
+
+/// Issue lab#1, not cached. Chain s1: s1 (10:00 to 10:30, named `lead`,
+/// role manager) and its /clear successor s2 (12:00 to 12:10, no name or
+/// role); s3 (11:00 to 11:05, no name or role) is its own chain. s1's
+/// subagents, each charged #1: a1 (role impl, type implementer), a2 (type
+/// recon) and a3 (neither), running from 10:10, 10:20 and 10:05. s3's a4
+/// has a cell but no `agents` row, so no charge. Cell $: s1 1, a1 2, a2 3,
+/// a3 4, s2 5, s3 6, a4 7.
+const ROLES: &str = "
+    INSERT INTO sessions (session_id, path, started_at, process_root) VALUES
+        ('s1', '/p/s1.jsonl', '2026-10-02T10:00:00.000Z', 's1'),
+        ('s2', '/p/s2.jsonl', '2026-10-02T12:00:00.000Z', 's1'),
+        ('s3', '/p/s3.jsonl', '2026-10-02T11:00:00.000Z', 's3');
+    INSERT INTO charges (id, key, kind, repo, number) VALUES
+        (1, 'issue_lab-1', 'issue', 'lab', 1);
+    INSERT INTO agents (session_id, agent_id, kind, name, role, agent_type, own_charge,
+        own_charge_source) VALUES
+        ('s1', NULL, 'orchestrator', 'lead', 'manager', NULL, 1, 'name'),
+        ('s1', 'a1', 'subagent', NULL, 'impl', 'implementer', 1, 'name'),
+        ('s1', 'a2', 'subagent', NULL, NULL, 'recon', 1, 'name'),
+        ('s1', 'a3', 'subagent', NULL, NULL, NULL, 1, 'name'),
+        ('s2', NULL, 'orchestrator', NULL, NULL, NULL, 1, 'name'),
+        ('s3', NULL, 'orchestrator', NULL, NULL, NULL, 1, 'name');
+    INSERT INTO events (session_id, agent_id, file, byte_offset, raw, timestamp, type) VALUES
+        ('s1', NULL, '/p/s1.jsonl', 1, '{}', '2026-10-02T10:30:00.000Z', 'assistant'),
+        ('s1', 'a1', '/p/a1.jsonl', 1, '{}', '2026-10-02T10:10:00.000Z', 'user'),
+        ('s1', 'a1', '/p/a1.jsonl', 2, '{}', '2026-10-02T10:11:00.000Z', 'assistant'),
+        ('s1', 'a2', '/p/a2.jsonl', 1, '{}', '2026-10-02T10:20:00.000Z', 'user'),
+        ('s1', 'a2', '/p/a2.jsonl', 2, '{}', '2026-10-02T10:22:00.000Z', 'assistant'),
+        ('s1', 'a3', '/p/a3.jsonl', 1, '{}', '2026-10-02T10:05:00.000Z', 'user'),
+        ('s1', 'a3', '/p/a3.jsonl', 2, '{}', '2026-10-02T10:08:00.000Z', 'assistant'),
+        ('s2', NULL, '/p/s2.jsonl', 1, '{}', '2026-10-02T12:10:00.000Z', 'assistant'),
+        ('s3', NULL, '/p/s3.jsonl', 1, '{}', '2026-10-02T11:05:00.000Z', 'assistant');
+    INSERT INTO audit_cells (session_id, agent_id, day, model, wall_ms, active_ms, wait_ms,
+        cost_usd, unpriced, input_tokens, output_tokens, cache_read_tokens,
+        cache_write_tokens) VALUES
+        ('s1', NULL, '2026-10-02', 'm', 1000, 1000, 0, 1.0, 0, 10, 1, 0, 0),
+        ('s1', 'a1', '2026-10-02', 'm', 60000, 60000, 0, 2.0, 0, 10, 1, 0, 0),
+        ('s1', 'a2', '2026-10-02', 'm', 120000, 120000, 0, 3.0, 0, 10, 1, 0, 0),
+        ('s1', 'a3', '2026-10-02', 'm', 180000, 180000, 0, 4.0, 0, 10, 1, 0, 0),
+        ('s2', NULL, '2026-10-02', 'm', 1000, 1000, 0, 5.0, 0, 10, 1, 0, 0),
+        ('s3', NULL, '2026-10-02', 'm', 1000, 1000, 0, 6.0, 0, 10, 1, 0, 0),
+        ('s3', 'a4', '2026-10-02', 'm', 1000, 1000, 0, 7.0, 0, 10, 1, 0, 0);
+";
+
+#[test]
+fn each_root_agent_leads_its_chains_subagents_and_every_cell_splits_by_role() {
+    use NodeKind::{Agent, Issue, Repo, Unlinked};
+    let t = Temp::new("roles");
+    let db = synthetic(&t, ROLES);
+    let root = lab(&db, "2026-10-01", "2026-10-31").root;
+    let one = child(child(&root, Repo, "lab"), Issue, "1");
+    // The s1 chain's root agent (both links), then its subagents by run
+    // start, not id; then s3's chain, which starts after s1's.
+    assert_eq!(
+        kinds(one),
+        [
+            (Agent, "s1/issue_lab-1"),
+            (Agent, "s1/a3"),
+            (Agent, "s1/a1"),
+            (Agent, "s1/a2"),
+            (Agent, "s3/issue_lab-1")
+        ]
+    );
+    let chain = child(one, Agent, "s1/issue_lab-1");
+    // Labelled by its earliest session's name; its sessions' 30 + 10 min.
+    assert_eq!(chain.label, "lead");
+    assert_eq!(chain.metrics.elapsed_ms, Some(40 * 60 * S));
+    assert_eq!((chain.metrics.sessions, chain.metrics.agents), (2, 0));
+    assert!(close(1.0 + 5.0, chain.metrics.cost_usd));
+    assert_eq!(
+        (chain.metrics.active_ms, chain.metrics.agent_ms),
+        (2 * S, 0)
+    );
+    let lone = child(one, Agent, "s3/issue_lab-1");
+    assert_eq!(lone.label, "s3", "no name: the session id");
+    assert_eq!(lone.metrics.elapsed_ms, Some(5 * 60 * S));
+    assert_eq!(child(one, Agent, "s1/a1").metrics.agents, 1);
+    // Each cell's role: the agent's own (manager, impl), else a subagent's
+    // type (recon), else `root` for a root agent, else unknown.
+    let roles = |m: &Metrics| -> Vec<(String, f64)> {
+        m.by_role
+            .iter()
+            .map(|s| (s.key.clone(), s.cost_usd))
+            .collect()
+    };
+    let slice = |key: &str, usd: f64| (key.to_string(), usd);
+    assert_eq!(
+        roles(&one.metrics),
+        [
+            slice("", 4.0),
+            slice("impl", 2.0),
+            slice("manager", 1.0),
+            slice("recon", 3.0),
+            slice("root", 5.0 + 6.0)
+        ]
+    );
+    assert_eq!(
+        roles(&chain.metrics),
+        [slice("manager", 1.0), slice("root", 5.0)]
+    );
+    // A subagent with no `agents` row: no charge, no role, its id.
+    let unlinked = child(&root, Unlinked, "");
+    assert_eq!(kinds(unlinked), [(Agent, "s3/a4")]);
+    let a4 = child(unlinked, Agent, "s3/a4");
+    assert_eq!(a4.label, "a4");
+    assert_eq!(roles(&a4.metrics), [slice("", 7.0)]);
+    // Cost parity: the root is every cell once.
+    assert!(close(28.0, root.metrics.cost_usd));
+    check_sums(&root, "roles");
+    for kind in [Split::Day, Split::Role, Split::Model] {
+        check_split_sums(&root, kind, "roles");
+        check_split_children(&root, kind, "roles");
+    }
 }
 
 #[test]
@@ -1278,7 +1438,7 @@ fn build_model(t: &Temp) -> Connection {
 
 #[test]
 fn model_home_files_every_agent_under_its_own_charge() {
-    use NodeKind::{Agent, Epic, Issue, Pr, Repo, Session, Topic, Unlinked};
+    use NodeKind::{Agent, Epic, Issue, Pr, Repo, Topic, Unlinked};
     let t = Temp::new("model-home");
     let db = build_model(&t);
     let day = filter("2026-10-20", "2026-10-20", &[]);
@@ -1294,70 +1454,121 @@ fn model_home_files_every_agent_under_its_own_charge() {
     );
     // M1 works #107 by its branch (PR #120's head), with a1, a2 and M2,
     // which a1 messaged first. Its reviewer a3 is charged PR #120 by name:
-    // it sits under that PR (closing #107, the lowest of its issues) in a
-    // Session row of M1's that holds only it.
+    // it sits under that PR (closing #107, the lowest of its issues) after
+    // M1's own subagents, its chain's root agent having no work in that
+    // charge. M2's chain starts later, so its root agent comes last.
     let pr = child(child(child(strate, Epic, "105"), Issue, "107"), Pr, "120");
-    let (m1, m1_pr, m2) = (
+    let (m1, m2) = (
         format!("{M1}/issue_strate-107"),
-        format!("{M1}/pr_strate-120"),
         format!("{M2}/issue_strate-107"),
+    );
+    let (a1, a2, a3) = (
+        format!("{M1}/{MA1}"),
+        format!("{M1}/{MA2}"),
+        format!("{M1}/{MA3}"),
     );
     assert_eq!(
         kinds(pr),
         [
-            (Session, m1.as_str()),
-            (Session, m1_pr.as_str()),
-            (Session, m2.as_str())
+            (Agent, m1.as_str()),
+            (Agent, a1.as_str()),
+            (Agent, a2.as_str()),
+            (Agent, a3.as_str()),
+            (Agent, m2.as_str())
         ]
     );
-    let own = child(pr, Session, &m1);
+    let own = child(pr, Agent, &m1);
     assert_eq!(own.label, "manager_epic_strate-105");
-    assert_eq!(kinds(own), [(Agent, ""), (Agent, MA1), (Agent, MA2)]);
     // Opus $0.008 a request: M1's two dispatches, a1's two; a2 sonnet.
-    assert!(close(4.0 * OPUS + SONNET, own.metrics.cost_usd));
-    let review = child(pr, Session, &m1_pr);
-    assert_eq!(review.label, "manager_epic_strate-105");
-    assert_eq!(kinds(review), [(Agent, MA3)]);
+    assert!(close(2.0 * OPUS, own.metrics.cost_usd));
+    assert!(close(2.0 * OPUS, child(pr, Agent, &a1).metrics.cost_usd));
+    assert!(close(SONNET, child(pr, Agent, &a2).metrics.cost_usd));
+    let review = child(pr, Agent, &a3);
     assert!(close(SONNET, review.metrics.cost_usd));
+    // a3's cell is the first of M1 in PR #120's charge.
     assert_eq!((review.metrics.sessions, review.metrics.agents), (1, 1));
     // Its elapsed is a3's run, 10:02:10 to 10:02:20, not M1's session.
     assert_eq!(review.metrics.elapsed_ms, Some(10 * S));
-    assert!(close(OPUS, child(pr, Session, &m2).metrics.cost_usd));
+    assert!(close(OPUS, child(pr, Agent, &m2).metrics.cost_usd));
     // M3 by name; the background chain M7 -> M8 by its registry name, one
-    // row, an issue the cache doesn't hold.
+    // root agent, an issue the cache doesn't hold.
     let m3 = child(
         child(strate, Issue, "110"),
-        Session,
+        Agent,
         &format!("{M3}/issue_strate-110"),
     );
     assert!(close(OPUS, m3.metrics.cost_usd));
     let bg = child(strate, Issue, "111");
     assert_eq!((bg.label.as_str(), bg.github), ("strate #111", false));
-    let chain = child(bg, Session, &format!("{M7}/issue_strate-111"));
-    assert_eq!(kinds(chain), [(Agent, "")]);
+    let chain = format!("{M7}/issue_strate-111");
+    assert_eq!(kinds(bg), [(Agent, chain.as_str())]);
+    let chain = child(bg, Agent, &chain);
     assert_eq!(chain.metrics.sessions, 2);
     assert!(close(2.0 * OPUS, chain.metrics.cost_usd));
     // director-hub's topic: M4 with b1, and M5, which b1 messaged.
     let hub = child(&root, Topic, "hub");
-    let (m4, m5) = (format!("{M4}/topic_hub"), format!("{M5}/topic_hub"));
-    assert_eq!(kinds(hub), [(Session, m4.as_str()), (Session, m5.as_str())]);
-    assert_eq!(kinds(child(hub, Session, &m4)), [(Agent, ""), (Agent, MB1)]);
+    let (m4, b1, m5) = (
+        format!("{M4}/topic_hub"),
+        format!("{M4}/{MB1}"),
+        format!("{M5}/topic_hub"),
+    );
+    assert_eq!(
+        kinds(hub),
+        [
+            (Agent, m4.as_str()),
+            (Agent, b1.as_str()),
+            (Agent, m5.as_str())
+        ]
+    );
     assert!(close(3.0 * OPUS, hub.metrics.cost_usd));
     // M6: unnamed, on a detached HEAD.
     let unlinked = child(&root, Unlinked, "");
-    assert_eq!(kinds(unlinked), [(Session, format!("{M6}/").as_str())]);
+    assert_eq!(kinds(unlinked), [(Agent, format!("{M6}/").as_str())]);
     // Every request once: 12 opus, 2 sonnet; 9 (session, charge) rows.
     assert!(close(12.0 * OPUS + 2.0 * SONNET, root.metrics.cost_usd));
     assert_eq!(root.metrics.sessions, 9);
     check_sums(&root, "model-home");
+    // By role: a parsed name's role (M1 manager, a3 review, the M7 chain's
+    // registry name impl, M4 `director-hub` by its legacy typed name director),
+    // else a subagent's type (a1 and b1 implementer, a2 Explore), else
+    // `root` for a root agent (M5).
+    let roles: Vec<_> = split(&root.metrics, Split::Role)
+        .iter()
+        .map(|s| s.0)
+        .collect();
+    assert_eq!(
+        roles,
+        [
+            "Explore",
+            "director",
+            "impl",
+            "implementer",
+            "manager",
+            "review",
+            "root"
+        ]
+    );
+    let usd = |m: &Metrics, key: &str| {
+        m.by_role
+            .iter()
+            .find(|s| s.key == key)
+            .map_or(0.0, |s| s.cost_usd)
+    };
+    assert!(close(2.0 * OPUS, usd(&root.metrics, "manager")));
+    assert!(close(2.0 * OPUS, usd(&root.metrics, "impl")));
+    assert!(close(SONNET, usd(&root.metrics, "review")));
+    for kind in [Split::Day, Split::Role, Split::Model] {
+        check_split_sums(&root, kind, "model-home");
+        check_split_children(&root, kind, "model-home");
+    }
 
-    // The reviewer's row draws a3's run alone: 06:02:10 to 06:02:20 EDT.
+    // The reviewer's node draws a3's run alone: 06:02:10 to 06:02:20 EDT.
     let path = steps(&[
         (Repo, "strate"),
         (Epic, "105"),
         (Issue, "107"),
         (Pr, "120"),
-        (Session, &m1_pr),
+        (Agent, &a3),
     ]);
     let days = audit_timeline(&db, &day, &path).expect("timeline");
     let at = |s: i64| (6 * 3600 + 2 * 60 + s) * S;
@@ -1392,12 +1603,12 @@ fn steps(path: &[(NodeKind, &str)]) -> Vec<(NodeKind, String)> {
 }
 
 #[test]
-fn a_session_across_local_midnight_draws_on_both_days() {
+fn a_root_agent_across_local_midnight_draws_on_both_days() {
     let t = Temp::new("timeline-hand");
     let db = build(&t);
     let tree = october(&db).root;
     let pr = child(issue(&tree, "9"), NodeKind::Pr, "12");
-    let s2 = labelled(pr, NodeKind::Session, "issue_demo-9");
+    let s2 = labelled(pr, NodeKind::Agent, "issue_demo-9");
     let oct = filter("2026-10-01", "2026-10-31", &[]);
     let to_pr = [
         (NodeKind::Repo, "demo"),
@@ -1406,19 +1617,18 @@ fn a_session_across_local_midnight_draws_on_both_days() {
         (NodeKind::Pr, "12"),
     ];
     let mut path = steps(&to_pr);
-    path.push((NodeKind::Session, s2.key.clone()));
+    path.push((NodeKind::Agent, s2.key.clone()));
     let days = audit_timeline(&db, &oct, &path).expect("timeline");
     // issue_demo-9 starts 03:50:00Z Oct 5 = 23:50 EDT Oct 4, 85 800 s after
     // that day's local midnight; the next (04:00Z) falls 600 s in, inside
-    // the idle [140,900]. Orchestrator: model [0,10], tools [10,15], model
-    // [15,25] are one active span; the wait [25,900] is waiting until the
-    // idle gap takes it at 140; req_b3 [900,910] is 300..310 s into Oct 5.
-    // The background subagent runs [20,140]. A session holds no issue or
-    // PR, so it has no marks.
+    // the idle [140,900]. The root agent: model [0,10], tools [10,15],
+    // model [15,25] are one active span; the wait [25,900] is waiting until
+    // the idle gap takes it at 140; req_b3 [900,910] is 300..310 s into Oct
+    // 5. Its background subagent's run [20,140] is its own node's, not the
+    // root agent's. An agent holds no issue or PR, so it has no marks.
     let oct4 = |s: i64| (85_800 + s) * S;
     let s2_oct4 = [
         span(oct4(0), oct4(25), SpanKind::Active),
-        span(oct4(20), oct4(140), SpanKind::Agent),
         span(oct4(25), oct4(140), SpanKind::Wait),
     ];
     assert_eq!(
@@ -1436,6 +1646,18 @@ fn a_session_across_local_midnight_draws_on_both_days() {
             },
         ]
     );
+    let mut to_bg = steps(&to_pr);
+    to_bg.push((NodeKind::Agent, format!("{A2}/{BG}")));
+    let bg_oct4 = span(oct4(20), oct4(140), SpanKind::Agent);
+    assert_eq!(
+        audit_timeline(&db, &oct, &to_bg).expect("timeline"),
+        [TimelineDay {
+            day: "2026-10-04".into(),
+            spans: vec![bg_oct4.clone()],
+            marks: vec![],
+        }]
+    );
+    let s2_oct4 = [s2_oct4[0].clone(), bg_oct4, s2_oct4[1].clone()];
 
     // Issue 9 adds demo-9 (14:00:00Z Oct 4 = 10:00 EDT, 36 000 s in):
     // model [0,10], tools [10,120] and model [120,130] active, the wait
@@ -1548,7 +1770,7 @@ fn each_days_spans_sum_to_every_nodes_cells_that_day() {
             );
             let m = &node.metrics;
             let at = format!("{day} {path:?}");
-            if node.kind == NodeKind::Agent && !node.key.is_empty() {
+            if is_subagent(node) {
                 // A subagent's node: its own non-idle time.
                 assert_eq!((active, wait, agent), (0, 0, m.active_ms), "{at}");
             } else {

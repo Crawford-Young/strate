@@ -13,7 +13,7 @@ pub(crate) fn tree(cells: &Cells, gh: &Gh) -> AuditNode {
     for cell in &cells.list {
         let keys = Keys {
             day: &cell.day,
-            agent_type: agent_type(cell, cells),
+            role: cells.role(cell),
             model: cell.model.as_deref().unwrap_or_default(),
         };
         root.insert(path(cell, cells, gh), &cell.share, &keys);
@@ -21,30 +21,17 @@ pub(crate) fn tree(cells: &Cells, gh: &Gh) -> AuditNode {
     root.finish().0
 }
 
-/// `cell`'s agent type: `orchestrator`, or its subagent's or teammate's
-/// stored type (`""`: unknown).
-fn agent_type<'a>(cell: &'a Cell, cells: &'a Cells) -> &'a str {
-    let Some(id) = &cell.agent_id else {
-        return "orchestrator";
-    };
-    cells
-        .agent(cell, id)
-        .and_then(|a| a.agent_type.as_deref())
-        .unwrap_or_default()
-}
-
 /// A cell's key in each split; `""` where it has none.
 struct Keys<'a> {
     day: &'a str,
-    agent_type: &'a str,
+    role: &'a str,
     model: &'a str,
 }
 
 /// How a node's elapsed time ends.
 #[derive(Clone, Copy)]
 enum End {
-    /// Its own spans' (a Session row or agent): its elapsed is the time
-    /// they cover, while the span it reports up covers its children's too.
+    /// Its own spans' (an agent): its elapsed is the time they cover.
     Own,
     /// Closed or merged at.
     Closed(i64),
@@ -80,19 +67,13 @@ impl Step {
         }
     }
 
-    /// Another cell's copy of this step: a Session row (or its
-    /// orchestrator) spans each of its sessions and subagent runs, and
-    /// sorts and is labelled by its earliest session. Every other step's
-    /// copies are the same.
+    /// Another cell's copy of this step: a root agent spans each of its
+    /// sessions. Every other step's copies are the same.
     fn widen(&mut self, other: &Self) {
         for span in &other.spans {
             if !self.spans.contains(span) {
                 self.spans.push(*span);
             }
-        }
-        if other.order < self.order {
-            self.order.clone_from(&other.order);
-            self.label.clone_from(&other.label);
         }
     }
 
@@ -135,18 +116,17 @@ impl Step {
     }
 }
 
-/// `cell`'s path from the root: its Session row's place (see
-/// [`place_steps`]), the Session row and its Agent node. The tree adds the
-/// cell to every node on it; the cells under a node are those whose path
-/// passes through that node's `(kind, key)` steps.
+/// `cell`'s path from the root: its chain row's place (see
+/// [`place_steps`]) and its Agent node. The tree adds the cell to every
+/// node on it; the cells under a node are those whose path passes through
+/// that node's `(kind, key)` steps.
 pub(crate) fn path(cell: &Cell, cells: &Cells, gh: &Gh) -> Vec<Step> {
     let mut steps = place_steps(&cells.row_of(cell).place, gh);
-    steps.push(session_step(cell, cells));
     steps.push(agent_step(cell, cells));
     steps
 }
 
-/// The steps a Session row is placed by: Unlinked; a Topic; a Repo; Repo >
+/// The steps a chain row is placed by: Unlinked; a Topic; a Repo; Repo >
 /// Epic for an epic; Repo > Epic > Issue > PR for an issue (an issue sits
 /// under each of its epics, outermost first, and an epic's own issue work
 /// under its "Direct work" Issue node, beside its sub-issues); Repo > PR
@@ -256,44 +236,28 @@ fn uncached_pr_step(number: i64) -> Step {
     step
 }
 
-/// `cell`'s Session row, sorted and labelled by its earliest session: over
-/// its session for an orchestrator cell, over its run for a subagent's.
-fn session_step(cell: &Cell, cells: &Cells) -> Step {
-    let session = cells.session(cell);
-    let row = &cells.row_of(cell).key;
-    let start = session.start.unwrap_or(0);
-    let mut step = Step::new(
-        NodeKind::Session,
-        row.clone(),
-        session.label.clone(),
-        format!("{start:020}/{row}"),
-    );
-    step.end = End::Own;
-    step.spans.extend(match &cell.agent_id {
-        None => session.span,
-        Some(id) => cells.agent(cell, id).and_then(|a| a.span),
-    });
-    step
-}
-
-/// `cell`'s Agent node: the orchestrator over its session, or a subagent
-/// over its run.
+/// `cell`'s Agent node. A root agent's cell: its chain row's root agent,
+/// keyed and labelled by the row, over its session. A subagent's: keyed
+/// `<session id>/<agent id>`, over its run. Siblings sort by their chain
+/// row's start, then its key, the root agent first, then the row's
+/// subagents by run start (none: 0), then key. The parts are joined by NUL,
+/// which no key holds, so the order is the parts' in turn.
 fn agent_step(cell: &Cell, cells: &Cells) -> Step {
+    let row = cells.row_of(cell);
+    let lead = format!("{:020}\0{}\0", row.start.unwrap_or(0), row.key);
     let mut step = match &cell.agent_id {
         None => {
-            let mut step = Step::new(
-                NodeKind::Agent,
-                String::new(),
-                "orchestrator".into(),
-                String::new(),
-            );
+            let mut step = Step::new(NodeKind::Agent, row.key.clone(), row.label.clone(), lead);
             step.spans.extend(cells.session(cell).span);
             step
         }
         Some(id) => {
             let agent = cells.agent(cell, id);
+            let key = format!("{}/{id}", cell.session_id);
             let label = agent.map_or_else(|| id.clone(), |a| a.label.clone());
-            let mut step = Step::new(NodeKind::Agent, id.clone(), label, id.clone());
+            let run_start = agent.and_then(|a| a.span).map_or(0, |s| s.0);
+            let order = format!("{lead}{run_start:020}\0{key}");
+            let mut step = Step::new(NodeKind::Agent, key, label, order);
             step.spans.extend(agent.and_then(|a| a.span));
             step.elapsed = agent.and_then(|a| a.run_ms);
             step
@@ -308,7 +272,7 @@ struct Node {
     step: Step,
     metrics: Metrics,
     by_day: Split,
-    by_agent_type: Split,
+    by_role: Split,
     by_model: Split,
     children: Vec<Node>,
     index: HashMap<(NodeKind, String), usize>,
@@ -354,7 +318,7 @@ impl Node {
             step,
             metrics: Metrics::default(),
             by_day: Split::default(),
-            by_agent_type: Split::default(),
+            by_role: Split::default(),
             by_model: Split::default(),
             children: Vec::new(),
             index: HashMap::new(),
@@ -386,7 +350,7 @@ impl Node {
 
     fn add(&mut self, s: &Share, keys: &Keys) {
         self.by_day.add(keys.day, s);
-        self.by_agent_type.add(keys.agent_type, s);
+        self.by_role.add(keys.role, s);
         self.by_model.add(keys.model, s);
         let m = &mut self.metrics;
         if let Some(c) = s.cost_usd {
@@ -414,13 +378,13 @@ impl Node {
             step,
             mut metrics,
             by_day,
-            by_agent_type,
+            by_role,
             by_model,
             mut children,
             ..
         } = self;
         metrics.by_day = by_day.finish();
-        metrics.by_agent_type = by_agent_type.finish();
+        metrics.by_role = by_role.finish();
         metrics.by_model = by_model.finish();
         children.sort_by(|a, b| {
             (a.step.kind as u8, &a.step.order).cmp(&(b.step.kind as u8, &b.step.order))

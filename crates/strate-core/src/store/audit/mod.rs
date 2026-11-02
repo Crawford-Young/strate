@@ -2,45 +2,50 @@
 //! the performance read, on a reader connection.
 //!
 //! Each cell is one agent's work on one local day and model, and it sits
-//! where its agent's effective charge (`agent_charges`, #107) puts it:
+//! where its agent's effective charge (`agent_charges`, #107) puts it (the
+//! charge tree, #110):
 //!
 //! - issue: Repo > Epic (each epic above it in the GitHub cache, outermost
-//!   first) > Issue > PR > Session > Agent. An epic's own issue charge is
-//!   one Epic node with its work under a "Direct work" Issue node. The PR
-//!   is the issue's PR that the newest `github_links` entry of the Session
-//!   row's sessions names, else the issue's only PR, else none.
-//! - epic: Repo > Epic (and the epics above it) > Session > Agent.
+//!   first) > Issue > PR > Agent. An epic's own issue charge is one Epic
+//!   node with its work under a "Direct work" Issue node. The PR is the
+//!   issue's PR that the newest `github_links` entry of the chain row's
+//!   sessions names, else the issue's only PR, else none.
+//! - epic: Repo > Epic (and the epics above it) > Agent.
 //! - pr: under the issue it closes when the cache holds it (the lowest
 //!   issue of its repo), as an issue's work under that PR; else Repo > PR.
-//! - repo: Repo > Session > Agent.
-//! - topic: a top-level Topic node per topic > Session > Agent.
-//! - none: Unlinked > Session > Agent.
+//! - repo: Repo > Agent.
+//! - topic: a top-level Topic node per topic > Agent.
+//! - none: Unlinked > Agent.
 //!
 //! An issue the cache doesn't hold (no `gh`, a failed fetch) has `github:
 //! false`, no epic, PR or progress, and is open; so is a PR it doesn't hold.
-//! A Session row is a `/clear` chain (every file one process wrote, by its
-//! process root) within one charge: its sessions' orchestrators and
-//! subagents of that charge. A subagent charged apart from its orchestrator
-//! sits under its own charge, in a Session row of its session holding only
-//! it. A session another one messaged or launched has its own charge, or
+//! Work is placed by chain row: a `/clear` chain (every file one process
+//! wrote, by its process root) within one charge. Under its place, a chain
+//! row is a root-agent node (its sessions' main agents' cells in that
+//! charge: keyed `<process root>/<charge key>`, labelled by its earliest
+//! session) followed by a node per subagent of its sessions in that charge
+//! (keyed `<session id>/<agent id>`, by run start); chain rows sort by
+//! their earliest session. A subagent charged apart from its root agent
+//! sits under its own charge, after any root agent its chain has there. A
+//! session another one messaged or launched has its own charge, or
 //! inherits it, and nests under nobody. The repo filter reads a cell by its
 //! charge's repo (see [`AuditFilter`]).
 //!
 //! Every node sums the cells under it. $, tokens, agent-hours (subagent
 //! wall) and the counts are additive at every level, and so are a node's $
-//! and agent-hours split by local day, agent type and model (#54): the
-//! slice for a key is what the node holds of that key's cells. Sessions
-//! count once per charge, on the first cell in the filter of each (session,
-//! charge); agents on the first cell of each subagent. Active and waiting
-//! come from the orchestrator cells, which carry the session timeline, so
-//! they are additive from Session up. An Agent node shows its own active
-//! and waiting time, which is not summed into its session, since its agents
-//! run in parallel. Elapsed and epic progress are per level. Cells with no
-//! activity, requests or subagent run (a session sitting open overnight)
-//! are left out, so they put no node on a day.
+//! and agent-hours split by local day, role and model (#54): the slice for
+//! a key is what the node holds of that key's cells. Sessions count once
+//! per charge, on the first cell in the filter of each (session, charge);
+//! agents on the first cell of each subagent. Active and waiting come from
+//! the root agents' cells, which carry the session timeline, so they are
+//! additive from the root agents up. A subagent's node shows its own active
+//! and waiting time, which is not summed into its parent, since subagents
+//! run in parallel with their root agent. Elapsed and epic progress are per
+//! level. Cells with no activity, requests or subagent run (a session
+//! sitting open overnight) are left out, so they put no node on a day.
 //!
 //! Modules: `gh` reads the GitHub cache, `cells` the cells in a filter and
-//! the agents, sessions and Session rows they belong to, `tree` builds
+//! the agents, sessions and chain rows they belong to, `tree` builds
 //! each cell's path and the rollup tree over them, `headline` the
 //! closed-issue and merged-PR figures, `timeline` one node's per-day spans
 //! and marks, and `performance` the outcome, agent, bottleneck and waste
@@ -64,6 +69,21 @@ pub use performance::{
     PermissionWaits, Waste, performance,
 };
 pub use timeline::{SpanKind, TimelineDay, TimelineMark, TimelineSpan, audit_timeline};
+
+/// An agent's role: its own (`agents.role`), else a subagent's or
+/// teammate's stored type, else `root` for a root agent, else `""`
+/// (unknown). A root agent has no stored type.
+pub(crate) fn role_key<'a>(
+    role: Option<&'a str>,
+    agent_type: Option<&'a str>,
+    root: bool,
+) -> &'a str {
+    if root {
+        role.unwrap_or("root")
+    } else {
+        role.or(agent_type).unwrap_or_default()
+    }
+}
 
 /// What [`audit`] rolls up: the cells on local days `from..=to`
 /// (`YYYY-MM-DD`) of agents charged in `repos` (repo slugs, `""` for a
@@ -89,7 +109,7 @@ pub enum NodeKind {
     Epic,
     Issue,
     Pr,
-    Session,
+    /// A root agent (a chain row's main agents) or a subagent: a leaf.
     Agent,
 }
 
@@ -130,8 +150,8 @@ pub struct Metrics {
     /// Subagents.
     pub agents: i64,
     /// First session start to the close (epic, issue) or merge (PR), else
-    /// to the last activity. A Session row's is the time its sessions (or,
-    /// alone in the row, its subagents) cover in range, an agent's its run.
+    /// to the last activity. A root agent's is the time its sessions cover
+    /// in range, a subagent's its run.
     pub elapsed_ms: Option<i64>,
     /// Elapsed runs to the last activity: the issue, epic or PR is open.
     pub open: bool,
@@ -139,9 +159,11 @@ pub struct Metrics {
     pub progress: Option<Progress>,
     /// By local day.
     pub by_day: Vec<Slice>,
-    /// By agent type: `orchestrator`, a subagent's or teammate's type
-    /// (`teammate` for one spawned with none recorded), or `""` (unknown).
-    pub by_agent_type: Vec<Slice>,
+    /// By role: the agent's own (`agents.role`, parsed from its name);
+    /// else a subagent's or teammate's type (`teammate` for one spawned
+    /// with none recorded); else `root` for a root agent; else `""`
+    /// (unknown).
+    pub by_role: Vec<Slice>,
     /// By model (`""`: a cell with no requests).
     pub by_model: Vec<Slice>,
 }
@@ -161,8 +183,8 @@ pub struct Slice {
 pub struct AuditNode {
     pub kind: NodeKind,
     /// Unique among its siblings: a repo slug, a topic, an issue or PR
-    /// number, a Session row's `<process root>/<charge key>` (`<process
-    /// root>/` with no charge) or an agent id (`""`: the orchestrator).
+    /// number, a root agent's `<process root>/<charge key>` (`<process
+    /// root>/` with no charge) or a subagent's `<session id>/<agent id>`.
     pub key: String,
     pub label: String,
     /// An epic, issue or PR read from the GitHub cache. False on one known

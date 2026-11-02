@@ -1,8 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { audit, node, slice } from '../tests/audit-fixtures'
 import {
-  agentTypeLabel,
-  agentTypePalette,
   compact,
   dailyChart,
   dayRange,
@@ -14,6 +12,8 @@ import {
   modelLabel,
   modelPalette,
   repoChips,
+  roleLabel,
+  rolePalette,
   segments,
   shortDay,
   UNLINKED,
@@ -151,15 +151,15 @@ describe('repo chips', () => {
 })
 
 describe('breakdown colours', () => {
-  it('pins the orchestrator to --chart-6, the other agent types by $ to 1..4', () => {
-    const p = agentTypePalette([
+  it('pins root agents to --chart-6, the other roles by $ to 1..4', () => {
+    const p = rolePalette([
       slice('implementer', 5),
-      slice('orchestrator', 9),
+      slice('root', 9),
       slice('recon', 1),
       slice('reviewer', 2),
     ])
     expect([...p.named]).toEqual([
-      ['orchestrator', 6],
+      ['root', 6],
       ['implementer', 1],
       ['reviewer', 2],
       ['recon', 3],
@@ -178,7 +178,7 @@ describe('breakdown colours', () => {
 
   it('keeps --chart-5 for Other in both splits, so no named series shares its colour', () => {
     const keys = ['a', 'b', 'c', 'd', 'e', 'f', 'g'].map((k, i) => slice(k, 10 - i))
-    for (const p of [agentTypePalette(keys), modelPalette(keys)]) {
+    for (const p of [rolePalette(keys), modelPalette(keys)]) {
       expect(p.other).toBe(5)
       expect([...p.named.values()]).not.toContain(5)
     }
@@ -192,7 +192,7 @@ describe('breakdown colours', () => {
 
   it('folds every key past the free colours into Other', () => {
     const types = ['a', 'b', 'c', 'd', 'e', 'f'].map((k, i) => slice(k, 10 - i))
-    const p = agentTypePalette(types)
+    const p = rolePalette(types)
     expect([...p.named]).toEqual([
       ['a', 1],
       ['b', 2],
@@ -200,28 +200,28 @@ describe('breakdown colours', () => {
       ['d', 4],
     ])
     expect(p.other).toBe(5)
-    // Four agent types besides the orchestrator fit without folding.
-    expect(agentTypePalette(types.slice(0, 4)).other).toBeNull()
-    expect(agentTypePalette(types.slice(0, 5)).other).toBe(5)
+    // Four roles besides root fit without folding.
+    expect(rolePalette(types.slice(0, 4)).other).toBeNull()
+    expect(rolePalette(types.slice(0, 5)).other).toBe(5)
   })
 
   // Segment keys can never clash: Other's is no slice key, and '' is one (Unknown, No requests).
   it('draws the slices of a row in legend order, Other last, on the chosen measure', () => {
-    const p = agentTypePalette(['a', 'b', 'c', 'd', 'e', 'f'].map((k, i) => slice(k, 10 - i)))
+    const p = rolePalette(['a', 'b', 'c', 'd', 'e', 'f'].map((k, i) => slice(k, 10 - i)))
     const row = [slice('f', 1, HOUR), slice('b', 2, 2 * HOUR), slice('e', 3), slice('x', 4)]
-    expect(segments(row, p, 'usd', agentTypeLabel)).toEqual([
+    expect(segments(row, p, 'usd', roleLabel)).toEqual([
       { key: 'slice:b', label: 'b', value: 2, color: 2 },
       { key: 'other', label: 'Other', value: 8, color: 5 },
     ])
-    expect(segments(row, p, 'hours', agentTypeLabel)).toEqual([
+    expect(segments(row, p, 'hours', roleLabel)).toEqual([
       { key: 'slice:b', label: 'b', value: 2, color: 2 },
       { key: 'other', label: 'Other', value: 1, color: 5 },
     ])
   })
 
-  it('names the empty keys: an unknown agent type, a cell with no requests', () => {
-    expect(agentTypeLabel('')).toBe('Unknown')
-    expect(agentTypeLabel('recon')).toBe('recon')
+  it('names the empty keys: an unknown role, a cell with no requests', () => {
+    expect(roleLabel('')).toBe('Unknown')
+    expect(roleLabel('recon')).toBe('recon')
     expect(modelLabel('')).toBe('No requests')
     expect(modelLabel('model-a')).toBe('model-a')
   })

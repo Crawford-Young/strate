@@ -1,9 +1,9 @@
 import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { auditTimeline, type AuditFilter, type AuditPath, type TimelineDay } from './api'
+import { auditTimeline, type AuditFilter, type AuditPath, type TimelineDay } from './audit-types'
 import { useTimeline } from './useTimeline'
 
-vi.mock('./api', () => ({ auditTimeline: vi.fn() }))
+vi.mock('./audit-types', () => ({ auditTimeline: vi.fn() }))
 
 const timelineMock = vi.mocked(auditTimeline)
 

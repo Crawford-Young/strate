@@ -544,19 +544,21 @@ fn outcome_has_one_point_per_calendar_day_of_any_range_across_dst() {
 }
 
 #[test]
-fn agents_roll_up_per_type_and_model_with_orchestrator_rows_flagged() {
+fn agents_roll_up_per_role_and_model_with_root_agent_rows_flagged() {
     let t = Temp::new("agents");
     let db = built(&t);
     let p = read(&db, &[]);
     let rows: Vec<(&str, &str, bool)> = p
         .agents
         .iter()
-        .map(|a| (a.agent_type.as_str(), a.model.as_str(), a.orchestrator))
+        .map(|a| (a.role.as_str(), a.model.as_str(), a.root))
         .collect();
+    // No name in perf-home parses to a role: root agents read `root`, the
+    // subagents their type.
     assert_eq!(
         rows,
         [
-            ("orchestrator", "claude-opus-5-5", true),
+            ("root", "claude-opus-5-5", true),
             ("implementer", "claude-sonnet-5-5", false),
         ]
     );
@@ -570,7 +572,7 @@ fn agents_roll_up_per_type_and_model_with_orchestrator_rows_flagged() {
         o.cost_usd,
         usd(&db, &format!("agent_id IS NULL AND {range}"))
     ));
-    // Every orchestrator request reads 10000 cached of 11000 input tokens.
+    // Every root agent request reads 10000 cached of 11000 input tokens.
     assert!(
         o.cache_hit_pct
             .is_some_and(|h| close(h, 100.0 * 10.0 / 11.0))
@@ -666,7 +668,7 @@ fn waste_counts_rework_and_errors_in_the_range() {
     assert_eq!((w.dispatches, w.blocked, w.no_report), (8, 1, 2));
     let top = w.no_report_top.expect("a top no-report lane");
     assert_eq!(
-        (top.agent_type.as_str(), top.model.as_str(), top.count),
+        (top.role.as_str(), top.model.as_str(), top.count),
         ("implementer", "claude-sonnet-5-5", 2)
     );
     assert_eq!((w.compactions, w.clears), (1, 1));
@@ -770,8 +772,17 @@ fn performance_serializes_in_camel_case_and_a_bad_day_is_an_error() {
     assert_eq!(json["bottleneck"]["days"][0]["permissionMs"], 0);
     assert_eq!(json["bottleneck"]["days"][0]["permissionPrompts"], 0);
     assert!(json["outcome"]["days"][0]["usdPerClosedIssue"].is_number());
-    assert_eq!(json["waste"]["noReportTop"]["agentType"], "implementer");
+    assert_eq!(
+        json["waste"]["noReportTop"],
+        serde_json::json!({ "role": "implementer", "model": "claude-sonnet-5-5", "count": 2 })
+    );
     assert!(json["agents"][1]["cacheHitPct"].is_number());
+    assert_eq!(
+        (&json["agents"][0]["role"], &json["agents"][0]["root"]),
+        (&serde_json::json!("root"), &serde_json::json!(true))
+    );
+    let row = json["agents"][0].as_object().expect("row");
+    assert!(!row.contains_key("agentType") && !row.contains_key("orchestrator"));
     assert_eq!(json["waste"]["contextPeaksOver80"], 1);
     assert!(performance(&db, &filter("October", "2026-10-13", &[])).is_err());
 }
@@ -992,5 +1003,70 @@ fn a_renamed_sessions_waits_count_under_its_one_charge() {
     assert_eq!(
         permission_rows(&p),
         [row("2026-10-07", Some("beta"), 3_000 + 4_000, 2)]
+    );
+}
+
+/// Chain s1: s1 (role manager) and its /clear successor s2 (no role); s3
+/// (no role) its own chain. s1's subagents: a1 (role impl, type
+/// implementer, never notified, quiet since 10:11), a2 (type recon) and a3
+/// (neither), both completed. Every cell on model `m`. Cell $: s1 1, a1 2,
+/// a2 3, a3 4, s2 5, s3 6.
+const ROLES: &str = "
+    INSERT INTO sessions (session_id, path, started_at, process_root) VALUES
+        ('s1', '/p/s1.jsonl', '2026-10-02T10:00:00.000Z', 's1'),
+        ('s2', '/p/s2.jsonl', '2026-10-02T12:00:00.000Z', 's1'),
+        ('s3', '/p/s3.jsonl', '2026-10-02T11:00:00.000Z', 's3');
+    INSERT INTO agents (session_id, agent_id, kind, role, agent_type, outcome) VALUES
+        ('s1', NULL, 'orchestrator', 'manager', NULL, NULL),
+        ('s1', 'a1', 'subagent', 'impl', 'implementer', NULL),
+        ('s1', 'a2', 'subagent', NULL, 'recon', 'completed'),
+        ('s1', 'a3', 'subagent', NULL, NULL, 'completed'),
+        ('s2', NULL, 'orchestrator', NULL, NULL, NULL),
+        ('s3', NULL, 'orchestrator', NULL, NULL, NULL);
+    INSERT INTO events (session_id, agent_id, file, byte_offset, raw, timestamp, type) VALUES
+        ('s1', 'a1', '/p/a1.jsonl', 1, '{}', '2026-10-02T10:11:00.000Z', 'assistant'),
+        ('s2', NULL, '/p/s2.jsonl', 1, '{}', '2026-10-02T12:10:00.000Z', 'assistant');
+    INSERT INTO audit_cells (session_id, agent_id, day, model, wall_ms, active_ms, wait_ms,
+        cost_usd, unpriced, input_tokens, output_tokens, cache_read_tokens,
+        cache_write_tokens) VALUES
+        ('s1', NULL, '2026-10-02', 'm', 1000, 1000, 0, 1.0, 0, 10, 1, 0, 0),
+        ('s1', 'a1', '2026-10-02', 'm', 1000, 1000, 0, 2.0, 0, 10, 1, 0, 0),
+        ('s1', 'a2', '2026-10-02', 'm', 1000, 1000, 0, 3.0, 0, 10, 1, 0, 0),
+        ('s1', 'a3', '2026-10-02', 'm', 1000, 1000, 0, 4.0, 0, 10, 1, 0, 0),
+        ('s2', NULL, '2026-10-02', 'm', 1000, 1000, 0, 5.0, 0, 10, 1, 0, 0),
+        ('s3', NULL, '2026-10-02', 'm', 1000, 1000, 0, 6.0, 0, 10, 1, 0, 0);
+";
+
+#[test]
+fn agent_rows_key_on_the_role_with_the_tree_fallbacks() {
+    let t = Temp::new("roles");
+    drop(Store::open_in(t.db(), "UTC").expect("open"));
+    Connection::open(t.db())
+        .expect("raw")
+        .execute_batch(ROLES)
+        .expect("rows");
+    let db = Store::open_reader(t.db()).expect("reader");
+    let p = performance(&db, &filter("2026-10-02", "2026-10-02", &[])).expect("read");
+    let rows: Vec<(&str, bool, f64, i64)> = p
+        .agents
+        .iter()
+        .map(|a| (a.role.as_str(), a.root, a.cost_usd, a.dispatches))
+        .collect();
+    // Root agents first: their role, else `root`, with no dispatches. Then
+    // subagents: their role, else their type, else unknown. Each by $.
+    assert_eq!(
+        rows,
+        [
+            ("root", true, 5.0 + 6.0, 0),
+            ("manager", true, 1.0, 0),
+            ("", false, 4.0, 1),
+            ("recon", false, 3.0, 1),
+            ("impl", false, 2.0, 1),
+        ]
+    );
+    let top = p.waste.no_report_top.expect("a1 never reported");
+    assert_eq!(
+        (top.role.as_str(), top.model.as_str(), top.count),
+        ("impl", "m", 1)
     );
 }

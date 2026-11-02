@@ -4,10 +4,10 @@
 //!
 //! - Outcome: per local day of the range, every day, the issues closed as
 //!   completed and the PRs merged on it, each at its whole-life $ and
-//!   orchestrator active time (all the work charged to it, in the range or
+//!   root-agent active time (all the work charged to it, in the range or
 //!   not), plus the range's spend with no outcome yet.
-//! - Agents: per agent type and model, each dispatch with a cell in the
-//!   range once, by outcome; orchestrator rows per model, flagged.
+//! - Agents: per role and model, each dispatch with a cell in the range
+//!   once, by outcome; root-agent rows per role and model, flagged.
 //! - Bottleneck: per local day and repo, your own time in the loop, a
 //!   blocked proxy (a blocked dispatch's last record to its parent's next
 //!   typed prompt or Agent/SendMessage dispatch, on the day it went quiet),
@@ -33,7 +33,7 @@ use serde::Serialize;
 
 use super::cells::{self, Cell, Cells};
 use super::gh::Gh;
-use super::{AuditFilter, Tokens};
+use super::{AuditFilter, Tokens, role_key};
 use crate::store::{Result, account};
 use crate::time::{USER_TOOLS, local_day, parse_timestamp};
 
@@ -51,7 +51,7 @@ const ALL_DAYS: (&str, &str) = ("0001-01-01", "9999-12-31");
 #[serde(rename_all = "camelCase")]
 pub struct Performance {
     pub outcome: Outcome,
-    /// Orchestrator rows first, then by $ (most first).
+    /// Root-agent rows first, then by $ (most first).
     pub agents: Vec<AgentRow>,
     pub bottleneck: Bottleneck,
     pub waste: Waste,
@@ -81,7 +81,7 @@ pub struct OutcomeDay {
     pub day: String,
     pub issues_closed: i64,
     pub usd_per_closed_issue: Option<f64>,
-    /// Orchestrator active time, not subagent time.
+    /// Root-agent active time, not subagent time.
     pub active_ms_per_closed_issue: Option<i64>,
     /// With linked work; a PR closing several issues counts once.
     pub prs_merged: i64,
@@ -90,16 +90,17 @@ pub struct OutcomeDay {
     pub spend_usd: f64,
 }
 
-/// One agent type on one model, or the orchestrator on one model.
+/// One role on one model; a root-agent row is a session's main agents.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentRow {
-    /// `orchestrator` on an orchestrator row; `""` when unknown.
-    pub agent_type: String,
+    /// The agent's own role, else a subagent's or teammate's type, else
+    /// `root` on a root-agent row; `""` when unknown.
+    pub role: String,
     /// `""` when unknown.
     pub model: String,
-    /// An orchestrator row: no dispatches, so every count is 0.
-    pub orchestrator: bool,
+    /// A root-agent row: no dispatches, so every count is 0.
+    pub root: bool,
     /// Each dispatch with a cell in the range, once.
     pub dispatches: i64,
     /// Completed with no `NEEDS_CONTEXT:` line in the final report.
@@ -142,7 +143,7 @@ pub struct BottleneckDay {
     pub prompt_wait_ms: i64,
     /// The blocked proxy, on the day the blocked dispatch went quiet.
     pub blocked_ms: i64,
-    /// The orchestrator's active time.
+    /// The root agent's active time.
     pub active_ms: i64,
     pub blocked_reports: i64,
     /// Permission prompts that started this day: answered ones' waits.
@@ -173,13 +174,13 @@ pub struct Waste {
     pub blocked: i64,
     pub dispatches: i64,
     pub no_report: i64,
-    /// The agent type and model with the most no-report dispatches.
+    /// The role and model with the most no-report dispatches.
     pub no_report_top: Option<LaneCount>,
     /// `compact_boundary` records.
     pub compactions: i64,
     /// `/clear` successors started in the range.
     pub clears: i64,
-    /// Agents, orchestrators too, whose deepest request reached 80% of
+    /// Agents, root agents too, whose deepest request reached 80% of
     /// their model's window.
     pub context_peaks_over_80: i64,
     pub deepest_peak: Option<Peak>,
@@ -199,7 +200,7 @@ pub struct Waste {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaneCount {
-    pub agent_type: String,
+    pub role: String,
     pub model: String,
     pub count: i64,
 }
@@ -282,11 +283,12 @@ fn newest_record(conn: &Connection) -> Result<Option<i64>> {
     Ok(newest.as_deref().and_then(parse_timestamp))
 }
 
-/// Agents by (session, agent id; `None`: the orchestrator).
+/// Agents by (session, agent id; `None`: the root agent).
 type AgentKey = (String, Option<String>);
 
 /// An `agents` row as this read needs it.
 struct AgentInfo {
+    role: Option<String>,
     agent_type: Option<String>,
     model: Option<String>,
     outcome: Option<String>,
@@ -299,6 +301,12 @@ struct AgentInfo {
 }
 
 impl AgentInfo {
+    /// A subagent's or teammate's role: its own, else its stored type, else
+    /// `""` (unknown).
+    fn role(&self) -> &str {
+        role_key(self.role.as_deref(), self.agent_type.as_deref(), false)
+    }
+
     fn load_all(conn: &Connection) -> Result<HashMap<AgentKey, Self>> {
         let mut stmt = conn.prepare_cached(
             "SELECT a.session_id, a.agent_id, a.agent_type, a.model, a.outcome, a.followups,
@@ -307,7 +315,7 @@ impl AgentInfo {
                      (SELECT max(e.timestamp) FROM events AS e
                       WHERE e.session_id = a.session_id AND e.agent_id = a.agent_id)
                  END,
-                 p.session_id, p.agent_id
+                 p.session_id, p.agent_id, a.role
              FROM agents AS a
              LEFT JOIN edges AS d ON d.child = a.id AND d.kind = 'dispatch'
              LEFT JOIN agents AS p ON p.id = d.parent",
@@ -318,6 +326,7 @@ impl AgentInfo {
             let last: Option<String> = r.get(7)?;
             let parent: Option<String> = r.get(8)?;
             let info = Self {
+                role: r.get(10)?,
                 agent_type: r.get(2)?,
                 model: r.get(3)?,
                 outcome: r.get(4)?,
@@ -349,7 +358,7 @@ enum Status {
 struct Dispatch<'a> {
     key: AgentKey,
     info: Option<&'a AgentInfo>,
-    agent_type: String,
+    role: String,
     model: String,
     status: Status,
     /// Its charge's repo.
@@ -380,7 +389,7 @@ impl Read<'_> {
     }
 
     fn outcome(&self, cells: &Cells, in_range: &[&Cell]) -> Outcome {
-        // Whole life: per issue its $ and orchestrator active ms; per PR
+        // Whole life: per issue its $ and root-agent active ms; per PR
         // (its own repo) its $ and merge time.
         let mut issues: HashMap<(&str, i64), (f64, i64)> = HashMap::new();
         let mut prs: HashMap<(&str, i64), (f64, Option<i64>)> = HashMap::new();
@@ -466,7 +475,7 @@ impl Read<'_> {
             }
             let info = self.agents.get(&key);
             out.push(Dispatch {
-                agent_type: info.and_then(|i| i.agent_type.clone()).unwrap_or_default(),
+                role: info.map(AgentInfo::role).unwrap_or_default().to_string(),
                 model: info
                     .and_then(|i| i.model.clone())
                     .or_else(|| cell.model.clone())
@@ -497,15 +506,19 @@ impl Read<'_> {
         let mut rows: HashMap<(bool, String, String), AgentRow> = HashMap::new();
         for cell in in_range {
             let lane = match &cell.agent_id {
-                // An orchestrator cell with no model carries no request.
+                // A root agent's cell with no model carries no request.
                 None => match &cell.model {
-                    Some(model) => (true, "orchestrator".to_string(), model.clone()),
+                    Some(model) => {
+                        let info = self.agents.get(&(cell.session_id.clone(), None));
+                        let role = role_key(info.and_then(|i| i.role.as_deref()), None, true);
+                        (true, role.to_string(), model.clone())
+                    }
                     None => continue,
                 },
                 Some(agent_id) => {
                     let key = (cell.session_id.clone(), Some(agent_id.clone()));
                     let Some(d) = lanes.get(&key) else { continue };
-                    (false, d.agent_type.clone(), d.model.clone())
+                    (false, d.role.clone(), d.model.clone())
                 }
             };
             let row = rows
@@ -515,7 +528,7 @@ impl Read<'_> {
             row.tokens.add(&cell.share.tokens);
         }
         for d in dispatches {
-            let lane = (false, d.agent_type.clone(), d.model.clone());
+            let lane = (false, d.role.clone(), d.model.clone());
             let row = rows
                 .entry(lane.clone())
                 .or_insert_with(|| AgentRow::new(lane));
@@ -531,10 +544,10 @@ impl Read<'_> {
         }
         let mut rows: Vec<AgentRow> = rows.into_values().map(AgentRow::finish).collect();
         rows.sort_by(|a, b| {
-            b.orchestrator
-                .cmp(&a.orchestrator)
+            b.root
+                .cmp(&a.root)
                 .then(b.cost_usd.total_cmp(&a.cost_usd))
-                .then_with(|| (&a.agent_type, &a.model).cmp(&(&b.agent_type, &b.model)))
+                .then_with(|| (&a.role, &a.model).cmp(&(&b.role, &b.model)))
         });
         rows
     }
@@ -659,17 +672,17 @@ impl Read<'_> {
             .filter(|r| r.no_report > 0)
             .min_by_key(|r| Reverse(r.no_report))
             .map(|r| LaneCount {
-                agent_type: r.agent_type.clone(),
+                role: r.role.clone(),
                 model: r.model.clone(),
                 count: r.no_report,
             });
-        // Peaks: the dispatches and the orchestrators with cells in range.
-        let orchestrators: HashSet<AgentKey> = in_range
+        // Peaks: the dispatches and the root agents with cells in range.
+        let roots: HashSet<AgentKey> = in_range
             .iter()
             .filter(|c| c.agent_id.is_none())
             .map(|c| (c.session_id.clone(), None))
             .collect();
-        let peaks: Vec<(f64, &str)> = orchestrators
+        let peaks: Vec<(f64, &str)> = roots
             .iter()
             .filter_map(|k| self.agents.get(k))
             .chain(dispatches.iter().filter_map(|d| d.info))
@@ -758,7 +771,7 @@ impl Read<'_> {
     }
 
     /// `/clear` successors (continuation children) that started in the
-    /// range, their orchestrator charged in the filter.
+    /// range, their root agent charged in the filter.
     fn clears(&self, cells: &Cells) -> Result<i64> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT s.session_id, s.started_at FROM edges AS e
@@ -878,11 +891,11 @@ struct EventCounts {
 }
 
 impl AgentRow {
-    fn new((orchestrator, agent_type, model): (bool, String, String)) -> Self {
+    fn new((root, role, model): (bool, String, String)) -> Self {
         Self {
-            agent_type,
+            role,
             model,
-            orchestrator,
+            root,
             dispatches: 0,
             completed: 0,
             blocked: 0,

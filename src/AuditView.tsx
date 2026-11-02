@@ -17,18 +17,12 @@ import {
 import { ChevronLeft } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { flushSync } from 'react-dom'
-import {
-  auditRefresh,
-  writeExport,
-  type Audit,
-  type AuditFilter,
-  type AuditPath,
-  type GithubError,
-} from './api'
+import { auditRefresh, writeExport } from './api'
 import { dailyChart, dayRange, hasPath, hoursLabel, lastDays, repoChips, shortDay } from './audit'
 import { AuditControls, PRESET_DAYS, type Controls } from './AuditControls'
 import { AuditDetail } from './AuditDetail'
 import { AuditTable } from './AuditTable'
+import type { Audit, AuditFilter, AuditPath, GithubError } from './audit-types'
 import { toCsv } from './csv'
 import { money } from './format'
 import { PerformanceView, Section } from './PerformanceView'
