@@ -125,8 +125,11 @@ export interface TranscriptTodo {
   status: TranscriptTodoStatus
 }
 
-/** One record of an agent's transcript, at its record's time (ISO; null when it has none). */
-export type TranscriptEntry = { timestamp: string | null } & (
+/**
+ * One record of an agent's transcript, at its record's time (ISO; null when it has none). `key`
+ * names it for good: its event id and its place among that record's entries.
+ */
+export type TranscriptEntry = { key: string; timestamp: string | null } & (
   | /** A human prompt. */ { kind: 'user'; text: string }
   | /** An assistant text block. */ { kind: 'text'; text: string }
   | /** Non-empty thinking; redacted thinking is skipped. */ { kind: 'thinking'; text: string }
@@ -147,6 +150,28 @@ export type TranscriptEntry = { timestamp: string | null } & (
       todos: TranscriptTodo[] | null
     }
 )
+
+/** A tool result whose call is not in its page: an earlier page's call, or none (an orphan). */
+export interface TranscriptResult {
+  /** The tool_use id it answers. */
+  id: string
+  status: Exclude<TranscriptToolStatus, 'pending'>
+  /** Capped at 4000 characters. */
+  result: string
+  resultTruncated: boolean
+  /** When the result arrived (ISO). */
+  resultAt: string | null
+}
+
+/** What an agent's transcript gained after a cursor. */
+export interface TranscriptPage {
+  /** The new records' entries, their calls completed by the new results. */
+  entries: TranscriptEntry[]
+  /** The new results for calls not in `entries`; each completes the last call with its id. */
+  updates: TranscriptResult[]
+  /** The last event id read: the next read's cursor. The given one when nothing was read. */
+  cursor: number | null
+}
 
 /** What auditRollup sums: the cells on local days `from..=to`. */
 export interface AuditFilter {
@@ -440,9 +465,12 @@ export const needsYou = () => invoke<NeedsYou[]>('needs_you')
 export const liveGraph = (workstream: number) =>
   invoke<LiveGraph | null>('live_graph', { workstream })
 
-/** The agent row's own transcript records in order, every tool call included; empty when unknown. */
-export const agentTranscript = (agent: number) =>
-  invoke<TranscriptEntry[]>('agent_transcript', { agent })
+/**
+ * What the agent row's own transcript records gained after event `cursor` (null: from the start),
+ * every tool call included; empty when unknown.
+ */
+export const agentTranscript = (agent: number, cursor: number | null) =>
+  invoke<TranscriptPage>('agent_transcript', { agent, cursor })
 
 /** Rejects with the message on a bad day in the filter. */
 export const auditRollup = (filter: AuditFilter) => invoke<Audit>('audit_rollup', { filter })

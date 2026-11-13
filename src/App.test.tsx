@@ -15,6 +15,7 @@ import {
   type LiveGraph,
   type NeedsYou,
   type TranscriptEntry,
+  type TranscriptPage,
   type Workstream,
 } from './api'
 import { App } from './App'
@@ -181,7 +182,7 @@ beforeEach(() => {
   needsYouMock.mockReset().mockResolvedValue([])
   listeners = []
   auditRollupMock.mockReset().mockResolvedValue(audit([]))
-  transcriptMock.mockReset().mockResolvedValue([])
+  transcriptMock.mockReset().mockResolvedValue({ entries: [], updates: [], cursor: null })
   onStoreChangedMock.mockReset().mockImplementation((callback) => {
     listeners.push(callback)
     return Promise.resolve(unlisten)
@@ -607,33 +608,49 @@ describe('canvas', () => {
 })
 
 describe('console', () => {
-  const said = (text: string): TranscriptEntry => ({ kind: 'text', text, timestamp: null })
+  const said = (text: string, key = text): TranscriptEntry => ({
+    key,
+    kind: 'text',
+    text,
+    timestamp: null,
+  })
+  const pageOf = (entries: TranscriptEntry[], cursor: number): TranscriptPage => ({
+    entries,
+    updates: [],
+    cursor,
+  })
   const consolePanel = () => screen.getByRole('complementary', { name: 'Console' })
 
   it("shows the selected agent's transcript, read-only", async () => {
     transcriptMock.mockImplementation((id) =>
-      Promise.resolve([
-        { kind: 'user', text: `brief for ${id}`, timestamp: null },
-        {
-          kind: 'tool_call',
-          id: 'toolu_1',
-          name: 'Bash',
-          args: 'Bash(bun test)',
-          status: 'success',
-          result: 'ok',
-          resultTruncated: false,
-          resultAt: null,
-          todos: null,
-          timestamp: null,
-        },
-      ]),
+      Promise.resolve(
+        pageOf(
+          [
+            { key: `${id}:0`, kind: 'user', text: `brief for ${id}`, timestamp: null },
+            {
+              key: `${id}:1`,
+              kind: 'tool_call',
+              id: 'toolu_1',
+              name: 'Bash',
+              args: 'Bash(bun test)',
+              status: 'success',
+              result: 'ok',
+              resultTruncated: false,
+              resultAt: null,
+              todos: null,
+              timestamp: null,
+            },
+          ],
+          id,
+        ),
+      ),
     )
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
     const transcript = await within(consolePanel()).findByRole('list', { name: 'Agent transcript' })
     expect(transcript).toHaveTextContent('brief for 11')
     expect(transcript).toHaveTextContent('Bash(bun test)')
-    expect(transcriptMock).toHaveBeenCalledWith(11)
+    expect(transcriptMock).toHaveBeenCalledWith(11, null)
     // The scroll stop is named by the console's visible heading, not left a nameless tab stop.
     expect(within(consolePanel()).getByRole('region', { name: 'implementer' })).toContainElement(
       transcript,
@@ -642,23 +659,31 @@ describe('console', () => {
     fireEvent.click(screen.getByRole('button', { name: /teammate/ }))
     expect(await within(consolePanel()).findByText('brief for 12')).toBeInTheDocument()
     expect(within(consolePanel()).queryByText('brief for 11')).not.toBeInTheDocument()
+    // Another agent starts from the start, not from the last one's cursor.
+    expect(transcriptMock).toHaveBeenLastCalledWith(12, null)
   })
 
   it('shows an unanswered call as running only while its agent works', async () => {
-    transcriptMock.mockResolvedValue([
-      {
-        kind: 'tool_call',
-        id: 'toolu_1',
-        name: 'Bash',
-        args: 'Bash(bun test)',
-        status: 'pending',
-        result: null,
-        resultTruncated: false,
-        resultAt: null,
-        todos: null,
-        timestamp: null,
-      },
-    ])
+    transcriptMock.mockResolvedValue(
+      pageOf(
+        [
+          {
+            key: '1:0',
+            kind: 'tool_call',
+            id: 'toolu_1',
+            name: 'Bash',
+            args: 'Bash(bun test)',
+            status: 'pending',
+            result: null,
+            resultTruncated: false,
+            resultAt: null,
+            todos: null,
+            timestamp: null,
+          },
+        ],
+        1,
+      ),
+    )
     render(<App />)
     // The implementer waits on the user; the teammate works.
     fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
@@ -667,27 +692,33 @@ describe('console', () => {
     expect(await within(consolePanel()).findByText('Running:')).toBeInTheDocument()
   })
 
-  it('rereads the open transcript on a store change', async () => {
-    transcriptMock.mockResolvedValue([said('first')])
+  it('reads what follows the open transcript on a store change', async () => {
+    transcriptMock.mockResolvedValue(pageOf([said('first')], 4))
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
     await within(consolePanel()).findByText('first')
-    transcriptMock.mockResolvedValue([said('first'), said('second')])
+    transcriptMock.mockResolvedValue(pageOf([said('second')], 5))
     act(() => storeChanged())
     expect(await within(consolePanel()).findByText('second')).toBeInTheDocument()
+    expect(transcriptMock).toHaveBeenLastCalledWith(11, 4)
+    expect(within(consolePanel()).getByText('first')).toBeInTheDocument()
   })
 
   it('reads the transcript afresh when the console reopens', async () => {
-    transcriptMock.mockResolvedValue([said('first')])
+    transcriptMock.mockResolvedValue(pageOf([said('first')], 4))
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
     await within(consolePanel()).findByText('first')
     fireEvent.click(within(consolePanel()).getByRole('button', { name: 'Close console' }))
     // Nothing tells the closed console the store changed; reopening must read again anyway.
-    transcriptMock.mockResolvedValue([said('first'), said('later')])
+    transcriptMock.mockResolvedValue(pageOf([said('first'), said('later')], 6))
     fireEvent.click(screen.getByRole('button', { name: /implementer/ }))
     expect(await within(consolePanel()).findByText('later')).toBeInTheDocument()
-    expect(transcriptMock).toHaveBeenCalledTimes(2)
+    expect(within(consolePanel()).getAllByText('first')).toHaveLength(1)
+    expect(transcriptMock.mock.calls).toEqual([
+      [11, null],
+      [11, null],
+    ])
   })
 
   it('reads no transcript while Audit hides the live view', async () => {
@@ -701,7 +732,9 @@ describe('console', () => {
   })
 
   it('keeps naming the agent whose transcript shows after it leaves the canvas', async () => {
-    transcriptMock.mockResolvedValue([said('first')])
+    transcriptMock
+      .mockResolvedValueOnce(pageOf([said('first')], 4))
+      .mockResolvedValue(pageOf([], 4))
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
     await within(consolePanel()).findByText('first')
@@ -1037,20 +1070,25 @@ describe('audit view', () => {
 
 describe('page', () => {
   it('makes every scroll box a containing block, so sr-only text never grows the page', async () => {
-    transcriptMock.mockResolvedValue([
-      {
-        kind: 'tool_call',
-        id: 'toolu_1',
-        name: 'Bash',
-        args: 'Bash(bun test)',
-        status: 'success',
-        result: 'ok',
-        resultTruncated: false,
-        resultAt: null,
-        todos: null,
-        timestamp: null,
-      },
-    ])
+    transcriptMock.mockResolvedValue({
+      entries: [
+        {
+          key: '1:0',
+          kind: 'tool_call',
+          id: 'toolu_1',
+          name: 'Bash',
+          args: 'Bash(bun test)',
+          status: 'success',
+          result: 'ok',
+          resultTruncated: false,
+          resultAt: null,
+          todos: null,
+          timestamp: null,
+        },
+      ],
+      updates: [],
+      cursor: 1,
+    })
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
     await screen.findByRole('list', { name: 'Agent transcript' })

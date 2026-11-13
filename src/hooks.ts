@@ -36,15 +36,26 @@ type Loaded<T> = { target: string; value: T } | { target: string; error: string 
  * Instead bumps coalesce into one rerun after the read in flight lands, so at
  * most one read per target is in flight and results land in order. A null
  * `target` loads nothing and, like an unmount, drops a queued rerun.
+ *
+ * `load` gets the value the last read for this target landed with (undefined
+ * for a new target or before any landed), so a read can add to it instead of
+ * starting over; a failed read leaves it as it was. A read still in flight
+ * when the target goes null and comes back lands as that last value.
  */
 export function useLoad<T>(
   target: string | null,
   version: number,
-  load: () => Promise<T>,
+  load: (last: T | undefined) => Promise<T>,
 ): Loaded<T> | null {
   const [loaded, setLoaded] = useState<Loaded<T> | null>(null)
   const run = useEffectEvent(load)
-  const reads = useRef({ generation: 0, target: null as string | null, busy: false, rerun: false })
+  const reads = useRef({
+    generation: 0,
+    target: null as string | null,
+    busy: false,
+    rerun: false,
+    last: undefined as T | undefined,
+  })
   // A rerun queued behind a read in flight is dropped on unmount, as it is
   // when the target goes null: nothing reads for a view that is gone.
   useEffect(() => {
@@ -57,6 +68,7 @@ export function useLoad<T>(
     const r = reads.current
     if (target === null) {
       r.rerun = false
+      r.last = undefined
       return
     }
     if (r.busy && r.target === target) {
@@ -64,10 +76,12 @@ export function useLoad<T>(
       return
     }
     const generation = ++r.generation
+    if (r.target !== target) r.last = undefined
     Object.assign(r, { target, busy: true, rerun: false })
-    const read = () => run().then(settle, (e: unknown) => settle(undefined, String(e)))
+    const read = () => run(r.last).then(settle, (e: unknown) => settle(undefined, String(e)))
     const settle = (value?: T, error?: string) => {
       if (r.generation !== generation) return
+      if (error === undefined) r.last = value
       setLoaded(error === undefined ? { target, value: value as T } : { target, error })
       r.busy = r.rerun
       r.rerun = false
