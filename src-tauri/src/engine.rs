@@ -295,10 +295,12 @@ impl Sources {
 
 /// At most one notification per `every`, sent as soon as one is due:
 /// the first change notifies at once, a burst after it once per window.
+/// While held, nothing is due; a mark waits for the release.
 struct Throttle {
     every: Duration,
     last: Option<Instant>,
     dirty: bool,
+    held: bool,
 }
 
 impl Throttle {
@@ -307,6 +309,7 @@ impl Throttle {
             every,
             last: None,
             dirty: false,
+            held: false,
         }
     }
 
@@ -316,7 +319,7 @@ impl Throttle {
 
     /// Whether to notify at `now`; a notification clears the mark.
     fn take(&mut self, now: Instant) -> bool {
-        let due = self.dirty && self.last.is_none_or(|last| now >= last + self.every);
+        let due = self.dirty && !self.held && self.last.is_none_or(|last| now >= last + self.every);
         if due {
             self.dirty = false;
             self.last = Some(now);
@@ -326,7 +329,7 @@ impl Throttle {
 
     /// How long until a marked change is due; `None` when nothing is.
     fn wait(&self, now: Instant) -> Option<Duration> {
-        self.dirty.then(|| {
+        (self.dirty && !self.held).then(|| {
             self.last.map_or(Duration::ZERO, |last| {
                 (last + self.every).saturating_duration_since(now)
             })
@@ -420,7 +423,7 @@ impl<F: FnMut()> Ingest<F> {
             select! {
                 recv(sources.stop) -> _ => break,
                 recv(batches) -> batch => match batch {
-                    Ok(batch) => self.batch(&batch),
+                    Ok(batch) => self.batch(&batch, !batches.is_empty()),
                     Err(_) => batches = never(),
                 },
                 recv(registry) -> event => match event {
@@ -465,19 +468,48 @@ impl<F: FnMut()> Ingest<F> {
         sources.stop();
     }
 
-    fn batch(&mut self, batch: &Batch) {
+    /// Stores one batch. While indexing, and inside a live burst (`more`
+    /// batches queued behind it), it leaves its sessions' rollups stale: a
+    /// burst recomputes each session once, at caught-up or at its last
+    /// batch. A live burst holds the change signal, every source's, until
+    /// that rollup ran, so no signal finds a live session stale (#114).
+    fn batch(&mut self, batch: &Batch, more: bool) {
         if batch.events.contains(&TailEvent::CaughtUp) {
+            self.roll_up();
             self.progress.live.store(true, Ordering::Release);
             self.discovery.due = true;
             self.notify.mark();
             return;
         }
-        if self.progress.live.load(Ordering::Acquire) {
+        let live = self.progress.live.load(Ordering::Acquire);
+        if live {
             self.discovery.saw(&batch.path);
         }
-        match self.store.ingest(batch) {
+        let stored = if live && !more {
+            self.store.ingest(batch)
+        } else {
+            self.store.ingest_deferred(batch)
+        };
+        match &stored {
             Ok(()) => self.notify.mark(),
             Err(e) => eprintln!("strate: ingest failed: {e}"),
+        }
+        if live && more {
+            self.notify.held = true;
+        } else if live && self.notify.held {
+            // A live batch rolls up every stale session with it; a failed
+            // one leaves the burst's to this.
+            if stored.is_err() {
+                self.roll_up();
+            }
+            self.notify.held = false;
+        }
+    }
+
+    /// Recomputes every session a deferred batch left stale.
+    fn roll_up(&mut self) {
+        if let Err(e) = self.store.roll_up() {
+            eprintln!("strate: rollup failed: {e}");
         }
     }
 
@@ -648,12 +680,24 @@ mod tests {
     /// An engine-thread state over an empty store (so a refresh has no repos
     /// to fetch), with GitHub on through `fetcher`.
     fn ingest(name: &str, fetcher: Option<Sender<Vec<Target>>>) -> Ingest<impl FnMut()> {
+        ingest_in(temp(name), fetcher, || {})
+    }
+
+    fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("strate-ingest-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("dir");
+        dir
+    }
+
+    fn ingest_in<F: FnMut()>(
+        dir: PathBuf,
+        fetcher: Option<Sender<Vec<Target>>>,
+        on_change: F,
+    ) -> Ingest<F> {
         Ingest {
-            root: dir.clone(),
             store: Store::open(dir.join("strate.db")).expect("store"),
+            root: dir,
             progress: Arc::default(),
             notify: Throttle::new(Duration::ZERO),
             discovery: Discovery::new(Duration::ZERO),
@@ -661,14 +705,161 @@ mod tests {
             fetching: false,
             pending: false,
             waiters: Vec::new(),
-            on_change: || {},
+            on_change,
         }
+    }
+
+    /// A one-record batch on session `s1` under `root`, at `10:<at>`.
+    fn s1_batch(root: &Path, offset: u64, at: &str) -> Batch {
+        let path: Arc<Path> = root.join("projects/-work-x/s1.jsonl").into();
+        Batch {
+            path: path.clone(),
+            events: vec![TailEvent::Record {
+                path,
+                offset,
+                value: serde_json::json!({"type": "user", "uuid": format!("u{offset}"),
+                    "timestamp": format!("2026-10-03T10:{at}.000Z"),
+                    "message": {"content": "Lorem."}}),
+            }],
+            checkpoint: None,
+        }
+    }
+
+    fn caught_up(root: &Path) -> Batch {
+        Batch {
+            path: root.into(),
+            events: vec![TailEvent::CaughtUp],
+            checkpoint: None,
+        }
+    }
+
+    /// Drives the real loop through caught-up and a queued live burst:
+    /// every change signal it sends finds no session rollup-stale, and the
+    /// burst still signals once its rollup ran (#114).
+    #[test]
+    fn the_loop_sends_no_change_signal_while_a_live_burst_leaves_a_rollup_stale() {
+        let dir = temp("signal");
+        let db = dir.join("strate.db");
+        let (seen, signals) = unbounded();
+        let on_change = move || {
+            let db = Store::open_reader(&db).expect("reader");
+            let stale: i64 = db
+                .query_row(
+                    "SELECT count(*) FROM meta WHERE key GLOB 'rollup_stale:*'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("stale");
+            let run_ms: Option<i64> = db
+                .query_row(
+                    "SELECT run_ms FROM sessions WHERE session_id = 's1'",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok()
+                .flatten();
+            let _ = seen.send((stale, run_ms));
+        };
+        let ingest = ingest_in(dir.clone(), None, on_change);
+        let (feed, batches) = unbounded();
+        for batch in [
+            caught_up(&dir),
+            s1_batch(&dir, 0, "00:00"),
+            s1_batch(&dir, 10, "00:30"),
+            s1_batch(&dir, 20, "01:00"),
+        ] {
+            feed.send(batch).expect("queued");
+        }
+        let (tailer, _tailed) =
+            Tailer::start(&dir, Default::default(), TailOptions::default()).expect("tailer");
+        let (stop, stop_rx) = bounded(0);
+        let (_request, refresh) = unbounded();
+        let sources = Sources {
+            tailer,
+            poller: None,
+            receiver: None,
+            batches,
+            registry: never(),
+            hooks: never(),
+            refresh,
+            fetched: never(),
+            stop: stop_rx,
+        };
+        let worker = thread::spawn(move || ingest.run(sources));
+        let mut observed = Vec::new();
+        while observed
+            .last()
+            .is_none_or(|&(_, run_ms)| run_ms != Some(60_000))
+        {
+            observed.push(
+                signals
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("the burst signals once rolled up"),
+            );
+        }
+        drop(stop);
+        worker.join().expect("loop");
+        assert!(
+            observed.iter().all(|&(stale, _)| stale == 0),
+            "a signal fired with a rollup stale: {observed:?}"
+        );
+    }
+
+    /// A mark from another source mid-burst waits for the burst's rollup
+    /// too; with nothing deferred it is due at once (#114).
+    #[test]
+    fn a_mark_from_another_source_mid_burst_waits_for_the_rollup() {
+        let mut ingest = ingest("held", None);
+        let root = ingest.root.clone();
+        ingest.batch(&caught_up(&root), false);
+        let now = Instant::now();
+        assert!(ingest.notify.take(now), "caught-up signals at once");
+        ingest.fetched(&[]);
+        assert!(ingest.notify.take(now), "nothing deferred: due at once");
+
+        ingest.batch(&s1_batch(&root, 0, "00:00"), true);
+        ingest.fetched(&[]);
+        assert_eq!(ingest.notify.wait(now), None, "held while a burst is out");
+        assert!(!ingest.notify.take(now));
+        ingest.batch(&s1_batch(&root, 10, "00:30"), false);
+        assert_eq!(ingest.notify.wait(now), Some(Duration::ZERO));
+        assert!(
+            ingest.notify.take(now),
+            "the burst's last batch releases it"
+        );
     }
 
     fn waiter(ingest: &mut Ingest<impl FnMut()>) -> Receiver<()> {
         let (waiter, done) = bounded(1);
         ingest.waiters.push(waiter);
         done
+    }
+
+    /// While indexing, a batch leaves its session's rollup to caught-up; a
+    /// live burst rolls up at its last batch, before the change signal
+    /// (#114).
+    #[test]
+    fn a_catch_up_rolls_up_at_caught_up_and_a_live_burst_at_its_last_batch() {
+        let mut ingest = ingest("rollups", None);
+        let root = ingest.root.clone();
+        let db = Store::open_reader(root.join("strate.db")).expect("reader");
+        let run_ms = || -> Option<i64> {
+            db.query_row(
+                "SELECT run_ms FROM sessions WHERE session_id = 's1'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("s1")
+        };
+        ingest.batch(&s1_batch(&root, 0, "00:00"), false);
+        ingest.batch(&s1_batch(&root, 10, "00:30"), false);
+        assert_eq!(run_ms(), None, "indexing leaves the rollup to caught-up");
+        ingest.batch(&caught_up(&root), false);
+        assert_eq!(run_ms(), Some(30_000), "rolled up at caught-up");
+        ingest.batch(&s1_batch(&root, 20, "01:00"), true);
+        assert_eq!(run_ms(), Some(30_000), "mid-burst: more batches queued");
+        ingest.batch(&s1_batch(&root, 30, "01:30"), false);
+        assert_eq!(run_ms(), Some(90_000), "the burst's last batch rolls up");
     }
 
     #[test]

@@ -470,6 +470,117 @@ fn an_incremental_and_repeated_ingest_equals_a_cold_build() {
     assert_eq!(rollups(&Store::open_reader(b.db()).expect("reader")), want);
 }
 
+/// Every record of every transcript as its own deferred batch, the graph
+/// first, as a catch-up delivers them (#114).
+fn catch_up(store: &mut Store) {
+    store
+        .ingest_graph(&discover(&root()).expect("discover"))
+        .expect("graph");
+    for path in transcripts() {
+        for event in records(&path) {
+            store
+                .ingest_deferred(&batch(vec![event]))
+                .expect("deferred");
+        }
+    }
+}
+
+fn audit_cells(db: &Connection) -> i64 {
+    db.query_row("SELECT count(*) FROM audit_cells", [], |r| r.get(0))
+        .expect("cells")
+}
+
+#[test]
+fn a_catch_up_defers_every_rollup_to_one_roll_up_that_equals_a_cold_build() {
+    let a = Temp::new("deferred-cold");
+    let want = rollups(&cold(&a));
+
+    let b = Temp::new("deferred");
+    let mut store = Store::open(b.db()).expect("open");
+    catch_up(&mut store);
+    let db = Store::open_reader(b.db()).expect("reader");
+    assert_eq!(audit_cells(&db), 0, "no batch rolled its session up");
+    assert_eq!(session_row::<Option<i64>>(&db, "run_ms", K1), None);
+    assert_eq!(
+        store.roll_up().expect("roll up"),
+        3,
+        "K1, K2 and K3 marked stale (marks, not recompute calls)"
+    );
+    assert_eq!(rollups(&db), want);
+    assert_eq!(store.roll_up().expect("again"), 0, "nothing left stale");
+}
+
+#[test]
+fn a_live_batch_rolls_up_what_the_catch_up_left_with_its_own_session() {
+    let a = Temp::new("live-after-cold");
+    let want = rollups(&cold(&a));
+
+    let b = Temp::new("live-after");
+    let mut store = Store::open(b.db()).expect("open");
+    catch_up(&mut store);
+    // A live batch re-delivering K1's first record stores nothing new.
+    let first = transcripts()
+        .into_iter()
+        .find(|p| p.ends_with(format!("{K1}.jsonl")))
+        .expect("K1's transcript");
+    let event = records(&first).remove(0);
+    store.ingest(&batch(vec![event])).expect("live");
+    let db = Store::open_reader(b.db()).expect("reader");
+    assert_eq!(rollups(&db), want);
+    assert_eq!(store.roll_up().expect("roll up"), 0);
+}
+
+#[test]
+fn a_rollup_left_stale_by_an_exit_is_recomputed_on_the_next_open() {
+    let a = Temp::new("reopen-cold");
+    let want = rollups(&cold(&a));
+
+    let b = Temp::new("reopen");
+    let mut store = Store::open(b.db()).expect("open");
+    catch_up(&mut store);
+    drop(store);
+    let mut store = Store::open(b.db()).expect("reopen");
+    assert_eq!(rollups(&Store::open_reader(b.db()).expect("reader")), want);
+    assert_eq!(store.roll_up().expect("roll up"), 0);
+}
+
+#[test]
+fn a_deferred_replay_into_another_session_leaves_the_first_session_stale_too() {
+    let t = Temp::new("deferred-cross-session");
+    let mut store = Store::open(t.db()).expect("open");
+    let line = |sid: &str, uuid: &str, output: u64| {
+        json!({
+            "type": "assistant", "uuid": uuid, "sessionId": sid,
+            "timestamp": "2026-10-03T10:00:00.000Z", "requestId": "req_x",
+            "message": {"id": "msg_x", "model": "claude-haiku-4-5", "content": [],
+                "usage": {"input_tokens": 0, "output_tokens": output}}
+        })
+    };
+    let record = |sid: &str, value: Value| {
+        let path: Arc<Path> = t
+            .path()
+            .join(format!("projects/-work-x/{sid}.jsonl"))
+            .into();
+        batch(vec![TailEvent::Record {
+            path,
+            offset: 0,
+            value,
+        }])
+    };
+    store
+        .ingest(&record("s-old", line("s-old", "x-1", 100)))
+        .expect("live");
+    store
+        .ingest_deferred(&record("s-new", line("s-new", "x-2", 300)))
+        .expect("deferred");
+    let db = Store::open_reader(t.db()).expect("reader");
+    let cost = |sid| session_row::<Option<f64>>(&db, "cost_usd", sid);
+    assert!((cost("s-old").expect("not rolled up yet") - 0.0005).abs() < 1e-12);
+    assert_eq!(store.roll_up().expect("roll up"), 2, "s-new and s-old");
+    assert_eq!(cost("s-old"), None, "the replay owns the request now");
+    assert!((cost("s-new").expect("priced") - 0.0015).abs() < 1e-12);
+}
+
 #[test]
 fn a_request_replayed_into_another_session_counts_once_toward_the_larger() {
     let t = Temp::new("cross-session");

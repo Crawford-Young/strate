@@ -1,9 +1,10 @@
 //! Cost and time in the store (#14). [`fields`] reads what accounting needs
 //! from each record as it is inserted. Rollups are a pure function of the
-//! stored events, recomputed in the batch's transaction for every session
-//! the batch touches, so re-ingest is idempotent and an incremental build
-//! converges to a cold one. Every function runs inside the caller's
-//! transaction.
+//! stored events, recomputed for every session a batch touches: in the
+//! batch's transaction, or once at the end of a catch-up burst for the
+//! sessions its batches marked stale ([`defer`], #114). So re-ingest is
+//! idempotent and an incremental build converges to a cold one. Every
+//! function runs inside the caller's transaction.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Once;
@@ -195,12 +196,44 @@ pub(super) fn touched(
     Ok(out)
 }
 
+/// The meta key prefix marking a session whose stored events moved since
+/// its rollup: `rollup_stale:<session_id>` (#114).
+const STALE: &str = "rollup_stale:";
+
+/// Marks the given sessions stale, for [`roll_up_stale`]: a catch-up
+/// batch leaves its rollups to the end of the burst. The mark commits with
+/// the batch, so one left by an exit is rolled up on the next open.
+pub(super) fn defer<'a>(conn: &Connection, ids: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let mut stmt =
+        conn.prepare_cached("INSERT OR IGNORE INTO meta (key, value) VALUES (?1, '')")?;
+    for id in ids {
+        stmt.execute([format!("{STALE}{id}")])?;
+    }
+    Ok(())
+}
+
+/// Recomputes every session marked stale; returns how many.
+pub(super) fn roll_up_stale(conn: &Connection) -> Result<usize> {
+    let ids: Vec<String> = conn
+        .prepare_cached(
+            "SELECT substr(key, length(?1) + 1) FROM meta
+             WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key",
+        )?
+        .query_map([STALE], |r| r.get(0))?
+        .collect::<Result<_>>()?;
+    rollup(conn, ids.iter().map(String::as_str))?;
+    Ok(ids.len())
+}
+
 /// Recomputes the rollups and audit cells of the given sessions and their
-/// agents, with days in the zone under meta `tz`.
+/// agents, with days in the zone under meta `tz`, and clears their stale
+/// marks.
 pub(super) fn rollup<'a>(conn: &Connection, ids: impl IntoIterator<Item = &'a str>) -> Result<()> {
     let tz = zone(conn)?;
     for id in ids {
         session(conn, id, &tz)?;
+        conn.prepare_cached("DELETE FROM meta WHERE key = ?1")?
+            .execute([format!("{STALE}{id}")])?;
     }
     Ok(())
 }

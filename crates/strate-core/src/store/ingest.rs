@@ -56,11 +56,13 @@ fn owner_of(path: &Path) -> Owner {
 /// Stores a batch's events and its checkpoint, then relinks the batch's
 /// session ([`relink`]), ends the waits left open on its `/clear` chain's
 /// earlier links, re-reads a subagent's meta `finished` until it is set,
-/// re-resolves the agents it touched in the model, recomputes the rollups
-/// it touches, and rebuilds the launch edges (when it stored a launch or
-/// its result, or changed what [`launch_inputs`] reads) and the message
-/// edges (when those changed, or it stored a cross-session message).
-pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
+/// re-resolves the agents it touched in the model, and rebuilds the launch
+/// edges (when it stored a launch or its result, or changed what
+/// [`launch_inputs`] reads) and the message edges (with the launch edges,
+/// or when it stored a cross-session message). Returns the sessions whose
+/// rollups it moved ([`account::touched`]), for the caller to recompute
+/// now or mark stale.
+pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<BTreeSet<String>> {
     let owner = owner_of(&batch.path);
     let file = text_of(&batch.path);
     let mut agent = None;
@@ -109,10 +111,8 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
         }
     }
     model::batch(conn, &owner.session_id, agent)?;
-    let touched = account::touched(conn, &owner.session_id, &requests)?;
-    account::rollup(conn, touched.iter().map(String::as_str))?;
     if launched || launch_inputs(conn, &owner.session_id)? != inputs {
-        model::relaunch(conn, messaged)?;
+        model::relaunch(conn)?;
     } else if messaged {
         model::messages(conn)?;
     }
@@ -129,7 +129,7 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
             c.identity.index.to_string()
         ])?;
     }
-    Ok(())
+    account::touched(conn, &owner.session_id, &requests)
 }
 
 /// Stores subagent `id`'s dispatch edge while none links it yet, by
