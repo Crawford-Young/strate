@@ -753,7 +753,10 @@ describe('console', () => {
   })
 
   it("follows a /clear to the chain's latest link: its name, charge and transcript (#133)", async () => {
-    transcriptMock.mockImplementation((id) => Promise.resolve([said(`transcript of ${id}`)]))
+    // A paged read: the entry on the first page (null cursor), nothing after it.
+    transcriptMock.mockImplementation((id, cursor) =>
+      Promise.resolve(pageOf(cursor === null ? [said(`transcript of ${id}`)] : [], 1)),
+    )
     render(<App />)
     fireEvent.click(await screen.findByRole('button', { name: /strate-17/ }))
     await within(consolePanel()).findByText('transcript of 10')
@@ -791,7 +794,7 @@ describe('console', () => {
     )
     expect(within(panel).getByRole('heading', { name: 'strate-18' })).toBeInTheDocument()
     expect(within(panel).getByText('transcript of 15')).toBeInTheDocument()
-    expect(transcriptMock).not.toHaveBeenLastCalledWith(10)
+    expect(transcriptMock.mock.lastCall?.[0]).toBe(15)
   })
 
   it("shows the selected agent's charge key and source as visible text in the heading area", async () => {
