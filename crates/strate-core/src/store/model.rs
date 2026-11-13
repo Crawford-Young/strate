@@ -34,11 +34,15 @@
 //!     result that one of the session's records received, by receipt time,
 //!     then msg_id, refusing one whose parent descends from the session
 //!     through any spawn edge.
-//! - Finished (a subagent's; never a teammate's, whose rests and lead's
-//!   registry row say liveness): its meta.json `finished` (`agents.finished`,
-//!   sticky), its task notification, or its dispatch answered
-//!   (`agents.dispatch_result`; a background dispatch's `async_launched`
-//!   launch result is no answer, and marks it background).
+//! - Finished (a subagent's or teammate's, [`FINISHED_SQL`]): its meta.json
+//!   `finished` (`agents.finished`, sticky), its task notification, or its
+//!   dispatch answered (`agents.dispatch_result`; a background dispatch's
+//!   `async_launched` launch result is no answer, and marks it
+//!   background); else its lead's process gone (#115): no live registry
+//!   row of its `/clear` chain started by its last record, and a poll since
+//!   that record. A process ends once, so this is terminal too: a later
+//!   process of the chain (a resume) started after the record, and an idle
+//!   notice never counts, because an idle teammate can be woken.
 //! - Effective charge (view `agent_charges`): its own, else its nearest
 //!   spawn ancestor's own, else Unlinked.
 //!
@@ -115,13 +119,16 @@ pub struct ModelAgent {
     pub parent: Option<i64>,
     /// dispatch | teammate | launch | message.
     pub parent_via: Option<String>,
-    /// A subagent's finished signal: its meta.json says so, its task
-    /// notification arrived, or its dispatch was answered (a background
-    /// dispatch's `async_launched` result is no answer). Never set for a
-    /// teammate (no dispatch, meta `finished` or notification) or an
-    /// orchestrator. `false` is not running: a worker whose lead exited
-    /// never finishes. Liveness comes from the lead's registry row and a
-    /// teammate's rests (as `views.rs` `session_agents` does).
+    /// A subagent or teammate has finished ([`FINISHED_SQL`]): its
+    /// meta.json says so, its task notification arrived, or its dispatch
+    /// was answered (a background dispatch's `async_launched` result is no
+    /// answer); else the process that ran it is gone: no live registry row
+    /// of its `/clear` chain started by its last record, and a poll since
+    /// then (#115). Never while such a row is live, never on an idle notice
+    /// alone, never for an orchestrator. `false` is not running: a worker
+    /// with no record, or none since the registry's newest change, waits
+    /// for the next poll, and a resting teammate (`views.rs`
+    /// `session_agents`) is idle.
     pub finished: bool,
     /// A worker dispatched in the background: its dispatch's tool_result
     /// is `async_launched`.
@@ -138,15 +145,36 @@ const REGISTRY_NAME: &str = "(SELECT r.name FROM registry AS r
         AND ifnull(rs.process_root, rs.session_id) = ifnull(s.process_root, s.session_id)
     ORDER BY r.gone, r.last_seen_ms DESC, r.id DESC LIMIT 1)";
 
+/// Whether worker `a` (an `agents` row so aliased) has finished, the one
+/// rule [`agent_model`] and `views.rs` `session_agents` read (see
+/// [`ModelAgent::finished`]). The signals first; only a worker none of them
+/// finished reads its last record (`w.last`, unix ms) for the registry
+/// check: no live row of its `/clear` chain's process started by then, and
+/// a poll at or after it (the newest row change) listed every running
+/// process. No record, or no such poll yet, is not finished.
+pub(super) const FINISHED_SQL: &str = "(a.agent_id IS NOT NULL AND CASE
+    WHEN a.finished IS 1 OR a.dispatch_result IS 'answered'
+        OR EXISTS (SELECT 1 FROM events AS n
+            WHERE n.session_id = a.session_id AND n.notification_task = a.agent_id) THEN 1
+    ELSE ifnull((SELECT w.last <= (SELECT max(p.last_seen_ms) FROM registry AS p)
+            AND NOT EXISTS (SELECT 1 FROM registry AS r
+                JOIN sessions AS rs ON rs.session_id = r.session_id
+                JOIN sessions AS s ON s.session_id = a.session_id
+                WHERE r.gone = 0 AND r.started_at_ms <= w.last
+                    AND ifnull(rs.process_root, rs.session_id)
+                        = ifnull(s.process_root, s.session_id))
+        FROM (SELECT CAST(round(max(unixepoch(e.timestamp, 'subsec')) * 1000) AS INTEGER) AS last
+            FROM events AS e
+            WHERE e.session_id = a.session_id AND e.agent_id = a.agent_id) AS w), 0)
+    END)";
+
 /// Every agent of the model, by session, orchestrator first.
 pub fn agent_model(conn: &Connection) -> Result<Vec<ModelAgent>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT a.id, a.session_id, a.agent_id, a.kind, l.lane, a.role,
              coalesce(a.name, CASE WHEN a.agent_id IS NULL THEN {REGISTRY_NAME} END),
              c.kind, c.repo, c.number, c.topic, x.source, p.parent, p.kind,
-             a.agent_id IS NOT NULL AND (a.finished IS 1 OR a.dispatch_result IS 'answered'
-                 OR EXISTS (SELECT 1 FROM events AS n
-                     WHERE n.session_id = a.session_id AND n.notification_task = a.agent_id)),
+             {FINISHED_SQL},
              a.dispatch_result IS 'async_launched'
          FROM agents AS a
          JOIN agent_lanes AS l ON l.agent = a.id

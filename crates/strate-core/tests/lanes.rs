@@ -10,10 +10,11 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 use strate_core::discovery::{AgentRef, Graph, Link, SubagentMeta, SubagentNode, discover};
-use strate_core::registry::{Kind, RegistryEntry, RegistryEvent};
+use strate_core::registry::{Kind, RegistryEntry, RegistryEvent, Status};
 use strate_core::store::Store;
 use strate_core::store::views::{self, Lane, ModelAgent};
 use strate_core::tail::{Batch, TailEvent};
+use strate_core::time::parse_timestamp;
 
 mod common;
 
@@ -311,6 +312,239 @@ fn the_live_graph_draws_no_worker_whose_meta_says_finished() {
         .expect("a graph");
     let drawn: Vec<Option<&str>> = graph.agents.iter().map(|a| a.agent_id.as_deref()).collect();
     assert_eq!(drawn, [None, Some("w2")]);
+}
+
+// ---- a worker whose lead exited (#115) -----------------------------------------------
+
+/// `time` in unix ms.
+fn ms(time: &str) -> i64 {
+    parse_timestamp(&at(time)).expect("a timestamp")
+}
+
+/// The process (pid `pid`, started at `started`) of interactive session
+/// `session`, as `claude agents` lists it.
+fn process(session: &str, pid: u32, started: &str) -> RegistryEntry {
+    RegistryEntry {
+        cwd: "/work/x".into(),
+        kind: Kind::Interactive,
+        started_at: ms(started),
+        pid: Some(pid),
+        id: None,
+        session_id: Some(session.into()),
+        name: None,
+        status: Some(Status::Busy),
+        waiting_for: None,
+        state: None,
+    }
+}
+
+/// A poll at `time` that first listed `entry`.
+fn appeared(entry: &RegistryEntry, time: &str) -> RegistryEvent {
+    RegistryEvent::Appeared {
+        entry: entry.clone(),
+        at_ms: ms(time),
+    }
+}
+
+/// A poll that no longer listed `entry`, last listed at `time`.
+fn gone(entry: &RegistryEntry, time: &str) -> RegistryEvent {
+    RegistryEvent::Gone {
+        entry: entry.clone(),
+        last_seen_ms: ms(time),
+    }
+}
+
+/// Teammate `agent` of `session`, named `name`, of team-lorem.
+fn teammate(h: &Home, session: &str, agent: &str, name: &str) -> SubagentNode {
+    SubagentNode {
+        session_id: session.into(),
+        agent_id: agent.into(),
+        path: h.transcript(session, Some(agent)),
+        meta: Some(SubagentMeta {
+            name: Some(name.into()),
+            team_name: Some("team-lorem".into()),
+            ..SubagentMeta::default()
+        }),
+        link: Link::Teammate {
+            team_name: "team-lorem".into(),
+            team_dir: None,
+        },
+    }
+}
+
+/// Teammate `name`'s idle notice in its lead's transcript, stamped `time`.
+fn idle(time: &str, name: &str) -> Value {
+    let body = json!({"type": "idle_notification", "from": name, "timestamp": at(time),
+        "idleReason": "available"});
+    json!({"type": "user", "timestamp": at(time), "message": {"role": "user", "content":
+        format!("<teammate-message teammate_id=\"{name}\" color=\"blue\">\n{body}\n</teammate-message>")}})
+}
+
+impl Home {
+    fn registry(&mut self, events: &[RegistryEvent]) {
+        self.store.apply_registry(events).expect("registry");
+    }
+
+    fn finished(&self, session: &str, agent: &str) -> bool {
+        self.agent(session, Some(agent)).finished
+    }
+}
+
+#[test]
+fn a_teammate_finishes_once_its_leads_process_is_gone_never_on_an_idle_notice() {
+    let mut h = Home::new("lanes-teammate-ended");
+    let lead = process("s1", 4101, "09:59:00");
+    h.registry(&[appeared(&lead, "10:00:00")]);
+    h.feed("s1", None, &[prompt("10:00:00")]);
+    let mate = teammate(&h, "s1", "t1", "lorem-mate");
+    h.graph(vec![mate]);
+    h.feed("s1", Some("t1"), &[prompt("10:01:00")]);
+    assert!(!h.finished("s1", "t1"), "its lead runs");
+
+    // It rests: an idle teammate can be woken, so it has not finished.
+    h.feed(
+        "s1",
+        None,
+        &[idle("10:02:00", "lorem-mate"), prompt("10:03:00")],
+    );
+    h.registry(&[RegistryEvent::Changed {
+        entry: lead.clone(),
+        at_ms: ms("10:04:00"),
+    }]);
+    assert!(!h.finished("s1", "t1"), "an idle notice alone");
+
+    h.registry(&[gone(&lead, "10:05:00")]);
+    assert!(h.finished("s1", "t1"), "its lead's registry row is gone");
+}
+
+#[test]
+fn a_worker_finishes_once_its_leads_process_is_gone() {
+    let mut h = Home::new("lanes-worker-ended");
+    let lead = process("s1", 4102, "09:59:00");
+    h.registry(&[appeared(&lead, "10:00:00")]);
+    h.feed(
+        "s1",
+        None,
+        &[prompt("10:00:00"), async_launched("10:00:30", "w1")],
+    );
+    let nodes = ["w1", "w2"]
+        .map(|w| h.dispatched("s1", w, orchestrator("s1"), None))
+        .to_vec();
+    h.graph(nodes);
+    h.feed("s1", Some("w1"), &[prompt("10:01:00")]);
+    h.feed("s1", Some("w2"), &[prompt("10:01:10")]);
+    h.registry(&[RegistryEvent::Changed {
+        entry: lead.clone(),
+        at_ms: ms("10:02:00"),
+    }]);
+    let state = |h: &Home, w: &str| {
+        let a = h.agent("s1", Some(w));
+        (a.finished, a.background)
+    };
+    assert_eq!(state(&h, "w1"), (false, true), "a live lead's");
+    assert_eq!(state(&h, "w2"), (false, false), "a live lead's");
+
+    h.registry(&[gone(&lead, "10:02:00")]);
+    assert_eq!(state(&h, "w1"), (true, true), "a background worker");
+    assert_eq!(state(&h, "w2"), (true, false), "nor runs a foreground one");
+    assert!(!h.agent("s1", None).finished, "an orchestrator never is");
+}
+
+#[test]
+fn a_worker_of_a_session_never_listed_finishes_once_a_later_poll_omits_it() {
+    let mut h = Home::new("lanes-worker-unlisted");
+    h.feed("s1", None, &[prompt("10:00:00")]);
+    let mate = teammate(&h, "s1", "t1", "lorem-mate");
+    h.graph(vec![mate]);
+    h.feed("s1", Some("t1"), &[prompt("10:01:00")]);
+    let other = process("s9", 4109, "09:00:00");
+    h.registry(&[appeared(&other, "10:00:30")]);
+    assert!(
+        !h.finished("s1", "t1"),
+        "no poll since its last record: maybe not listed yet"
+    );
+    h.registry(&[RegistryEvent::Changed {
+        entry: other,
+        at_ms: ms("10:01:00"),
+    }]);
+    assert!(
+        h.finished("s1", "t1"),
+        "a poll at its last record omitted s1"
+    );
+
+    // No record: nothing says when it last ran.
+    h.graph(vec![teammate(&h, "s1", "t2", "ipsum-mate")]);
+    assert!(!h.finished("s1", "t2"));
+}
+
+#[test]
+fn a_new_process_of_the_lead_neither_revives_a_finished_worker_nor_finishes_its_own() {
+    let mut h = Home::new("lanes-worker-resumed");
+    let first = process("s1", 4103, "09:59:00");
+    h.registry(&[appeared(&first, "10:00:00")]);
+    h.feed("s1", None, &[prompt("10:00:00")]);
+    h.graph(vec![
+        teammate(&h, "s1", "t1", "lorem-mate"),
+        teammate(&h, "s1", "t2", "ipsum-mate"),
+    ]);
+    h.feed("s1", Some("t1"), &[prompt("10:01:00")]);
+    h.registry(&[gone(&first, "10:02:00")]);
+    assert!(h.finished("s1", "t1"));
+
+    // The session resumed in a new process, which spawned t2.
+    let second = process("s1", 4104, "10:30:00");
+    h.registry(&[appeared(&second, "10:30:01")]);
+    h.feed("s1", Some("t2"), &[prompt("10:31:00")]);
+    h.registry(&[RegistryEvent::Changed {
+        entry: second,
+        at_ms: ms("10:32:00"),
+    }]);
+    assert!(h.finished("s1", "t1"), "finished stays finished");
+    assert!(!h.finished("s1", "t2"), "the live process runs it");
+}
+
+#[test]
+fn the_live_graph_draws_no_worker_of_its_leads_earlier_process() {
+    let mut h = Home::new("lanes-live-resumed");
+    let first = process("s1", 4106, "09:59:00");
+    h.registry(&[appeared(&first, "10:00:00")]);
+    h.feed("s1", None, &[prompt("10:00:00")]);
+    h.graph(vec![
+        teammate(&h, "s1", "t1", "lorem-mate"),
+        teammate(&h, "s1", "t2", "ipsum-mate"),
+    ]);
+    h.feed("s1", Some("t1"), &[prompt("10:01:00")]);
+    h.registry(&[gone(&first, "10:02:00")]);
+    let second = process("s1", 4107, "10:30:00");
+    h.registry(&[appeared(&second, "10:30:01")]);
+    h.feed("s1", None, &[prompt("10:30:30")]);
+    h.feed("s1", Some("t2"), &[prompt("10:31:00")]);
+    let reader = Store::open_reader(h.t.db()).expect("reader");
+    let graph = views::live_graph(&reader, h.id("s1", None))
+        .expect("query")
+        .expect("a graph");
+    assert!(graph.live);
+    let drawn: Vec<Option<&str>> = graph.agents.iter().map(|a| a.agent_id.as_deref()).collect();
+    assert_eq!(drawn, [None, Some("t2")], "t1 ended with the first process");
+}
+
+#[test]
+fn a_worker_of_a_clear_chain_runs_while_any_link_is_listed() {
+    // s1 /cleared into s2: one process, whose registry row names s1.
+    let mut h = Home::new("lanes-worker-chain");
+    let lead = process("s1", 4105, "09:59:00");
+    h.registry(&[appeared(&lead, "10:00:00")]);
+    h.feed("s1", None, &[prompt("10:00:00")]);
+    h.feed("s2", None, &[linked("s1", "10:20:00")]);
+    h.graph(vec![h.dispatched("s2", "w1", orchestrator("s2"), None)]);
+    h.feed("s2", Some("w1"), &[prompt("10:21:00")]);
+    h.registry(&[RegistryEvent::Changed {
+        entry: lead.clone(),
+        at_ms: ms("10:22:00"),
+    }]);
+    assert!(!h.finished("s2", "w1"), "its chain's process is listed");
+    h.registry(&[gone(&lead, "10:22:00")]);
+    assert!(h.finished("s2", "w1"));
 }
 
 // ---- a worker's edge before discovery ----------------------------------------------
@@ -770,14 +1004,22 @@ const L1: &str = "5e55f2f2-0000-4000-8000-0000000000e1";
 const L2: &str = "5e55f2f2-0000-4000-8000-0000000000e2";
 const L3: &str = "5e55f2f2-0000-4000-8000-0000000000e3";
 const L4: &str = "5e55f2f2-0000-4000-8000-0000000000e4";
+const L5: &str = "5e55f2f2-0000-4000-8000-0000000000e5";
 
 fn home() -> PathBuf {
     fixture_home("lanes-home")
 }
 
-/// The registry row the generator describes: L3, started by L2's launch.
+/// The registry rows the generator describes: L3, started by L2's launch;
+/// L1's process, live; L5's, gone after 10:53.
 fn registry() -> Vec<RegistryEvent> {
-    vec![background("c0ffee01", L3, Some("lorem-unit"))]
+    let l5 = process(L5, 4205, "10:49:00");
+    vec![
+        background("c0ffee01", L3, Some("lorem-unit")),
+        appeared(&process(L1, 4201, "09:59:00"), "10:00:00"),
+        appeared(&l5, "10:50:00"),
+        gone(&l5, "10:53:00"),
+    ]
 }
 
 fn cold(t: &Temp) -> Vec<ModelAgent> {
@@ -870,6 +1112,31 @@ fn lanes_home_reads_as_its_generator_describes() {
         worker("a9100000000000004", true, true),
         "its task notification"
     );
+    let l5 = Some(key(L5, None));
+    assert_eq!(
+        row(L5, Some("a9100000000000005")),
+        (
+            key(L5, Some("a9100000000000005")),
+            Lane::Subagent,
+            l5.clone(),
+            dispatch.clone(),
+            true,
+            true
+        ),
+        "a background worker whose lead exited"
+    );
+    assert_eq!(
+        row(L5, Some("a9100000000000006")),
+        (
+            key(L5, Some("a9100000000000006")),
+            Lane::Subagent,
+            l5,
+            Some("teammate".into()),
+            true,
+            false
+        ),
+        "a teammate whose lead exited"
+    );
     assert_eq!(
         row(L3, None),
         (
@@ -882,7 +1149,7 @@ fn lanes_home_reads_as_its_generator_describes() {
         ),
         "the launch beats L4's message"
     );
-    for s in [L1, L2, L4] {
+    for s in [L1, L2, L4, L5] {
         assert_eq!(row(s, None).2, None, "{s}");
     }
 }

@@ -853,19 +853,25 @@ JSON
 # b3 still runs (no `finished`), and b4's task notification arrives. L2 runs
 # `claude --bg -n lorem-unit`, whose result prints short id c0ffee01: the
 # test's background registry row naming L3. L4 messages L3 first, but L3
-# hangs under L2 by the launch.
+# hangs under L2 by the launch. L5 (#115) leads team-lanes: teammate
+# lanes-mate (t1) works from 10:52, and b5 runs in the background from 10:51
+# (no notification, no meta `finished`). The test's registry lists L1's
+# process (so b3 runs) and L5's, which exits after 10:53: t1 and b5 finished.
 H=fixtures/lanes-home
 L1=5e55f2f2-0000-4000-8000-0000000000e1
 L2=5e55f2f2-0000-4000-8000-0000000000e2
 L3=5e55f2f2-0000-4000-8000-0000000000e3
 L4=5e55f2f2-0000-4000-8000-0000000000e4
+L5=5e55f2f2-0000-4000-8000-0000000000e5
 LB1=a9100000000000001
 LB2=a9100000000000002
 LB3=a9100000000000003
 LB4=a9100000000000004
+LB5=a9100000000000005
+LT1=a9100000000000006
 LD="$H/projects/-work-lanes"
 rm -rf "$H"
-mkdir -p "$LD/$L1/subagents"
+mkdir -p "$LD/$L1/subagents" "$LD/$L5/subagents"
 lm() { echo "5e55ff22-0000-4000-8000-00000000000$1"; }
 LT=2026-10-20T10
 aat $L1 /work/lanes "\"isSidechain\":false,\"session_id\":\"$L1\""
@@ -896,3 +902,13 @@ aat $L3 /work/lanes "\"isSidechain\":false,\"session_id\":\"$L3\""
   areply $LT:40:40 l3-03 req_l3-03 $OPUS "$UO" "$TEXT"; } > "$LD/$L3.jsonl"
 aat $L4 /work/lanes "\"isSidechain\":false,\"session_id\":\"$L4\""
 { aprompt $LT:39:00 l4-01; dsend $LT:40 l4-02 lorem-unit "$(lm 1)"; } > "$LD/$L4.jsonl"
+aat $L5 /work/lanes "\"isSidechain\":false,\"session_id\":\"$L5\""
+{ aprompt $LT:50:00 l5-01
+  gdispatch $LT:51:00 l5-02 req_l5-02 toolu_l5b; alaunch $LT:51:01 l5-03 toolu_l5b $LB5
+} > "$LD/$L5.jsonl"
+aat $L5 /work/lanes "\"isSidechain\":true,\"agentId\":\"$LB5\""
+{ atask $LT:51:10 "$LB5-01"; areply $LT:51:20 "$LB5-02" "req_$LB5-02" $SONNET "$US" "$TEXT"; } > "$LD/$L5/subagents/agent-$LB5.jsonl"
+mmeta implementer "Lorem task" "\"toolUseId\":\"toolu_l5b\"" > "$LD/$L5/subagents/agent-$LB5.meta.json"
+aat $L5 /work/lanes "\"isSidechain\":true,\"agentId\":\"$LT1\""
+{ atask $LT:52:10 "$LT1-01"; areply $LT:52:20 "$LT1-02" "req_$LT1-02" $SONNET "$US" "$TEXT"; } > "$LD/$L5/subagents/agent-$LT1.jsonl"
+echo "{\"agentType\":\"lanes-mate\",\"description\":\"Lorem task\",\"name\":\"lanes-mate\",\"spawnDepth\":0,\"requestShape\":\"teammate\",\"requestNonInteractive\":false,\"model\":\"$SONNET\",\"teamName\":\"team-lanes\",\"color\":\"blue\",\"taskKind\":\"in_process_teammate\"}" > "$LD/$L5/subagents/agent-$LT1.meta.json"
