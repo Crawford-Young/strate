@@ -236,20 +236,6 @@ fn open_creates_every_table_with_the_required_columns() {
         ("charges", &["key", "kind", "repo", "number", "topic"]),
         ("offsets", &["path", "byte_offset", "volume", "file_index"]),
         (
-            "intents",
-            &[
-                "parent_agent",
-                "cwd",
-                "model",
-                "effort",
-                "cost_cap_usd",
-                "time_cap_ms",
-                "status",
-                "created_at",
-                "correlated_agent",
-            ],
-        ),
-        (
             "github_links",
             &["session_id", "pr_number", "pr_url", "pr_repository"],
         ),
@@ -296,44 +282,20 @@ fn reopening_an_existing_store_keeps_its_rows_and_version() {
 }
 
 #[test]
-fn intents_take_defaults_and_reference_agents() {
+fn a_fresh_store_has_no_v1_intents_table() {
+    // Strate v2 only reads (#105): nothing launches or dispatches, so the
+    // v1 launch/dispatch intents table is gone (#122).
     let tmp = Temp::new("intents");
-    let path = session_path(tmp.path(), "s1");
-    let mut store = Store::open(tmp.db()).expect("open");
-    store
-        .ingest(&batch(
-            &path,
-            vec![record(&path, 0, json!({"type": "user"}))],
-            5,
-        ))
-        .expect("ingest");
-    drop(store);
-
-    let conn = Connection::open(tmp.db()).expect("writer");
-    conn.pragma_update(None, "foreign_keys", true)
-        .expect("fk on");
-    conn.execute(
-        "INSERT INTO intents (parent_agent, cwd, model, effort, cost_cap_usd, time_cap_ms)
-         SELECT id, '/work/x', 'claude-opus-5-5', 'high', 5.0, 600000 FROM agents
-         WHERE session_id = 's1' AND agent_id IS NULL",
-        [],
-    )
-    .expect("insert intent");
-    let (status, created, correlated): (String, String, Option<i64>) = conn
+    drop(Store::open(tmp.db()).expect("open"));
+    let conn = reader(&tmp.db());
+    let named: i64 = conn
         .query_row(
-            "SELECT status, created_at, correlated_agent FROM intents",
+            "SELECT count(*) FROM sqlite_schema WHERE name LIKE 'intent%'",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| r.get(0),
         )
-        .expect("intent");
-    assert_eq!(status, "pending");
-    assert!(created.starts_with("20"), "{created}");
-    assert_eq!(correlated, None);
-    assert!(
-        conn.execute("INSERT INTO intents (parent_agent) VALUES (9999)", [])
-            .is_err(),
-        "an intent's parent must be a stored agent"
-    );
+        .expect("schema");
+    assert_eq!(named, 0, "no intents table, index, trigger or view");
 }
 
 // ---- WAL and concurrency ------------------------------------------------

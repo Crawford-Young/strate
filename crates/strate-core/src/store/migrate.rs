@@ -26,6 +26,7 @@ pub(super) const MIGRATIONS: &[&str] = &[
     include_str!("0021_agent_model.sql"),
     include_str!("0022_drop_workstreams.sql"),
     include_str!("0023_every_lane.sql"),
+    include_str!("0024_drop_intents.sql"),
 ];
 
 /// Applies every migration past the db's `user_version`, each in its own
@@ -138,6 +139,33 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .expect("parents");
         assert_eq!(parents, [(3, Some(2)), (4, Some(1)), (5, Some(1))]);
+    }
+
+    #[test]
+    fn v24_drops_the_v1_intents_and_keeps_the_agents_they_named() {
+        let mut conn = Connection::open_in_memory().expect("db");
+        migrate(&mut conn, &MIGRATIONS[..23]).expect("v23");
+        conn.execute_batch(
+            "INSERT INTO sessions (session_id) VALUES ('s1');
+             INSERT INTO agents (id, session_id, agent_id, kind) VALUES
+                 (1, 's1', NULL, 'orchestrator'), (2, 's1', 'w1', 'subagent');
+             INSERT INTO intents (parent_agent, correlated_agent) VALUES (1, 2);",
+        )
+        .expect("v23 rows");
+        migrate(&mut conn, MIGRATIONS).expect("v24");
+        let intents: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name = 'intents'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("schema");
+        assert_eq!(intents, 0, "the intents table is gone");
+        let agents: i64 = conn
+            .query_row("SELECT count(*) FROM agents", [], |r| r.get(0))
+            .expect("agents");
+        assert_eq!(agents, 2, "the agents an intent named are kept");
+        assert_eq!(version(&conn), 24);
     }
 
     #[test]
