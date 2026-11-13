@@ -803,6 +803,164 @@ describe('console', () => {
     expect(transcriptMock.mock.lastCall?.[0]).toBe(15)
   })
 
+  describe('link picker (#133)', () => {
+    const chain = (links: number[]): LiveGraph => {
+      const latest = links[links.length - 1] as number
+      return {
+        ...shellGraph,
+        agents: [
+          agent({
+            id: latest,
+            agentId: null,
+            kind: 'orchestrator',
+            name: 'strate-17',
+            lane: 'interactive',
+            links,
+          }),
+          ...shellGraph.agents.filter((a) => a.id !== 10),
+        ],
+        edges: [{ kind: 'dispatch', parent: latest, child: 11 }],
+      }
+    }
+    const savedCapture = Element.prototype.hasPointerCapture
+    const savedScroll = Element.prototype.scrollIntoView
+    afterEach(() => {
+      Element.prototype.hasPointerCapture = savedCapture
+      Element.prototype.scrollIntoView = savedScroll
+    })
+    beforeEach(() => {
+      // The first page (null cursor) holds the one entry; nothing follows.
+      transcriptMock.mockImplementation((id, cursor) =>
+        Promise.resolve(pageOf(cursor === null ? [said(`transcript of ${id}`)] : [], 1)),
+      )
+      // Radix Select reads these; happy-dom has neither.
+      Element.prototype.hasPointerCapture = () => false
+      Element.prototype.scrollIntoView = () => {}
+    })
+    const picker = () => within(consolePanel()).getByRole('combobox', { name: 'Chain link' })
+    const choose = async (name: string) => {
+      const trigger = picker()
+      trigger.focus()
+      fireEvent.keyDown(trigger, { key: 'Enter' })
+      fireEvent.click(await screen.findByRole('option', { name }))
+    }
+    const openChain = async (links: number[]) => {
+      liveGraphMock.mockImplementation((id) =>
+        Promise.resolve(id === 3 ? unnamedGraph : chain(links)),
+      )
+      render(<App />)
+      fireEvent.click(await screen.findByRole('button', { name: /strate-17/ }))
+      await within(consolePanel()).findByText(`transcript of ${links[links.length - 1]}`)
+    }
+
+    it('shows the latest link as N/N for a chain of several, and none for one link', async () => {
+      await openChain([10, 15])
+      expect(picker()).toHaveTextContent('2/2')
+      cleanup()
+      liveGraphMock.mockResolvedValue(chain([10]))
+      render(<App />)
+      fireEvent.click(await screen.findByRole('button', { name: /strate-17/ }))
+      await within(consolePanel()).findByText('transcript of 10')
+      expect(within(consolePanel()).queryByRole('combobox')).not.toBeInTheDocument()
+    })
+
+    it('shows no picker for a non-orchestrator', async () => {
+      liveGraphMock.mockResolvedValue(chain([10, 15]))
+      render(<App />)
+      fireEvent.click(await screen.findByRole('button', { name: /implementer/ }))
+      await within(consolePanel()).findByText('transcript of 11')
+      expect(within(consolePanel()).queryByRole('combobox')).not.toBeInTheDocument()
+    })
+
+    it('swaps the transcript to a picked earlier link and back, keeping the chain heading', async () => {
+      await openChain([10, 15])
+      await choose('1/2')
+      const panel = consolePanel()
+      expect(await within(panel).findByText('transcript of 10')).toBeInTheDocument()
+      expect(within(panel).queryByText('transcript of 15')).not.toBeInTheDocument()
+      expect(transcriptMock).toHaveBeenLastCalledWith(10, null)
+      expect(picker()).toHaveTextContent('1/2')
+      expect(within(panel).getByRole('heading', { name: 'strate-17' })).toBeInTheDocument()
+      await choose('2/2 latest')
+      expect(await within(panel).findByText('transcript of 15')).toBeInTheDocument()
+      expect(within(panel).queryByText('transcript of 10')).not.toBeInTheDocument()
+      expect(picker()).toHaveTextContent('2/2')
+    })
+
+    it('follows a /clear when the latest was chosen', async () => {
+      await openChain([10, 15])
+      liveGraphMock.mockResolvedValue(chain([10, 15, 20]))
+      act(() => storeChanged())
+      expect(await within(consolePanel()).findByText('transcript of 20')).toBeInTheDocument()
+      expect(picker()).toHaveTextContent('3/3')
+    })
+
+    it('stays on a chosen earlier link when a /clear adds one, and N grows', async () => {
+      await openChain([10, 15])
+      await choose('1/2')
+      await within(consolePanel()).findByText('transcript of 10')
+      liveGraphMock.mockResolvedValue(chain([10, 15, 20]))
+      act(() => storeChanged())
+      await waitFor(() => expect(picker()).toHaveTextContent('1/3'))
+      expect(within(consolePanel()).getByText('transcript of 10')).toBeInTheDocument()
+    })
+
+    it('goes back to the latest on picking another node, and on close and reopen', async () => {
+      await openChain([10, 15])
+      await choose('1/2')
+      await within(consolePanel()).findByText('transcript of 10')
+      fireEvent.click(screen.getByRole('button', { name: /implementer/ }))
+      await within(consolePanel()).findByText('transcript of 11')
+      fireEvent.click(screen.getByRole('button', { name: /strate-17/ }))
+      expect(await within(consolePanel()).findByText('transcript of 15')).toBeInTheDocument()
+      expect(picker()).toHaveTextContent('2/2')
+      await choose('1/2')
+      await within(consolePanel()).findByText('transcript of 10')
+      fireEvent.click(screen.getByRole('button', { name: 'Close console' }))
+      fireEvent.click(screen.getByRole('button', { name: /strate-17/ }))
+      expect(await within(consolePanel()).findByText('transcript of 15')).toBeInTheDocument()
+    })
+
+    it('re-picking the latest means latest: a later /clear is followed', async () => {
+      await openChain([10, 15])
+      await choose('1/2')
+      await within(consolePanel()).findByText('transcript of 10')
+      await choose('2/2 latest')
+      await within(consolePanel()).findByText('transcript of 15')
+      liveGraphMock.mockResolvedValue(chain([10, 15, 20]))
+      act(() => storeChanged())
+      expect(await within(consolePanel()).findByText('transcript of 20')).toBeInTheDocument()
+      expect(picker()).toHaveTextContent('3/3')
+    })
+
+    it('reads a chosen link the chain no longer lists as the latest', async () => {
+      await openChain([10, 15])
+      await choose('1/2')
+      await within(consolePanel()).findByText('transcript of 10')
+      liveGraphMock.mockResolvedValue(chain([15, 20]))
+      act(() => storeChanged())
+      expect(await within(consolePanel()).findByText('transcript of 20')).toBeInTheDocument()
+      expect(picker()).toHaveTextContent('2/2')
+    })
+
+    it('resets to the latest when the chain leaves the canvas, and stays reset when redrawn', async () => {
+      await openChain([10, 15])
+      await choose('1/2')
+      await within(consolePanel()).findByText('transcript of 10')
+      liveGraphMock.mockResolvedValue({
+        ...shellGraph,
+        agents: shellGraph.agents.filter((a) => a.id !== 10),
+        edges: [],
+      })
+      act(() => storeChanged())
+      expect(await within(consolePanel()).findByText('transcript of 15')).toBeInTheDocument()
+      liveGraphMock.mockResolvedValue(chain([10, 15]))
+      act(() => storeChanged())
+      await waitFor(() => expect(picker()).toHaveTextContent('2/2'))
+      expect(within(consolePanel()).getByText('transcript of 15')).toBeInTheDocument()
+    })
+  })
+
   it("shows the selected agent's charge key and source as visible text in the heading area", async () => {
     const charged = (a: GraphAgent): GraphAgent =>
       a.id === 11 ? { ...a, chargeKey: 'issue_strate-109', chargeSource: 'branch' } : a
