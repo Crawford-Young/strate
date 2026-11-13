@@ -1,9 +1,10 @@
 {
   "$comment": "First-party API $/MTok for audit.mjs. Re-verify against the source when a model ships or audit.mjs warns of an unpriced model. The cost-state total runs ~10% under by scope (#116), so it is no price check; the per-model check on cost-state's own tokens is (#141). A model's \"longPrompt\" is the tier whose prices replace the base ones for a request with more than \"over\" prompt tokens (input + cache write + cache read). A model's \"exception\" is a price Claude Code charges that differs from the published one: dated, named for the fix it waits on, and reported as an exception, not drift.",
-  "verified": "2026-10-14",
+  "verified": "2026-11-13",
   "source": "https://platform.claude.com/docs/en/about-claude/pricing",
   "webSearchPer1k": 10,
   "models": {
+    "claude-fable-5-2": { "input": 8, "output": 40, "cacheWrite5m": 10, "cacheWrite1h": 16, "cacheRead": 0.2 },
     "claude-fable-5-1": { "input": 10, "output": 50, "cacheWrite5m": 12.5, "cacheWrite1h": 20, "cacheRead": 0.25 },
     "claude-opus-5-5": { "input": 4, "output": 20, "cacheWrite5m": 5, "cacheWrite1h": 8, "cacheRead": 0.2 },
     "claude-opus-5": { "input": 5, "output": 25, "cacheWrite5m": 6.25, "cacheWrite1h": 10, "cacheRead": 0.5 },
