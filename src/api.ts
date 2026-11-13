@@ -92,6 +92,11 @@ export interface GraphAgent {
   /** The charge's join key, e.g. `issue_strate-109`; null when Unlinked. */
   chargeKey: string | null
   chargeSource: ChargeSource
+  /**
+   * On a drawn chain's orchestrator, every link's orchestrator of its `/clear` chain, itself
+   * included, in start order: an earlier link's id names this node. Empty on a worker.
+   */
+  links: number[]
 }
 
 /**

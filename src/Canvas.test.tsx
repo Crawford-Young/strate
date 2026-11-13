@@ -58,6 +58,7 @@ function agent(over: Partial<GraphAgent> & Pick<GraphAgent, 'id'>): GraphAgent {
     charge: null,
     chargeKey: null,
     chargeSource: 'unlinked',
+    links: [],
     ...over,
   }
 }

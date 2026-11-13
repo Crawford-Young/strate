@@ -36,6 +36,7 @@ function agent(id: number, parent: number | null = null): GraphAgent {
     charge: null,
     chargeKey: null,
     chargeSource: 'unlinked',
+    links: [],
   }
 }
 

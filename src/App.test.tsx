@@ -104,6 +104,7 @@ function agent(over: Partial<GraphAgent> & Pick<GraphAgent, 'id'>): GraphAgent {
     charge: null,
     chargeKey: null,
     chargeSource: 'unlinked',
+    links: [],
     ...over,
   }
 }
@@ -121,6 +122,7 @@ const shellGraph: LiveGraph = {
       kind: 'orchestrator',
       name: 'strate-17',
       lane: 'interactive',
+      links: [10],
       model: 'claude-opus-5-5',
       costUsd: 0.3,
       contextPct: 41.6,
@@ -748,6 +750,48 @@ describe('console', () => {
     )
     expect(within(consolePanel()).getByRole('heading', { name: 'implementer' })).toBeInTheDocument()
     expect(within(consolePanel()).getByText('first')).toBeInTheDocument()
+  })
+
+  it("follows a /clear to the chain's latest link: its name, charge and transcript (#133)", async () => {
+    transcriptMock.mockImplementation((id) => Promise.resolve([said(`transcript of ${id}`)]))
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /strate-17/ }))
+    await within(consolePanel()).findByText('transcript of 10')
+    // The /clear: the chain now draws its next link, a new orchestrator row, renamed.
+    const next = agent({
+      id: 15,
+      agentId: null,
+      kind: 'orchestrator',
+      name: 'strate-18',
+      lane: 'interactive',
+      links: [10, 15],
+      chargeKey: 'issue_strate-18',
+      chargeSource: 'name',
+    })
+    liveGraphMock.mockResolvedValue({
+      ...shellGraph,
+      agents: [next, ...shellGraph.agents.filter((a) => a.id !== 10)],
+      edges: [{ kind: 'dispatch', parent: 15, child: 11 }],
+    })
+    act(() => storeChanged())
+    const panel = consolePanel()
+    expect(await within(panel).findByRole('heading', { name: 'strate-18' })).toBeInTheDocument()
+    expect(within(panel).getByText('charge issue_strate-18 from name')).toBeInTheDocument()
+    expect(await within(panel).findByText('transcript of 15')).toBeInTheDocument()
+    expect(within(panel).queryByText('transcript of 10')).not.toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: /strate-18/ })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+    // Should the chain then leave the canvas, the console stays on its latest link.
+    liveGraphMock.mockResolvedValue({ ...shellGraph, agents: [] })
+    act(() => storeChanged())
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: /strate-18/ })).not.toBeInTheDocument(),
+    )
+    expect(within(panel).getByRole('heading', { name: 'strate-18' })).toBeInTheDocument()
+    expect(within(panel).getByText('transcript of 15')).toBeInTheDocument()
+    expect(transcriptMock).not.toHaveBeenLastCalledWith(10)
   })
 
   it("shows the selected agent's charge key and source as visible text in the heading area", async () => {

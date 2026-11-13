@@ -70,7 +70,7 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
   const liveSessions = sessions.filter(hasTab)
   const active = liveSessions.find((w) => w.id === selection.tab) ?? liveSessions[0] ?? null
   const activeKey = active && String(active.id)
-  const agentId = selection.agent
+  const picked = selection.agent
 
   const graphLoad = useLoad(activeKey, version, () => liveGraph(Number(activeKey)))
   const currentGraphLoad = graphLoad?.target === activeKey ? graphLoad : null
@@ -78,7 +78,15 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
   const error =
     (overview && 'error' in overview ? overview.error : null) ??
     (currentGraphLoad && 'error' in currentGraphLoad ? currentGraphLoad.error : null)
-  const selectedAgent = graph?.agents.find((a) => a.id === agentId)
+  // A picked orchestrator names its whole `/clear` chain: after a /clear the chain draws its next
+  // link, a new row, and the pick follows it there (#133).
+  const selectedAgent =
+    picked === null
+      ? undefined
+      : graph?.agents.find((a) => a.id === picked || a.links.includes(picked))
+  const agentId = selectedAgent?.id ?? picked
+  // Kept, so the latest link's transcript stays open should the chain leave the canvas too.
+  if (agentId !== picked) setAgent(agentId)
   // A finished agent leaves the canvas but its transcript stays open, so the heading keeps its name.
   const [lastNamed, setLastNamed] = useState<{ id: number; name: string; charge: string } | null>(
     null,

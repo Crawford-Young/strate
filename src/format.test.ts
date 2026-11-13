@@ -24,6 +24,7 @@ function agent(costUsd: number | null): GraphAgent {
     charge: null,
     chargeKey: null,
     chargeSource: 'unlinked',
+    links: [],
   }
 }
 
