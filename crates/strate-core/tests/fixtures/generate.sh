@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ and github/audit-home.json for #26, nest-home/ and github/nest-home.json for #47, perf-home/ and github/perf-home.json for #51, directs-home/ for #53, chain-home/ for #63, teams-home/ for #83, model-home/ and github/model-home.json for #107, lanes-home/ for #108). Field names come from
+# Regenerates the synthetic fixtures (claude-home/ for discovery, workstreams-home/ for #13, cost-home/ for #14, audit-home/ and github/audit-home.json for #26, nest-home/ and github/nest-home.json for #47, perf-home/ and github/perf-home.json for #51, directs-home/ for #53, chain-home/ for #63, teams-home/ for #83, model-home/ and github/model-home.json for #107, lanes-home/ for #108, peers-home/ for #133). Field names come from
 # the "~/.claude format, as observed" comment on strate #10; every value is a placeholder.
 set -eu
 cd "$(dirname "$0")/.."
@@ -912,3 +912,54 @@ mmeta implementer "Lorem task" "\"toolUseId\":\"toolu_l5b\"" > "$LD/$L5/subagent
 aat $L5 /work/lanes "\"isSidechain\":true,\"agentId\":\"$LT1\""
 { atask $LT:52:10 "$LT1-01"; areply $LT:52:20 "$LT1-02" "req_$LT1-02" $SONNET "$US" "$TEXT"; } > "$LD/$L5/subagents/agent-$LT1.jsonl"
 echo "{\"agentType\":\"lanes-mate\",\"description\":\"Lorem task\",\"name\":\"lanes-mate\",\"spawnDepth\":0,\"requestShape\":\"teammate\",\"requestNonInteractive\":false,\"model\":\"$SONNET\",\"teamName\":\"team-lanes\",\"color\":\"blue\",\"taskKind\":\"in_process_teammate\"}" > "$LD/$L5/subagents/agent-$LT1.meta.json"
+
+# ---- peers-home: a renamed chain and a younger messager (#133); hand values in tests/chain_peers.rs ----
+# director_topic_lorem-11-19 is one process (root D1) across three /clear
+# links: D1 from 2026-10-21, D2 and D3 on 10-23. D3 opens on the carried name,
+# then /renames to director_topic_lorem-21-29. Y (unnamed, a session of its
+# own started 10-23 09:00) messages D1 at 09:05: a peer, since D1's chain is
+# older, so no edge. Control: director_topic_amet (root O, 08:00, no
+# messages) /clears into O2 (08:30), which messages W (started 08:15, after
+# O's chain but before O2): a spawn, judged by the messager's chain's first
+# link.
+H=fixtures/peers-home
+D1=5e55f3f3-0000-4000-8000-0000000000a1
+D2=5e55f3f3-0000-4000-8000-0000000000a2
+D3=5e55f3f3-0000-4000-8000-0000000000a3
+Y=5e55f3f3-0000-4000-8000-0000000000b1
+O=5e55f3f3-0000-4000-8000-0000000000c1
+W=5e55f3f3-0000-4000-8000-0000000000c3
+O2=5e55f3f3-0000-4000-8000-0000000000c4
+PHUB="$H/projects/-work-hub"
+PREPO="$H/projects/-work-lorem"
+rm -rf "$H"
+mkdir -p "$PHUB" "$PREPO"
+pm() { echo "5e55ff33-0000-4000-8000-00000000000$1"; }
+proot() { # sessionId cwd root: an orchestrator envelope on process root `root`
+  aat "$1" "$2" "\"isSidechain\":false,\"session_id\":\"$3\""
+}
+PT=2026-10-23T
+proot $D1 /work/hub $D1
+{ dname director_topic_lorem-11-19
+  aprompt 2026-10-21T09:00:00 d1-01; areply 2026-10-21T09:00:10 d1-02 req_d1-02 $OPUS "$UO" "$TEXT"
+  dpeer ${PT}09:05:02 d1-03 "$(pm 1)" code-lorem
+  areply ${PT}09:06:00 d1-04 req_d1-04 $OPUS "$UO" "$TEXT"; } > "$PHUB/$D1.jsonl"
+proot $D2 /work/hub $D1
+{ dname director_topic_lorem-11-19
+  aprompt ${PT}10:00:00 d2-01; areply ${PT}10:00:10 d2-02 req_d2-02 $OPUS "$UO" "$TEXT"; } > "$PHUB/$D2.jsonl"
+proot $D3 /work/hub $D1
+{ dname director_topic_lorem-11-19; aprompt ${PT}11:00:00 d3-01
+  dname director_topic_lorem-21-29
+  areply ${PT}11:00:10 d3-02 req_d3-02 $OPUS "$UO" "$TEXT"; } > "$PHUB/$D3.jsonl"
+proot $Y /work/lorem $Y
+{ aprompt ${PT}09:00:00 y-01
+  dsend ${PT}09:05 y-02 director_topic_lorem-11-19 "$(pm 1)"; } > "$PREPO/$Y.jsonl"
+proot $O /work/hub $O
+{ dname director_topic_amet; aprompt ${PT}08:00:00 o-01
+  areply ${PT}08:00:10 o-02 req_o-02 $OPUS "$UO" "$TEXT"; } > "$PHUB/$O.jsonl"
+proot $W /work/lorem $W
+{ dname lorem-w; aprompt ${PT}08:15:00 w-01
+  dpeer ${PT}08:31:02 w-02 "$(pm 2)" director_topic_amet; } > "$PREPO/$W.jsonl"
+proot $O2 /work/hub $O
+{ dname director_topic_amet; aprompt ${PT}08:30:00 o2-01
+  dsend ${PT}08:31 o2-02 lorem-w "$(pm 2)"; } > "$PHUB/$O2.jsonl"

@@ -33,7 +33,9 @@
 //!     messager: the agent whose record holds the msg_id of a SendMessage
 //!     result that one of the session's records received, by receipt time,
 //!     then msg_id, refusing one whose parent descends from the session
-//!     through any spawn edge.
+//!     through any spawn edge, and one whose parent's `/clear` chain (its
+//!     process root's links) started after the session's chain (#133): a
+//!     younger messager is a peer, never the spawner of what ran before it.
 //! - Finished (a subagent's or teammate's, [`FINISHED_SQL`]): its meta.json
 //!   `finished` (`agents.finished`, sticky), its task notification, or its
 //!   dispatch answered (`agents.dispatch_result`; a background dispatch's
@@ -67,8 +69,8 @@ use crate::discovery::launches;
 /// What the stored model was built by, under meta `model`: a store at
 /// another version (one from before v21 too) is rebuilt on open. Bump it
 /// when resolution changes. v2 (#108) derives the launches and dispatch
-/// results.
-const MODEL_VERSION: &str = "2";
+/// results; v3 (#133) refuses a message edge from a younger chain.
+const MODEL_VERSION: &str = "3";
 
 /// Where an agent runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
@@ -382,7 +384,10 @@ pub(super) fn batch(conn: &Connection, session_id: &str, agent: Option<i64>) -> 
 /// ids, names and lanes.
 pub(super) fn listed(conn: &Connection, session_id: &str) -> Result<()> {
     resolve(conn, chain_orchestrators(conn, session_id)?)?;
-    relaunch(conn, false)
+    if launch_edges(conn)? {
+        messages(conn)?;
+    }
+    Ok(())
 }
 
 /// After a discovery graph: every agent of `sessions`, then the launch and
@@ -404,15 +409,14 @@ pub(super) fn graph<'a>(
     messages(conn)
 }
 
-/// After something a launch edge reads may have changed (a launch or its
-/// result, a background registry row, an orchestrator's name or start):
-/// rebuilds the launch edges, then the message edges when those changed or
-/// `messaged` (the batch stored a cross-session message).
-pub(super) fn relaunch(conn: &Connection, messaged: bool) -> Result<()> {
-    if launch_edges(conn)? || messaged {
-        messages(conn)?;
-    }
-    Ok(())
+/// After a batch moved something a launch edge reads (a launch or its
+/// result, an orchestrator's name, start or process root): rebuilds the
+/// launch edges, then the message edges, which read every chain's start
+/// (#133: an earlier link arriving ages its chain), whatever `_messaged`
+/// (the batch stored a cross-session message) says.
+pub(super) fn relaunch(conn: &Connection, _messaged: bool) -> Result<()> {
+    launch_edges(conn)?;
+    messages(conn)
 }
 
 /// After a GitHub refresh: every agent on a branch that can head a PR.
@@ -597,18 +601,28 @@ fn charge_id(conn: &Connection, c: &Charge) -> Result<i64> {
 
 /// Rebuilds the message edges from the stored events: each session's
 /// orchestrator under its first messager (see the module doc), a
-/// candidate whose parent it is an ancestor of refused for the next.
+/// candidate whose parent it is an ancestor of, or whose parent's `/clear`
+/// chain started after the session's (a peer, #133), refused for the next.
+/// A chain with no known start, or two chains that started together, keeps
+/// the edge: only a strictly younger messager is a peer.
 pub(super) fn messages(conn: &Connection) -> Result<()> {
     let mut up = spawn_up(conn, true)?;
     let candidates: Vec<(i64, i64)> = conn
         .prepare_cached(
-            "SELECT p.id, c.id
+            "WITH chains AS (SELECT ifnull(process_root, session_id) AS root,
+                     min(unixepoch(started_at, 'subsec')) AS start
+                 FROM sessions GROUP BY 1)
+             SELECT p.id, c.id
              FROM events AS r
              JOIN events AS s ON s.sent_msg_id = r.peer_msg_id AND s.session_id <> r.session_id
              JOIN agents AS p ON p.session_id = s.session_id
                  AND ifnull(p.agent_id, '') = ifnull(s.agent_id, '')
              JOIN agents AS c ON c.session_id = r.session_id AND ifnull(c.agent_id, '') = ''
-             WHERE r.peer_msg_id IS NOT NULL
+             JOIN sessions AS ps ON ps.session_id = s.session_id
+             JOIN sessions AS cs ON cs.session_id = r.session_id
+             JOIN chains AS pc ON pc.root = ifnull(ps.process_root, ps.session_id)
+             JOIN chains AS cc ON cc.root = ifnull(cs.process_root, cs.session_id)
+             WHERE r.peer_msg_id IS NOT NULL AND NOT ifnull(pc.start > cc.start, 0)
              ORDER BY r.timestamp IS NULL, r.timestamp, r.peer_msg_id, s.session_id,
                  s.agent_id IS NOT NULL, s.agent_id, r.session_id",
         )?

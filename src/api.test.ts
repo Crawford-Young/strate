@@ -74,6 +74,7 @@ describe('commands', () => {
           charge: { kind: 'issue', repo: 'strate', number: 109, topic: null },
           chargeKey: 'issue_strate-109',
           chargeSource: 'name',
+          links: [1],
         },
       ],
       edges: [{ kind: 'launch', parent: 1, child: 2 }],

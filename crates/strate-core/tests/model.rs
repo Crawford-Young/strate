@@ -655,7 +655,8 @@ fn a_message_closing_a_cycle_through_a_dispatch_is_refused_and_the_next_messager
     let mut h = Home::new("model-cycle");
     // s4 dispatches b1 (the graph arrives last); b1 messages s5, s5
     // messages s4 back (s4 -> b1 -> s5 -> s4 would be a cycle), then s6
-    // messages s4.
+    // messages s4. s5 starts with s4, so only the cycle refuses its
+    // message; s6 is older (a younger messager is a peer, #133).
     h.feed(
         "s4",
         None,
@@ -668,9 +669,20 @@ fn a_message_closing_a_cycle_through_a_dispatch_is_refused_and_the_next_messager
     h.feed(
         "s5",
         None,
-        &[peer("10:10:02", "m2"), sent("10:20:00", "m3")],
+        &[
+            record("10:00:00", "/work/hub", "main"),
+            peer("10:10:02", "m2"),
+            sent("10:20:00", "m3"),
+        ],
     );
-    h.feed("s6", None, &[sent("10:30:00", "m4")]);
+    h.feed(
+        "s6",
+        None,
+        &[
+            record("09:50:00", "/work/hub", "main"),
+            sent("10:30:00", "m4"),
+        ],
+    );
     h.feed(
         "s4",
         None,

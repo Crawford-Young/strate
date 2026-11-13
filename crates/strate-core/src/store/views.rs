@@ -57,7 +57,10 @@
 //! nearest drawn spawn ancestor, else the tab's orchestrator. The header's
 //! $ and run time sum the tab's drawn link and the links before it (#65).
 //! Each drawn agent carries its model reading ([`agent_model`]): session,
-//! role, lane and effective charge.
+//! role, lane and effective charge. A drawn chain's orchestrator names
+//! every link's orchestrator of its chain ([`GraphAgent::links`]), so a
+//! console open on an earlier link follows the chain to the one drawn
+//! after a `/clear` (#133).
 
 use std::collections::{HashMap, HashSet};
 
@@ -199,6 +202,10 @@ pub struct GraphAgent {
     /// That charge's key, e.g. `issue_strate-109`.
     pub charge_key: Option<String>,
     pub charge_source: ChargeSource,
+    /// On a drawn chain's orchestrator, the orchestrators of every link of
+    /// its `/clear` chain, itself included, in start order: an earlier
+    /// link's row id names this node (#133). Empty on a worker.
+    pub links: Vec<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -856,6 +863,7 @@ fn session_agents(
                 charge: None,
                 charge_key: None,
                 charge_source: ChargeSource::Unlinked,
+                links: Vec::new(),
             },
             edge,
         ))
@@ -1041,7 +1049,12 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
     // chain's drawn orchestrator, not past it under the chain's spawner.
     let drawn_chains =
         std::iter::once((chain, shown)).chain(units.iter().map(|u| (u.chain, u.link)));
+    let mut links: HashMap<i64, Vec<i64>> = HashMap::new();
     for (chain, drawn) in drawn_chains {
+        links.insert(
+            drawn.orchestrator,
+            chain.links.iter().map(|l| l.orchestrator).collect(),
+        );
         for link in chain
             .links
             .iter()
@@ -1095,6 +1108,7 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
         agent.charge_key = charge.as_ref().map(Charge::key);
         agent.charge = charge;
         agent.charge_source = source;
+        agent.links = links.remove(&agent.id).unwrap_or_default();
         agents.push(agent);
     }
     Ok(Some(LiveGraph {
@@ -2004,6 +2018,7 @@ mod tests {
             }),
             charge_key: Some("issue_strate-109".into()),
             charge_source: ChargeSource::Parent,
+            links: vec![1],
         };
         assert_eq!(
             serde_json::to_value(agent.state).expect("json"),
@@ -2026,6 +2041,7 @@ mod tests {
                 "id",
                 "kind",
                 "lane",
+                "links",
                 "model",
                 "name",
                 "parent",
@@ -2035,6 +2051,7 @@ mod tests {
             ]
         );
         let json = serde_json::to_value(&agent).expect("json");
+        assert_eq!(json["links"], serde_json::json!([1]));
         assert_eq!(
             (
                 &json["lane"],
