@@ -7,6 +7,11 @@ import {
   ResizableHandle,
   ResizablePanel,
   ResizablePanelGroup,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
   Tabs,
 } from '@crawfordyoung/ui'
 import { X } from 'lucide-react'
@@ -23,8 +28,10 @@ import { usePanels } from './usePanels'
 interface Selection {
   tab: number | null
   agent: number | null
+  /** An earlier link of the picked chain whose transcript shows; null means the latest. */
+  link: number | null
 }
-const NONE: Selection = { tab: null, agent: null }
+const NONE: Selection = { tab: null, agent: null, link: null }
 
 /** A tab of its own: live and not nested under a director's tab. */
 const hasTab = (w: Workstream) => w.live && w.director === null
@@ -56,10 +63,11 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
     return loaded
   })
   // A new tab shows with no node selected.
-  const pickTab = (tab: number) => setSelection({ tab, agent: null })
+  const pickTab = (tab: number) => setSelection({ tab, agent: null, link: null })
   // Returns the same object when nothing changes, so a repeated layout event rerenders nothing.
-  const setAgent = (agent: number | null) =>
-    setSelection((s) => (s.agent === agent ? s : { ...s, agent }))
+  // A new node starts on its latest link; a chain's own follow keeps an earlier pick.
+  const setAgent = (agent: number | null, keepLink = false) =>
+    setSelection((s) => (s.agent === agent ? s : { ...s, agent, link: keepLink ? s.link : null }))
   const panels = usePanels()
   const canvasRef = useRef<HTMLElement>(null)
 
@@ -86,7 +94,13 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
       : graph?.agents.find((a) => a.id === picked || a.links.includes(picked))
   const agentId = selectedAgent?.id ?? picked
   // Kept, so the latest link's transcript stays open should the chain leave the canvas too.
-  if (agentId !== picked) setAgent(agentId)
+  if (agentId !== picked) setAgent(agentId, true)
+  // A chain that left the canvas forgets its earlier pick, and stays reset if it is drawn again.
+  if (graph && picked !== null && !selectedAgent && selection.link !== null)
+    setSelection((s) => ({ ...s, link: null }))
+  // Re-picking the drawn link means "latest", so a later /clear is followed again.
+  const pickLink = (link: number) =>
+    setSelection((s) => ({ ...s, link: link === agentId ? null : link }))
   // A finished agent leaves the canvas but its transcript stays open, so the heading keeps its name.
   const [lastNamed, setLastNamed] = useState<{ id: number; name: string; charge: string } | null>(
     null,
@@ -105,6 +119,10 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
     setLastNamed(named)
   const shown = named ?? (lastNamed?.id === agentId ? lastNamed : null)
   const heading = shown ? shown.name : 'Console'
+  // A chain of several links lists them, in start order, the drawn one last. A chosen link the
+  // chain no longer lists reads as the latest.
+  const links = selectedAgent && selectedAgent.links.length > 1 ? selectedAgent.links : null
+  const viewed = links?.find((l) => l === selection.link) ?? agentId
 
   const selectAgent = (id: number) => {
     setAgent(id)
@@ -185,6 +203,23 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
                     </p>
                   )}
                 </div>
+                {links && (
+                  <Select value={String(viewed)} onValueChange={(v) => pickLink(Number(v))}>
+                    <SelectTrigger
+                      aria-label="Chain link"
+                      className="h-7 w-auto flex-none gap-1 px-2 text-xs"
+                    >
+                      <SelectValue>{`${links.findIndex((l) => l === viewed) + 1}/${links.length}`}</SelectValue>
+                    </SelectTrigger>
+                    <SelectContent>
+                      {links.map((l, i) => (
+                        <SelectItem key={l} value={String(l)}>
+                          {`${i + 1}/${links.length}${i === links.length - 1 ? ' latest' : ''}`}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                )}
                 <Button
                   variant="ghost"
                   size="icon"
@@ -195,16 +230,16 @@ export function LiveShell({ hidden, auditButtonRef, onOpenAudit }: LiveShellProp
                   <X aria-hidden className="size-4" />
                 </Button>
               </div>
-              {agentId === null ? (
+              {viewed === null ? (
                 <EmptyState message="Select an agent to see its transcript." />
               ) : (
                 // Its own instance per agent, so each starts at its own newest entry; and gone
                 // while the console is closed, so a reopen reads afresh.
                 // A finished agent is not drawn, so it reads as not working.
                 <AgentTranscript
-                  key={agentId}
-                  agent={agentId}
-                  working={selectedAgent?.state === 'working'}
+                  key={viewed}
+                  agent={viewed}
+                  working={viewed === agentId && selectedAgent?.state === 'working'}
                   version={version}
                   labelledBy={HEADING_ID}
                 />
