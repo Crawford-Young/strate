@@ -1,7 +1,7 @@
 //! The headline: issues closed as completed and merged PRs with work in the
 //! filter, and what they cost.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use super::Headline;
 use super::cells::Cells;
@@ -12,8 +12,8 @@ use super::gh::Gh;
 /// An issue's elapsed is its whole life, from the first session ever
 /// charged to it.
 pub(crate) fn headline(gh: &Gh, cells: &Cells) -> Headline {
-    let mut issues: HashMap<(&str, i64), f64> = HashMap::new();
-    let mut merged: HashMap<(&str, i64), f64> = HashMap::new();
+    let mut issues: BTreeMap<(&str, i64), f64> = BTreeMap::new();
+    let mut merged: BTreeMap<(&str, i64), f64> = BTreeMap::new();
     for cell in &cells.list {
         let Some((repo, issue, pr)) = cells.row_of(cell).place.issue() else {
             continue;

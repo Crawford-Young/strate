@@ -23,7 +23,7 @@
 //! whenever it runs.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use jiff::ToSpan;
 use jiff::civil::Date;
@@ -391,8 +391,8 @@ impl Read<'_> {
     fn outcome(&self, cells: &Cells, in_range: &[&Cell]) -> Outcome {
         // Whole life: per issue its $ and main-agent active ms; per PR
         // (its own repo) its $ and merge time.
-        let mut issues: HashMap<(&str, i64), (f64, i64)> = HashMap::new();
-        let mut prs: HashMap<(&str, i64), (f64, Option<i64>)> = HashMap::new();
+        let mut issues: BTreeMap<(&str, i64), (f64, i64)> = BTreeMap::new();
+        let mut prs: BTreeMap<(&str, i64), (f64, Option<i64>)> = BTreeMap::new();
         for cell in &cells.list {
             let Some((repo, issue, pr)) = cells.row_of(cell).place.issue() else {
                 continue;
@@ -677,7 +677,7 @@ impl Read<'_> {
                 count: r.no_report,
             });
         // Peaks: the dispatches and the main agents with cells in range.
-        let mains: HashSet<AgentKey> = in_range
+        let mains: BTreeSet<AgentKey> = in_range
             .iter()
             .filter(|c| c.agent_id.is_none())
             .map(|c| (c.session_id.clone(), None))

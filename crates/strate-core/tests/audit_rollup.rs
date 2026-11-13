@@ -27,7 +27,7 @@ use strate_core::registry::{Kind, RegistryEntry, RegistryEvent};
 use strate_core::store::Store;
 use strate_core::store::views::{
     Audit, AuditFilter, AuditNode, Metrics, NodeKind, SpanKind, TimelineDay, TimelineMark,
-    TimelineSpan, audit, audit_timeline,
+    TimelineSpan, audit, audit_timeline, performance,
 };
 
 const TORONTO: &str = "America/Toronto";
@@ -1810,4 +1810,49 @@ fn the_timeline_uses_the_webview_shape() {
             "marks": [{"atMs": 3, "label": "#9 closed"}]
         })
     );
+}
+
+/// `n` closed-as-completed issues, each with its own session, one cell of
+/// widely spread $ and its own merged PR, all closed and merged the same day:
+/// enough terms, of enough different magnitudes, that a float sum taken in
+/// another order lands on other bits.
+fn many_closed(n: i64) -> String {
+    let mut sql = String::from(
+        "INSERT INTO gh_repos (slug, owner, name, fetched_at) VALUES ('lab', 'example', 'lab', 1);",
+    );
+    for i in 1..=n {
+        let usd = 10f64.powi((i % 9) as i32 - 3) * (1.0 + i as f64 * 0.137);
+        sql.push_str(&format!(
+            "INSERT INTO sessions (session_id, path, started_at) VALUES ('s{i}', '/p/s{i}.jsonl', '2026-10-02T10:00:00.000Z');
+             INSERT INTO charges (id, key, kind, repo, number) VALUES ({i}, 'issue_lab-{i}', 'issue', 'lab', {i});
+             INSERT INTO agents (session_id, kind, own_charge, own_charge_source) VALUES ('s{i}', 'orchestrator', {i}, 'name');
+             INSERT INTO audit_cells (session_id, agent_id, day, model, wall_ms, active_ms, wait_ms, cost_usd, unpriced,
+                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
+                 VALUES ('s{i}', NULL, '2026-10-02', 'm', 1000, 1000, 0, {usd}, 0, 10, 1, 0, 0);
+             INSERT INTO gh_issues (repo, number, title, state, state_reason, created_at, closed_at, parent, sub_total, sub_completed)
+                 VALUES ('lab', {i}, 'Lorem', 'CLOSED', 'COMPLETED', '2026-10-01T00:00:00Z', '2026-10-03T10:00:00Z', NULL, 0, 0);
+             INSERT INTO gh_prs (repo, issue, number, state, created_at, merged_at, url)
+                 VALUES ('lab', {i}, {pr}, 'MERGED', '2026-10-02T00:00:00Z', '2026-10-03T09:00:00Z', 'https://github.com/example/lab/pull/{pr}');",
+            pr = 100 + i
+        ));
+    }
+    sql
+}
+
+#[test]
+fn the_audit_and_performance_json_are_byte_identical_on_a_fixed_store() {
+    let t = Temp::new("deterministic");
+    let db = synthetic(&t, &many_closed(80));
+    let f = filter("2026-10-01", "2026-10-31", &[]);
+    let read = || {
+        (
+            serde_json::to_string(&audit(&db, &f).expect("audit")).expect("audit json"),
+            serde_json::to_string(&performance(&db, &f).expect("performance"))
+                .expect("performance json"),
+        )
+    };
+    let first = read();
+    for run in 1..20 {
+        assert_eq!(first, read(), "read {run} differs from the first");
+    }
 }
