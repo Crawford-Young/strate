@@ -3,6 +3,7 @@
 // results complete their pending calls in place. It follows the newest entry while the reader is at
 // the bottom. Mount one per agent (`key` it by the agent): a new agent starts at its own bottom.
 import {
+  Badge,
   EmptyState,
   Transcript,
   TranscriptText,
@@ -96,6 +97,11 @@ function entry(e: TranscriptEntry, working: boolean): ReactNode {
     case 'user':
       return (
         <TranscriptUserTurn key={e.key} timestamp={timestamp} className="whitespace-pre-wrap">
+          {e.sender !== null && (
+            <Badge asChild variant="outline" className="mr-2">
+              <span>From {e.sender}</span>
+            </Badge>
+          )}
           {e.text}
         </TranscriptUserTurn>
       )

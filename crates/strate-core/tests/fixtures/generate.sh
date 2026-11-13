@@ -963,3 +963,35 @@ proot $W /work/lorem $W
 proot $O2 /work/hub $O
 { dname director_topic_amet; aprompt ${PT}08:30:00 o2-01
   dsend ${PT}08:31 o2-02 lorem-w "$(pm 2)"; } > "$PHUB/$O2.jsonl"
+
+# ---- sender-home: who sent a tagged prompt (#119); hand values in src/store/transcript.rs ----
+# 2026-11-13Z. One session S1: a typed prompt, then records carrying a
+# teammate-message (teammate_id), a cross-session-message with from-name and
+# one with only from, a record with two teammate-messages and one with two
+# cross-session-messages (each block its own sender), and a block with no
+# sender attribute, then (all text outside the blocks kept as its own entry)
+# a preamble before two blocks, trailing text after the last block, and a
+# teammate-message followed by a cross-session-message in one record.
+SH=fixtures/sender-home
+S1=5e55c1c1-0000-4000-8000-0000000000f1
+rm -rf "$SH"
+mkdir -p "$SH/projects/-work-sender"
+SN=2026-11-13T10
+xmsg() { # tag attributes body: a tagged block, JSON-escaped for a string
+  printf '<%s%s>\\n%s\\n</%s>' "$1" "$2" "$3" "$1"
+}
+xrec() { # time uuid content: a user record, content a JSON string
+  aenv "$1" "$2"; echo "{$AE,\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"$3\"}}"
+}
+aat $S1 /work/sender '"isSidechain":false'
+{ aprompt $SN:00:00 s1-01
+  xrec $SN:00:10 s1-02 "$(xmsg teammate-message " teammate_id=${Q}lorem-mate${Q} color=${Q}blue${Q}" 'Lorem ipsum.')"
+  xrec $SN:00:20 s1-03 "$(xmsg cross-session-message " from=${Q}uds:lorem${Q} from-name=${Q}ipsum-lead${Q}" 'Dolor sit.')"
+  xrec $SN:00:30 s1-04 "$(xmsg cross-session-message " from=${Q}uds:amet${Q}" 'Amet elit.')"
+  xrec $SN:00:40 s1-05 "$(xmsg teammate-message " teammate_id=${Q}lorem-mate${Q}" 'First.')\\n\\n$(xmsg teammate-message " teammate_id=${Q}ipsum-mate${Q} summary=${Q}x > y${Q}" 'Second.')"
+  xrec $SN:00:50 s1-06 "$(xmsg cross-session-message " from=${Q}uds:a${Q} from-name=${Q}one${Q}" 'Third.')\\n\\n$(xmsg cross-session-message " from=${Q}uds:b${Q}" 'Fourth.')"
+  xrec $SN:01:00 s1-07 "$(xmsg teammate-message '' 'Nameless.')"
+  xrec $SN:01:10 s1-08 "Lorem preamble:\\n\\n$(xmsg teammate-message " teammate_id=${Q}lorem-mate${Q}" 'Pre one.')\\n\\n$(xmsg teammate-message " teammate_id=${Q}ipsum-mate${Q}" 'Pre two.')"
+  xrec $SN:01:20 s1-09 "$(xmsg teammate-message " teammate_id=${Q}lorem-mate${Q}" 'Body.')\\n\\nTrailing text."
+  xrec $SN:01:30 s1-10 "$(xmsg teammate-message " teammate_id=${Q}lorem-mate${Q}" 'Mate.')\\n\\n$(xmsg cross-session-message " from=${Q}uds:c${Q} from-name=${Q}sit-lead${Q}" 'Cross.')"
+} > "$SH/projects/-work-sender/$S1.jsonl"

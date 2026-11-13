@@ -248,7 +248,7 @@ mod tests {
             json,
             serde_json::json!({
                 "entries": [{"key": format!("{id}:0"), "timestamp": "2026-10-07T10:00:00.000Z",
-                    "kind": "user", "text": "Lorem ipsum."}],
+                    "kind": "user", "text": "Lorem ipsum.", "sender": null}],
                 "updates": [],
                 "cursor": id,
             })

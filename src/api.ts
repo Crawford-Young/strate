@@ -135,7 +135,11 @@ export interface TranscriptTodo {
  * names it for good: its event id and its place among that record's entries.
  */
 export type TranscriptEntry = { key: string; timestamp: string | null } & (
-  | /** A human prompt. */ { kind: 'user'; text: string }
+  | /** A human prompt; `sender` names who sent a teammate or cross-session one. */ {
+      kind: 'user'
+      text: string
+      sender: string | null
+    }
   | /** An assistant text block. */ { kind: 'text'; text: string }
   | /** Non-empty thinking; redacted thinking is skipped. */ { kind: 'thinking'; text: string }
   | {

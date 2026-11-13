@@ -628,7 +628,13 @@ describe('console', () => {
       Promise.resolve(
         pageOf(
           [
-            { key: `${id}:0`, kind: 'user', text: `brief for ${id}`, timestamp: null },
+            {
+              key: `${id}:0`,
+              kind: 'user',
+              text: `brief for ${id}`,
+              sender: null,
+              timestamp: null,
+            },
             {
               key: `${id}:1`,
               kind: 'tool_call',
