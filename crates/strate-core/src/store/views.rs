@@ -72,7 +72,7 @@ pub use super::audit::{
     audit_timeline, performance,
 };
 pub use super::model::{ChargeSource, Lane, ModelAgent, agent_model};
-use super::model::{effective_charge, lane};
+use super::model::{FINISHED_SQL, effective_charge, lane};
 pub use super::transcript::{
     ARGS_MAX, RESULT_MAX, TranscriptBody, TranscriptEntry, TranscriptTodo, TranscriptTodoStatus,
     TranscriptToolStatus, agent_transcript,
@@ -371,15 +371,18 @@ fn orchestrator_state(needs_you: bool, registry_state: Option<&str>) -> AgentSta
     }
 }
 
-/// A subagent's or teammate's state: hooks first, then whether it finished
-/// or rests (see [`session_agents`]) and whether its session is still live.
-/// An idle hook is a turn end, which `finished` covers while no newer
-/// record woke the teammate.
-fn worker_state(needs_you: bool, hook: Option<&str>, finished: bool, live: bool) -> AgentState {
+/// A subagent's or teammate's state: hooks first, then whether it is done
+/// (finished by the model's rule, [`FINISHED_SQL`], or resting: see
+/// [`session_agents`]) and whether its session is live. A session that is
+/// not live reads done too, though its workers need not have finished: an
+/// earlier `/clear` link, a background session blocked on the user, or one
+/// the registry has not listed yet. An idle hook is a turn end, which
+/// `done` covers while no newer record woke the teammate.
+fn worker_state(needs_you: bool, hook: Option<&str>, done: bool, live: bool) -> AgentState {
     match (needs_you, hook) {
         (true, _) => AgentState::NeedsYou,
         (_, Some("done")) => AgentState::Done,
-        _ if finished || !live => AgentState::Done,
+        _ if done || !live => AgentState::Done,
         _ => AgentState::Working,
     }
 }
@@ -771,15 +774,12 @@ type Row = (GraphAgent, Option<(i64, String)>);
 /// state and registry wait come from the session's listing ([`listings`]),
 /// and workers' states read its liveness.
 ///
-/// A worker has finished once its dispatch is answered, its task
-/// notification arrives or its meta.json says so (#108). A background
-/// dispatch's tool_result is the immediate launch result
-/// (`toolUseResult.status` `async_launched`), not an answer: its end is
-/// the notification (#42). A teammate rests
-/// ([`rests`]) from its newest idle notice in this session's own
-/// transcript, the lead's, matched by its meta name, or idle hook.
-/// The session's answers are read once ([`answered`]), not per agent: a
-/// real session held 86 agents over thousands of records.
+/// A worker reads done once it has finished, by the model's one rule
+/// ([`FINISHED_SQL`], [`ModelAgent::finished`]: its signals, or its lead's
+/// process gone), or while a teammate rests ([`rests`]) from its newest
+/// idle notice in this session's own transcript, the lead's, matched by its
+/// meta name, or idle hook. Resting is not finished: the teammate can be
+/// woken.
 fn session_agents(
     conn: &Connection,
     session_id: &str,
@@ -787,14 +787,12 @@ fn session_agents(
 ) -> Result<Vec<Row>> {
     let listing = listings.get(session_id).unwrap_or(&NOT_LISTED);
     let notices = idle_notices(conn, session_id)?;
-    let answered = answered(conn, session_id)?;
-    let mut stmt = conn.prepare_cached(
+    let mut stmt = conn.prepare_cached(&format!(
         "SELECT a.id, a.agent_id, a.kind, a.name, a.agent_type,
              a.description, a.model, a.cost_usd, a.context_tokens, a.context_pct,
              a.hook_state,
              EXISTS (SELECT 1 FROM needs_you AS n WHERE n.agent = a.id AND n.source = 'hook'),
-             a.finished IS 1 OR EXISTS (SELECT 1 FROM events AS n
-                 WHERE n.session_id = a.session_id AND n.notification_task = a.agent_id),
+             {FINISHED_SQL},
              (SELECT p.parent FROM edges AS p
                  WHERE p.child = a.id AND p.kind IN ('dispatch', 'teammate')),
              (SELECT p.kind FROM edges AS p
@@ -806,12 +804,11 @@ fn session_agents(
                   WHERE e.session_id = a.session_id AND e.agent_id = a.agent_id
                     AND e.type IN ('user', 'assistant'))
              END,
-             (SELECT d.tool_use_id FROM edges AS d WHERE d.child = a.id AND d.kind = 'dispatch'),
              a.session_id, a.role, l.lane
          FROM agents AS a JOIN agent_lanes AS l ON l.agent = a.id
          WHERE a.session_id = ?1
-         ORDER BY a.agent_id IS NOT NULL, a.id",
-    )?;
+         ORDER BY a.agent_id IS NOT NULL, a.id"
+    ))?;
     let rows = stmt.query_map([session_id], |r| {
         let agent_id: Option<String> = r.get(1)?;
         let needs: bool = r.get(11)?;
@@ -827,14 +824,11 @@ fn session_agents(
                     _ => None,
                 };
                 let idle = notice.max(r.get(15)?);
-                let dispatch: Option<String> = r.get(17)?;
-                let finished = r.get::<_, bool>(12)?
-                    || dispatch.is_some_and(|d| answered.contains(&d))
-                    || rests(idle, r.get(16)?);
+                let done = r.get::<_, bool>(12)? || rests(idle, r.get(16)?);
                 let hook: Option<String> = r.get(10)?;
                 (
                     name,
-                    worker_state(needs, hook.as_deref(), finished, listing.live),
+                    worker_state(needs, hook.as_deref(), done, listing.live),
                 )
             }
         };
@@ -855,9 +849,9 @@ fn session_agents(
                 context_tokens: r.get(8)?,
                 context_pct: r.get(9)?,
                 parent: None,
-                session_id: r.get(18)?,
-                role: r.get(19)?,
-                lane: lane(&r.get::<_, String>(20)?),
+                session_id: r.get(17)?,
+                role: r.get(18)?,
+                lane: lane(&r.get::<_, String>(19)?),
                 // Read for drawn agents only ([`live_graph`]).
                 charge: None,
                 charge_key: None,
@@ -867,18 +861,6 @@ fn session_agents(
         ))
     })?;
     rows.collect()
-}
-
-/// The tool_use ids `session_id`'s records answer: every tool_result but a
-/// background dispatch's launch (`toolUseResult.status` `async_launched`).
-fn answered(conn: &Connection, session_id: &str) -> Result<HashSet<String>> {
-    conn.prepare_cached(
-        "SELECT j.value FROM events AS e JOIN json_each(e.tool_results) AS j
-         WHERE e.session_id = ?1 AND e.tool_results IS NOT NULL
-           AND json_extract(e.raw, '$.toolUseResult.status') IS NOT 'async_launched'",
-    )?
-    .query_map([session_id], |r| r.get(0))?
-    .collect()
 }
 
 /// A spawned chain to draw: the chain, its drawn link, and the edge from
@@ -1136,7 +1118,7 @@ mod tests {
         assert_eq!(worker_state(false, Some("done"), false, true), Done);
         assert_eq!(worker_state(false, Some("running"), true, true), Done);
         assert_eq!(worker_state(false, Some("idle"), false, false), Done);
-        // An idle hook is a turn end the caller folds into `finished`
+        // An idle hook is a turn end the caller folds into `done`
         // (#83): one it does not is behind a newer record.
         assert_eq!(worker_state(false, Some("idle"), false, true), Working);
         assert_eq!(worker_state(false, Some("running"), false, true), Working);
