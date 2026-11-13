@@ -16,6 +16,7 @@ use serde_json::Value;
 pub use config_dir::resolve_config_dir;
 pub(crate) use jsonl::parse_line;
 pub use launch::{Launch, launches};
+pub use scan::Scanner;
 pub(crate) use scan::{is_transcript, meta_finished, meta_of, scalar_text, transcript_paths};
 
 /// Everything discovered under one config dir.
@@ -168,7 +169,9 @@ pub enum WarningKind {
 
 /// Discovers the graph under `root` (a Claude Code config dir). Fails only
 /// when `root` itself cannot be read; everything below it degrades into
-/// [`Graph::warnings`].
+/// [`Graph::warnings`]. Every call shares one process-wide [`Scanner`], so
+/// a pass reads only the transcript bytes written since the last. The cache
+/// belongs to one root: a pass on another root starts over.
 pub fn discover(root: &Path) -> io::Result<Graph> {
     scan::discover(root)
 }

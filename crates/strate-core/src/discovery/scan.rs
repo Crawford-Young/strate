@@ -1,28 +1,290 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, BufReader};
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 
 use serde_json::{Map, Value};
 
-use super::jsonl::for_each_record;
+use crate::tail::FileIdentity;
+
+use super::jsonl::parse_line;
 use super::{
     AgentRef, Graph, Link, Project, SessionNode, SubagentMeta, SubagentNode, TeamNode, Unresolved,
     Warning, WarningKind,
 };
 
+/// Discovers `root` with one process-wide [`Scanner`].
 pub(super) fn discover(root: &Path) -> io::Result<Graph> {
-    fs::read_dir(root)?;
-    let mut g = Graph::default();
-    g.teams = read_teams(&root.join("teams"), &mut g.warnings);
-    for path in sorted_entries(&root.join("projects"), &mut g.warnings) {
-        if path.is_dir() {
-            let dir_name = name_of(&path);
-            scan_project(&path, &dir_name, &mut g);
-            g.projects.push(Project { dir_name, path });
+    static SCANNER: LazyLock<Mutex<Scanner>> = LazyLock::new(Mutex::default);
+    let mut scanner = SCANNER.lock().unwrap_or_else(|poisoned| {
+        // A pass that panicked may have left its cache half-updated.
+        let mut scanner = poisoned.into_inner();
+        *scanner = Scanner::default();
+        scanner
+    });
+    SCANNER.clear_poison();
+    scanner.discover(root)
+}
+
+/// Discovers a config dir pass after pass, keeping what each transcript's
+/// records give a pass, so a pass costs what changed since the last (#121):
+/// a transcript whose size and mtime are unchanged is not opened, one that
+/// grew is read from its last complete line, and one that shrank, was
+/// replaced (another file identity) or kept its size under a newer mtime is
+/// read whole, as the tailer does. Metas
+/// and team configs are small and read every pass, so a meta's `finished`
+/// is as fresh as a full scan's.
+#[derive(Debug, Default)]
+pub struct Scanner {
+    /// The transcripts the last pass read, by path.
+    last: HashMap<PathBuf, Cached>,
+    /// The transcripts this pass has read.
+    next: HashMap<PathBuf, Cached>,
+    bytes_read: u64,
+}
+
+#[derive(Debug)]
+struct Cached {
+    len: u64,
+    modified: Option<SystemTime>,
+    identity: Option<FileIdentity>,
+    transcript: Transcript,
+}
+
+impl Scanner {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Transcript bytes read by every pass so far.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// Discovers the graph under `root`, as [`super::discover`] documents.
+    pub fn discover(&mut self, root: &Path) -> io::Result<Graph> {
+        fs::read_dir(root)?;
+        let mut g = Graph::default();
+        g.teams = read_teams(&root.join("teams"), &mut g.warnings);
+        for path in sorted_entries(&root.join("projects"), &mut g.warnings) {
+            if path.is_dir() {
+                let dir_name = name_of(&path);
+                self.scan_project(&path, &dir_name, &mut g);
+                g.projects.push(Project { dir_name, path });
+            }
+        }
+        // A transcript gone since is forgotten.
+        self.last = std::mem::take(&mut self.next);
+        Ok(g)
+    }
+
+    fn scan_project(&mut self, project: &Path, dir_name: &str, g: &mut Graph) {
+        let mut session_ids: Vec<String> = sorted_entries(project, &mut g.warnings)
+            .iter()
+            .filter_map(|p| {
+                let name = name_of(p);
+                if p.is_dir() {
+                    Some(name)
+                } else {
+                    name.strip_suffix(".jsonl").map(str::to_string)
+                }
+            })
+            .collect();
+        session_ids.sort();
+        session_ids.dedup();
+        for session_id in session_ids {
+            self.scan_session(project, dir_name, &session_id, g);
         }
     }
-    Ok(g)
+
+    fn scan_session(&mut self, project: &Path, dir_name: &str, session_id: &str, g: &mut Graph) {
+        // tool_use id -> the agent whose transcript holds it (first wins).
+        let mut tool_uses: HashMap<String, AgentRef> = HashMap::new();
+
+        let transcript = project.join(format!("{session_id}.jsonl"));
+        if transcript.is_file() {
+            let owner = AgentRef::Session {
+                session_id: session_id.to_string(),
+            };
+            let mut node = SessionNode {
+                session_id: session_id.to_string(),
+                project_dir: dir_name.to_string(),
+                path: transcript.clone(),
+                cwd: None,
+                git_branch: None,
+                version: None,
+            };
+            if let Some(t) = self.read(&transcript, &mut g.warnings) {
+                node.cwd = t.first(|r| &r.cwd);
+                node.git_branch = t.first(|r| &r.git_branch);
+                node.version = t.first(|r| &r.version);
+                t.add_tool_uses(&owner, &mut tool_uses);
+            }
+            g.sessions.push(node);
+        }
+
+        let mut pending = Vec::new();
+        for path in sorted_entries(&project.join(session_id).join("subagents"), &mut g.warnings) {
+            let file = name_of(&path);
+            let Some(agent_id) = agent_id_of(&file) else {
+                continue;
+            };
+            let owner = AgentRef::Subagent {
+                session_id: session_id.to_string(),
+                agent_id: agent_id.to_string(),
+            };
+            if let Some(t) = self.read(&path, &mut g.warnings) {
+                t.add_tool_uses(&owner, &mut tool_uses);
+            }
+            let meta = read_meta(&path, agent_id, &mut g.warnings);
+            pending.push((agent_id.to_string(), owner, path, meta));
+        }
+
+        // Links resolve only after every transcript in the session is read, so
+        // a nested subagent finds a parent subagent listed after it.
+        let siblings: HashSet<String> = pending.iter().map(|(id, ..)| id.clone()).collect();
+        for (agent_id, owner, path, meta) in pending {
+            let link = resolve_link(meta.as_ref(), &owner, &tool_uses, &g.teams, &siblings);
+            g.subagents.push(SubagentNode {
+                session_id: session_id.to_string(),
+                agent_id,
+                path,
+                meta,
+                link,
+            });
+        }
+    }
+
+    /// What the transcript at `path` holds now, warning when it is
+    /// unreadable or has lines that do not parse.
+    fn read(&mut self, path: &Path, warnings: &mut Vec<Warning>) -> Option<&Transcript> {
+        let cached = self.last.remove(path);
+        let read = fs::metadata(path).and_then(|m| {
+            let (len, modified) = (m.len(), m.modified().ok());
+            let cached = match cached {
+                Some(c) if c.len == len && c.modified == modified => return Ok(c),
+                cached => cached,
+            };
+            let identity = FileIdentity::of(path).ok();
+            let mut transcript = match cached {
+                // Same size but another mtime is a rewrite, not growth.
+                Some(c) if identity.is_some() && c.identity == identity && len > c.len => {
+                    c.transcript
+                }
+                _ => Transcript::default(),
+            };
+            transcript.read_from(path, &mut self.bytes_read)?;
+            Ok(Cached {
+                len,
+                modified,
+                identity,
+                transcript,
+            })
+        });
+        let cached = match read {
+            Ok(cached) => cached,
+            Err(e) => {
+                warn(warnings, path, WarningKind::Unreadable(e.to_string()));
+                return None;
+            }
+        };
+        self.next.insert(path.to_path_buf(), cached);
+        let t = &self.next[path].transcript;
+        t.warn(path, warnings);
+        Some(t)
+    }
+}
+
+/// What one transcript's records give a pass.
+#[derive(Debug, Default)]
+struct Records {
+    cwd: Option<String>,
+    git_branch: Option<String>,
+    version: Option<String>,
+    tool_uses: Vec<String>,
+    /// 1-based numbers of the lines that fail to parse.
+    bad: Vec<usize>,
+}
+
+impl Records {
+    fn add(&mut self, line_no: usize, line: &[u8]) {
+        match parse_line(line) {
+            None => {}
+            Some(Ok(record)) => {
+                fill_first(&mut self.cwd, &record, "cwd");
+                fill_first(&mut self.git_branch, &record, "gitBranch");
+                fill_first(&mut self.version, &record, "version");
+                self.tool_uses.extend(tool_use_ids(&record));
+            }
+            Some(Err(_)) => self.bad.push(line_no),
+        }
+    }
+}
+
+/// One transcript as read so far.
+#[derive(Debug, Default)]
+struct Transcript {
+    /// Bytes through the last complete line, and the lines in them.
+    offset: u64,
+    lines: usize,
+    complete: Records,
+    /// The line after `offset` that has no newline yet.
+    partial: Records,
+}
+
+impl Transcript {
+    /// Reads `path` from `offset` to its end, counting the bytes read.
+    fn read_from(&mut self, path: &Path, bytes_read: &mut u64) -> io::Result<()> {
+        let mut reader = BufReader::new(File::open(path)?);
+        reader.seek(SeekFrom::Start(self.offset))?;
+        self.partial = Records::default();
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let n = reader.read_until(b'\n', &mut line)?;
+            if n == 0 {
+                return Ok(());
+            }
+            *bytes_read += n as u64;
+            if line.ends_with(b"\n") {
+                self.lines += 1;
+                self.complete.add(self.lines, &line);
+                self.offset += n as u64;
+            } else {
+                self.partial.add(self.lines + 1, &line);
+            }
+        }
+    }
+
+    /// The first value `field` picks from a record.
+    fn first(&self, field: impl Fn(&Records) -> &Option<String>) -> Option<String> {
+        field(&self.complete)
+            .as_ref()
+            .or(field(&self.partial).as_ref())
+            .cloned()
+    }
+
+    fn add_tool_uses(&self, owner: &AgentRef, out: &mut HashMap<String, AgentRef>) {
+        let ids = self.complete.tool_uses.iter();
+        for id in ids.chain(&self.partial.tool_uses) {
+            if !out.contains_key(id) {
+                out.insert(id.clone(), owner.clone());
+            }
+        }
+    }
+
+    fn warn(&self, path: &Path, warnings: &mut Vec<Warning>) {
+        let bad: Vec<usize> = [&self.complete.bad, &self.partial.bad]
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        if !bad.is_empty() {
+            warn(warnings, path, WarningKind::MalformedLines(bad));
+        }
+    }
 }
 
 /// Every transcript (session or subagent `.jsonl`) under `root/projects`,
@@ -99,112 +361,24 @@ fn warn(warnings: &mut Vec<Warning>, path: &Path, kind: WarningKind) {
     });
 }
 
-fn scan_project(project: &Path, dir_name: &str, g: &mut Graph) {
-    let mut session_ids: Vec<String> = sorted_entries(project, &mut g.warnings)
-        .iter()
-        .filter_map(|p| {
-            let name = name_of(p);
-            if p.is_dir() {
-                Some(name)
-            } else {
-                name.strip_suffix(".jsonl").map(str::to_string)
-            }
-        })
-        .collect();
-    session_ids.sort();
-    session_ids.dedup();
-    for session_id in session_ids {
-        scan_session(project, dir_name, &session_id, g);
-    }
-}
-
-fn scan_session(project: &Path, dir_name: &str, session_id: &str, g: &mut Graph) {
-    // tool_use id -> the agent whose transcript holds it (first wins).
-    let mut tool_uses: HashMap<String, AgentRef> = HashMap::new();
-
-    let transcript = project.join(format!("{session_id}.jsonl"));
-    if transcript.is_file() {
-        let owner = AgentRef::Session {
-            session_id: session_id.to_string(),
-        };
-        let mut node = SessionNode {
-            session_id: session_id.to_string(),
-            project_dir: dir_name.to_string(),
-            path: transcript.clone(),
-            cwd: None,
-            git_branch: None,
-            version: None,
-        };
-        read_transcript(&transcript, &mut g.warnings, |record| {
-            fill_first(&mut node.cwd, &record, "cwd");
-            fill_first(&mut node.git_branch, &record, "gitBranch");
-            fill_first(&mut node.version, &record, "version");
-            collect_tool_uses(&record, &owner, &mut tool_uses);
-        });
-        g.sessions.push(node);
-    }
-
-    let mut pending = Vec::new();
-    for path in sorted_entries(&project.join(session_id).join("subagents"), &mut g.warnings) {
-        let file = name_of(&path);
-        let Some(agent_id) = agent_id_of(&file) else {
-            continue;
-        };
-        let owner = AgentRef::Subagent {
-            session_id: session_id.to_string(),
-            agent_id: agent_id.to_string(),
-        };
-        read_transcript(&path, &mut g.warnings, |record| {
-            collect_tool_uses(&record, &owner, &mut tool_uses);
-        });
-        let meta = read_meta(&path, agent_id, &mut g.warnings);
-        pending.push((agent_id.to_string(), owner, path, meta));
-    }
-
-    // Links resolve only after every transcript in the session is read, so
-    // a nested subagent finds a parent subagent listed after it.
-    let siblings: HashSet<String> = pending.iter().map(|(id, ..)| id.clone()).collect();
-    for (agent_id, owner, path, meta) in pending {
-        let link = resolve_link(meta.as_ref(), &owner, &tool_uses, &g.teams, &siblings);
-        g.subagents.push(SubagentNode {
-            session_id: session_id.to_string(),
-            agent_id,
-            path,
-            meta,
-            link,
-        });
-    }
-}
-
-fn read_transcript(path: &Path, warnings: &mut Vec<Warning>, on_record: impl FnMut(Value)) {
-    let result = File::open(path).and_then(|f| for_each_record(BufReader::new(f), on_record));
-    match result {
-        Ok(bad) if bad.is_empty() => {}
-        Ok(bad) => warn(warnings, path, WarningKind::MalformedLines(bad)),
-        Err(e) => warn(warnings, path, WarningKind::Unreadable(e.to_string())),
-    }
-}
-
 fn fill_first(slot: &mut Option<String>, record: &Value, key: &str) {
     if slot.is_none() {
         *slot = record.get(key).and_then(Value::as_str).map(str::to_string);
     }
 }
 
-fn collect_tool_uses(record: &Value, owner: &AgentRef, out: &mut HashMap<String, AgentRef>) {
-    if record.get("type").and_then(Value::as_str) != Some("assistant") {
-        return;
-    }
-    let Some(blocks) = record.pointer("/message/content").and_then(Value::as_array) else {
-        return;
+/// The ids of an assistant record's `tool_use` blocks.
+fn tool_use_ids(record: &Value) -> impl Iterator<Item = String> + '_ {
+    let blocks = match record.get("type").and_then(Value::as_str) {
+        Some("assistant") => record.pointer("/message/content").and_then(Value::as_array),
+        _ => None,
     };
-    for block in blocks {
-        if block.get("type").and_then(Value::as_str) == Some("tool_use")
-            && let Some(id) = block.get("id").and_then(Value::as_str)
-        {
-            out.entry(id.to_string()).or_insert_with(|| owner.clone());
-        }
-    }
+    blocks.into_iter().flatten().filter_map(|block| {
+        (block.get("type").and_then(Value::as_str) == Some("tool_use"))
+            .then(|| block.get("id").and_then(Value::as_str))
+            .flatten()
+            .map(str::to_string)
+    })
 }
 
 /// Reads JSON at `path` as an object, warning when it is unreadable or not
@@ -578,6 +752,308 @@ mod tests {
         assert_eq!(finished("a1"), Some(true));
         assert_eq!(finished("a2"), None, "absent while the subagent runs");
         assert_eq!(finished("a3"), None, "only a boolean counts");
+    }
+
+    /// Every fixture home under `tests/fixtures`.
+    fn fixture_homes() -> Vec<PathBuf> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut homes: Vec<PathBuf> = fs::read_dir(dir)
+            .expect("fixtures")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.join("projects").is_dir())
+            .collect();
+        homes.sort();
+        homes
+    }
+
+    /// Blank lines count toward the numbers; a line that does not parse
+    /// (malformed, non-UTF-8, or a final one cut short) is skipped and
+    /// numbered; CRLF endings parse.
+    #[test]
+    fn a_read_numbers_the_lines_that_do_not_parse_and_carries_on() {
+        let dir = crate::tail::test_dir("scan-lines");
+        let path = dir.join("s.jsonl");
+        let mut bytes = b"{\"cwd\":\"/work/a\"}\r\n\n{\"a\": \n{\"a\":\"\xff\xfe\"}\n".to_vec();
+        bytes.extend(dispatching("toolu_1").as_bytes());
+        let cut = b"{\"a\":2,\"b\":\"tru";
+        bytes.extend(cut);
+        fs::write(&path, &bytes).expect("write");
+        let mut t = Transcript::default();
+        let mut read = 0;
+        t.read_from(&path, &mut read).expect("read");
+        fs::remove_dir_all(dir).expect("cleanup");
+
+        assert_eq!(read, bytes.len() as u64);
+        assert_eq!((t.lines, t.offset), (5, (bytes.len() - cut.len()) as u64));
+        assert_eq!(t.complete.bad, [3, 4]);
+        assert_eq!(t.partial.bad, [6]);
+        assert_eq!(t.complete.tool_uses, ["toolu_1"]);
+        assert_eq!(t.first(|r| &r.cwd).as_deref(), Some("/work/a"));
+    }
+
+    fn len(path: &Path) -> u64 {
+        fs::metadata(path).expect("metadata").len()
+    }
+
+    #[test]
+    fn a_pass_with_nothing_changed_reads_no_transcript_bytes_and_links_the_same() {
+        let homes = fixture_homes();
+        assert!(homes.len() > 5, "{homes:?}");
+        for root in homes {
+            let mut scanner = Scanner::new();
+            let full = scanner.discover(&root).expect("fixture root");
+            let every: u64 = transcript_paths(&root).iter().map(|p| len(p)).sum();
+            assert_eq!(
+                scanner.bytes_read(),
+                every,
+                "{root:?}: a first pass reads all"
+            );
+            let again = scanner.discover(&root).expect("fixture root");
+            assert_eq!(scanner.bytes_read(), every, "{root:?}: nothing changed");
+            assert_eq!(again, full, "{root:?}");
+        }
+    }
+
+    fn write(path: &Path, text: &str) -> u64 {
+        fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+        fs::write(path, text).expect("write");
+        text.len() as u64
+    }
+
+    fn append(path: &Path, text: &str) -> u64 {
+        use std::io::Write;
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("open");
+        file.write_all(text.as_bytes()).expect("append");
+        text.len() as u64
+    }
+
+    /// An assistant record holding one `tool_use` with `id`.
+    fn dispatching(id: &str) -> String {
+        format!(
+            "{{\"type\":\"assistant\",\"message\":{{\"content\":[{{\"type\":\"tool_use\",\"id\":\"{id}\"}}]}}}}\n"
+        )
+    }
+
+    fn link_of(g: &Graph, agent_id: &str) -> Link {
+        let sub = g.subagents.iter().find(|s| s.agent_id == agent_id);
+        sub.expect("subagent").link.clone()
+    }
+
+    fn session_ref() -> AgentRef {
+        AgentRef::Session {
+            session_id: "s1".to_string(),
+        }
+    }
+
+    /// A pass of `scanner`, checked against a full scan of the same files,
+    /// with the transcript bytes it read.
+    fn pass(scanner: &mut Scanner, root: &Path) -> (Graph, u64) {
+        let before = scanner.bytes_read();
+        let g = scanner.discover(root).expect("readable root");
+        assert_eq!(g, Scanner::new().discover(root).expect("readable root"));
+        (g, scanner.bytes_read() - before)
+    }
+
+    #[test]
+    fn a_pass_reads_only_the_bytes_appended_and_the_transcripts_added_since_the_last() {
+        let root = crate::tail::test_dir("scan-grows");
+        let session = root.join("projects/-work-x/s1.jsonl");
+        let subagents = root.join("projects/-work-x/s1/subagents");
+        write(&session, "{\"type\":\"user\",\"cwd\":\"/work/x\"}\n");
+        write(&subagents.join("agent-a1.jsonl"), "{\"type\":\"user\"}\n");
+        let meta = r#"{"agentType":"x","toolUseId":"toolu_1"}"#;
+        write(&subagents.join("agent-a1.meta.json"), meta);
+        let mut scanner = Scanner::new();
+        let (g, _) = pass(&mut scanner, &root);
+        assert!(matches!(
+            link_of(&g, "a1"),
+            Link::Unresolved(Unresolved::ToolUseNotFound { .. })
+        ));
+
+        let grown = append(&session, &dispatching("toolu_1"));
+        let (g, read) = pass(&mut scanner, &root);
+        assert_eq!(read, grown, "only the appended bytes");
+        assert_eq!(
+            link_of(&g, "a1"),
+            Link::Dispatch {
+                parent: session_ref(),
+                tool_use_id: "toolu_1".to_string(),
+            }
+        );
+        assert_eq!(g.sessions[0].cwd.as_deref(), Some("/work/x"));
+
+        // a2 (spawned by a1) dispatches a3; both appear at once.
+        let added = write(&subagents.join("agent-a2.jsonl"), &dispatching("toolu_2"))
+            + write(&subagents.join("agent-a3.jsonl"), "{\"type\":\"user\"}\n");
+        let meta = r#"{"agentType":"x","parentAgentId":"a1"}"#;
+        write(&subagents.join("agent-a2.meta.json"), meta);
+        let meta = r#"{"agentType":"x","toolUseId":"toolu_2"}"#;
+        write(&subagents.join("agent-a3.meta.json"), meta);
+        let (g, read) = pass(&mut scanner, &root);
+        assert_eq!(read, added, "only the new transcripts");
+        let a2 = AgentRef::Subagent {
+            session_id: "s1".to_string(),
+            agent_id: "a2".to_string(),
+        };
+        assert_eq!(
+            link_of(&g, "a3"),
+            Link::Dispatch {
+                parent: a2,
+                tool_use_id: "toolu_2".to_string(),
+            }
+        );
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_line_without_its_newline_is_read_again_once_it_ends() {
+        let root = crate::tail::test_dir("scan-partial");
+        let session = root.join("projects/-work-x/s1.jsonl");
+        let head = "{\"type\":\"user\"}\n";
+        let record = dispatching("toolu_1");
+        let (start, rest) = record.split_at(30);
+        let subagents = root.join("projects/-work-x/s1/subagents");
+        write(&subagents.join("agent-a1.jsonl"), "{\"type\":\"user\"}\n");
+        let meta = r#"{"agentType":"x","toolUseId":"toolu_1"}"#;
+        write(&subagents.join("agent-a1.meta.json"), meta);
+        let partial = write(&session, &format!("{head}{start}"));
+        let mut scanner = Scanner::new();
+        let (g, _) = pass(&mut scanner, &root);
+        let warning = g.warnings.iter().find(|w| w.path == session);
+        assert_eq!(
+            warning.map(|w| &w.kind),
+            Some(&WarningKind::MalformedLines(vec![2]))
+        );
+
+        append(&session, rest);
+        let (g, read) = pass(&mut scanner, &root);
+        assert_eq!(read, partial - head.len() as u64 + rest.len() as u64);
+        assert!(g.warnings.is_empty(), "{:?}", g.warnings);
+        assert!(matches!(link_of(&g, "a1"), Link::Dispatch { .. }));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_transcript_that_shrinks_or_is_replaced_is_read_whole() {
+        let root = crate::tail::test_dir("scan-rewritten");
+        let session = root.join("projects/-work-x/s1.jsonl");
+        let subagents = root.join("projects/-work-x/s1/subagents");
+        write(&subagents.join("agent-a1.jsonl"), "{\"type\":\"user\"}\n");
+        let meta = r#"{"agentType":"x","toolUseId":"toolu_1"}"#;
+        write(&subagents.join("agent-a1.meta.json"), meta);
+        write(
+            &session,
+            &format!("{{\"type\":\"user\"}}\n{}", dispatching("toolu_1")),
+        );
+        let mut scanner = Scanner::new();
+        let (g, _) = pass(&mut scanner, &root);
+        assert!(matches!(link_of(&g, "a1"), Link::Dispatch { .. }));
+
+        let shorter = write(&session, "{\"type\":\"user\"}\n");
+        let (g, read) = pass(&mut scanner, &root);
+        assert_eq!(read, shorter, "truncated in place: read from the start");
+        assert!(matches!(
+            link_of(&g, "a1"),
+            Link::Unresolved(Unresolved::ToolUseNotFound { .. })
+        ));
+
+        // Longer than before, so only the file's identity tells it apart.
+        let replacement = root.join("projects/-work-x/s1.jsonl.tmp");
+        let text = format!("{}{}", dispatching("toolu_1"), dispatching("toolu_9"));
+        let longer = write(&replacement, &text);
+        fs::rename(&replacement, &session).expect("replace");
+        let (g, read) = pass(&mut scanner, &root);
+        assert_eq!(read, longer, "replaced: read from the start");
+        assert!(matches!(link_of(&g, "a1"), Link::Dispatch { .. }));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_transcript_rewritten_to_the_same_size_with_a_newer_mtime_is_read_whole() {
+        let root = crate::tail::test_dir("scan-same-size");
+        let session = root.join("projects/-work-x/s1.jsonl");
+        let subagents = root.join("projects/-work-x/s1/subagents");
+        write(&subagents.join("agent-a1.jsonl"), "{\"type\":\"user\"}\n");
+        let meta = r#"{"agentType":"x","toolUseId":"toolu_1"}"#;
+        write(&subagents.join("agent-a1.meta.json"), meta);
+        write(&session, &dispatching("toolu_1"));
+        let mut scanner = Scanner::new();
+        let (g, _) = pass(&mut scanner, &root);
+        assert!(matches!(link_of(&g, "a1"), Link::Dispatch { .. }));
+
+        let size = write(&session, &dispatching("toolu_2"));
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&session)
+            .expect("open");
+        let newer = fs::metadata(&session)
+            .expect("metadata")
+            .modified()
+            .expect("mtime")
+            + std::time::Duration::from_secs(5);
+        file.set_modified(newer).expect("set mtime");
+        drop(file);
+        let (g, read) = pass(&mut scanner, &root);
+        assert_eq!(read, size, "same size, newer mtime: read from the start");
+        assert!(matches!(
+            link_of(&g, "a1"),
+            Link::Unresolved(Unresolved::ToolUseNotFound { .. })
+        ));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn a_deleted_transcript_is_forgotten_and_restored_when_it_reappears() {
+        let root = crate::tail::test_dir("scan-deleted");
+        let session = root.join("projects/-work-x/s1.jsonl");
+        let subagents = root.join("projects/-work-x/s1/subagents");
+        write(&subagents.join("agent-a1.jsonl"), "{\"type\":\"user\"}\n");
+        let meta = r#"{"agentType":"x","toolUseId":"toolu_1"}"#;
+        write(&subagents.join("agent-a1.meta.json"), meta);
+        let text = dispatching("toolu_1");
+        write(&session, &text);
+        let mut scanner = Scanner::new();
+        let (g, _) = pass(&mut scanner, &root);
+        assert!(matches!(link_of(&g, "a1"), Link::Dispatch { .. }));
+
+        fs::remove_file(&session).expect("delete");
+        let (g, read) = pass(&mut scanner, &root);
+        assert_eq!(read, 0);
+        assert!(g.sessions.is_empty());
+        assert!(matches!(
+            link_of(&g, "a1"),
+            Link::Unresolved(Unresolved::ToolUseNotFound { .. })
+        ));
+        assert!(!scanner.last.contains_key(&session), "entry dropped");
+
+        let back = write(&session, &text);
+        let (g, read) = pass(&mut scanner, &root);
+        assert_eq!(read, back, "read whole again");
+        assert!(matches!(link_of(&g, "a1"), Link::Dispatch { .. }));
+        fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// `finished` is as fresh as a full scan's: every pass reads the metas.
+    #[test]
+    fn a_meta_rewritten_between_passes_is_read_again() {
+        let root = crate::tail::test_dir("scan-meta");
+        let subagents = root.join("projects/-work-x/s1/subagents");
+        write(&subagents.join("agent-a1.jsonl"), "{\"type\":\"user\"}\n");
+        let meta = subagents.join("agent-a1.meta.json");
+        write(&meta, r#"{"agentType":"x"}"#);
+        let mut scanner = Scanner::new();
+        let finished = |g: &Graph| g.subagents[0].meta.as_ref().and_then(|m| m.finished);
+        let (g, _) = pass(&mut scanner, &root);
+        assert_eq!(finished(&g), None);
+
+        write(&meta, r#"{"agentType":"x","finished":true}"#);
+        let (g, read) = pass(&mut scanner, &root);
+        assert_eq!(read, 0, "no transcript changed");
+        assert_eq!(finished(&g), Some(true));
+        fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]

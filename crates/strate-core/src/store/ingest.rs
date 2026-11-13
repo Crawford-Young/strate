@@ -137,10 +137,11 @@ pub(super) fn batch(conn: &Connection, batch: &Batch) -> Result<()> {
 /// Code writes at spawn (before the first record) names a `toolUseId`,
 /// and the stored agent of this session whose record holds that tool_use
 /// dispatched it, else the stored sibling its `parentAgentId` names. The
-/// discovery pass that links a new subagent re-reads every transcript
-/// (4 s release on a real 2.3 GB home, ~20 s seen live in a debug build),
-/// so a short-lived worker was drawn and gone with no edge (#109). A
-/// teammate (`teamName`) and a worker with no meta are left to discovery.
+/// discovery pass that links a new subagent runs only when the engine
+/// schedules one, and until #121 it re-read every transcript (4 s release
+/// on a real 2.3 GB home, ~20 s seen live in a debug build), so a
+/// short-lived worker was drawn and gone with no edge (#109). A teammate
+/// (`teamName`) and a worker with no meta are left to discovery.
 fn link_from_meta(
     conn: &Connection,
     id: i64,
