@@ -78,6 +78,8 @@ impl Store {
         // A store from before v3 or v6, or accounted with another price list,
         // in another zone or at another rollup version.
         account::refresh(&tx.tx, zone)?;
+        // Rollups a deferred batch left stale when the last run exited.
+        account::roll_up_stale(&tx.tx)?;
         // A store from before v21, or built by another model version.
         model::refresh(&tx.tx)?;
         tx.commit()?;
@@ -129,6 +131,25 @@ impl Store {
         let tx = self.transaction()?;
         tx.batch(batch)?;
         tx.commit()
+    }
+
+    /// [`Store::ingest`] for a catch-up: the sessions the batch touches are
+    /// marked stale instead of rolled up, so a burst of batches on one
+    /// session costs one rollup ([`Store::roll_up`]), not one per batch
+    /// (#114). The marks commit with the batch.
+    pub fn ingest_deferred(&mut self, batch: &Batch) -> Result<()> {
+        let tx = self.transaction()?;
+        tx.batch_deferred(batch)?;
+        tx.commit()
+    }
+
+    /// Recomputes, in one transaction, the rollups of every session a
+    /// deferred batch left stale; returns how many.
+    pub fn roll_up(&mut self) -> Result<usize> {
+        let tx = self.transaction()?;
+        let n = account::roll_up_stale(&tx.tx)?;
+        tx.commit()?;
+        Ok(n)
     }
 
     /// Stores a discovery graph's sessions, agents and edges in one
@@ -186,18 +207,27 @@ impl Ingest<'_> {
     /// relinks the batch's session: its start and its process root's
     /// continuation edges. Then it re-resolves the agents the batch touched
     /// in the agent model, recomputes the cost, time and context rollups of
-    /// that session and of any session sharing one of the batch's requests,
-    /// and rebuilds the `launch` edges (when the batch stored a `claude
-    /// --bg` launch or its result, or moved its session orchestrator's name,
-    /// start or process root) and the `message` edges (when the launch
-    /// edges changed or the batch stored a cross-session message). All of
+    /// that session, of any session sharing one of the batch's requests and
+    /// of every session a deferred batch left stale, and rebuilds the
+    /// `launch` edges (when the batch stored a `claude --bg` launch or its
+    /// result, or moved its session orchestrator's name, start or process
+    /// root) and the `message` edges (with the launch edges, or when the
+    /// batch stored a cross-session message). All of
     /// these are functions of the stored rows, so batches in any order
     /// converge to a cold build. Meta.json `finished` is the exception,
     /// read from disk: a subagent's batch re-reads it until it is set, but
     /// the meta is mostly written after the last record, so a discovery
     /// pass usually reads it.
     pub fn batch(&self, batch: &Batch) -> Result<()> {
-        ingest::batch(&self.tx, batch)
+        self.batch_deferred(batch)?;
+        account::roll_up_stale(&self.tx).map(drop)
+    }
+
+    /// [`Ingest::batch`], marking the sessions it touches stale instead of
+    /// recomputing their rollups ([`Store::ingest_deferred`]).
+    pub fn batch_deferred(&self, batch: &Batch) -> Result<()> {
+        let touched = ingest::batch(&self.tx, batch)?;
+        account::defer(&self.tx, touched.iter().map(String::as_str))
     }
 
     /// Writes a discovery graph into this transaction.

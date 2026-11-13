@@ -412,9 +412,8 @@ pub(super) fn graph<'a>(
 /// After a batch moved something a launch edge reads (a launch or its
 /// result, an orchestrator's name, start or process root): rebuilds the
 /// launch edges, then the message edges, which read every chain's start
-/// (#133: an earlier link arriving ages its chain), whatever `_messaged`
-/// (the batch stored a cross-session message) says.
-pub(super) fn relaunch(conn: &Connection, _messaged: bool) -> Result<()> {
+/// (#133: an earlier link arriving ages its chain).
+pub(super) fn relaunch(conn: &Connection) -> Result<()> {
     launch_edges(conn)?;
     messages(conn)
 }
