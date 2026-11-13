@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use strate_core::store::Store;
 use strate_core::store::views::{
     self, Audit, AuditFilter, LiveGraph, NeedsYou, NodeKind, Performance, TimelineDay,
-    TranscriptEntry, Workstream, WorkstreamCost,
+    TranscriptPage, Workstream, WorkstreamCost,
 };
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
@@ -68,18 +68,20 @@ pub fn live_graph(reader: State<'_, Reader>, workstream: i64) -> Result<Option<L
     reader.read(|conn| views::live_graph(conn, workstream))
 }
 
-/// Agent row `agent`'s own records as console entries, in transcript
-/// order, every tool call with its result; an unknown agent has none.
+/// What agent row `agent`'s own records gained after event `cursor` (all of
+/// them with none) as console entries, in transcript order, plus results
+/// for calls of earlier pages and the next cursor; an unknown agent has none.
 #[tauri::command(async)]
 pub fn agent_transcript(
     reader: State<'_, Reader>,
     agent: i64,
-) -> Result<Vec<TranscriptEntry>, String> {
-    transcript(&reader, agent)
+    cursor: Option<i64>,
+) -> Result<TranscriptPage, String> {
+    transcript(&reader, agent, cursor)
 }
 
-fn transcript(reader: &Reader, agent: i64) -> Result<Vec<TranscriptEntry>, String> {
-    reader.read(|conn| views::agent_transcript(conn, agent))
+fn transcript(reader: &Reader, agent: i64, cursor: Option<i64>) -> Result<TranscriptPage, String> {
+    reader.read(|conn| views::agent_transcript(conn, agent, cursor))
 }
 
 /// The Audit tree and headline for `filter`, over the stored cells and
@@ -239,15 +241,22 @@ mod tests {
         drop(writer);
 
         let reader = Reader::open(&db).expect("reader");
-        let entries = transcript(&reader, 1).expect("a transcript");
-        let json = serde_json::to_value(&entries).expect("json");
+        let page = transcript(&reader, 1, None).expect("a transcript");
+        let json = serde_json::to_value(&page).expect("json");
+        let id = page.cursor.expect("a cursor");
         assert_eq!(
             json,
-            serde_json::json!([
-                {"timestamp": "2026-10-07T10:00:00.000Z", "kind": "user", "text": "Lorem ipsum."}
-            ])
+            serde_json::json!({
+                "entries": [{"key": format!("{id}:0"), "timestamp": "2026-10-07T10:00:00.000Z",
+                    "kind": "user", "text": "Lorem ipsum."}],
+                "updates": [],
+                "cursor": id,
+            })
         );
-        assert_eq!(transcript(&reader, 99), Ok(vec![]), "an unknown agent");
+        let after = transcript(&reader, 1, Some(id)).expect("after the cursor");
+        assert!(after.entries.is_empty() && after.cursor == Some(id));
+        let unknown = transcript(&reader, 99, None).expect("an unknown agent");
+        assert!(unknown.entries.is_empty() && unknown.cursor.is_none());
         drop(reader);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }

@@ -1,6 +1,7 @@
 // The console body: the selected agent's transcript, read-only, every record in order with its
-// time. It rereads on each store change and follows the newest entry while the reader is at the
-// bottom. Mount one per agent (`key` it by the agent): a new agent starts at its own bottom.
+// time. Each store change reads only what followed the last read (#116): new entries append and
+// results complete their pending calls in place. It follows the newest entry while the reader is at
+// the bottom. Mount one per agent (`key` it by the agent): a new agent starts at its own bottom.
 import {
   EmptyState,
   Transcript,
@@ -12,8 +13,13 @@ import {
   TranscriptUserTurn,
   type TranscriptToolCallProps,
 } from '@crawfordyoung/ui'
-import { useLayoutEffect, useRef, type ReactNode } from 'react'
-import { agentTranscript, type TranscriptEntry, type TranscriptToolStatus } from './api'
+import { useLayoutEffect, useMemo, useRef, type ReactNode } from 'react'
+import {
+  agentTranscript,
+  type TranscriptEntry,
+  type TranscriptPage,
+  type TranscriptToolStatus,
+} from './api'
 import { clockTime } from './format'
 import { useLoad } from './hooks'
 
@@ -59,12 +65,12 @@ function result(call: ToolCall): Pick<TranscriptToolCallProps, 'resultSummary' |
   }
 }
 
-function toolCall(call: ToolCall, key: number, working: boolean): ReactNode {
+function toolCall(call: ToolCall, working: boolean): ReactNode {
   const timestamp = time(call.timestamp)
   // A TodoWrite shows its list; a failed one shows as the failed call it is.
   if (call.todos !== null && call.status !== 'error') {
     return (
-      <TranscriptTodos key={key} title={call.args} timestamp={timestamp}>
+      <TranscriptTodos key={call.key} title={call.args} timestamp={timestamp}>
         {call.todos.map((todo, i) => (
           <TranscriptTodo key={i} status={todo.status}>
             {todo.content}
@@ -75,7 +81,7 @@ function toolCall(call: ToolCall, key: number, working: boolean): ReactNode {
   }
   return (
     <TranscriptToolCall
-      key={key}
+      key={call.key}
       head={call.args}
       status={toolStatus(call.status, working)}
       timestamp={timestamp}
@@ -84,30 +90,65 @@ function toolCall(call: ToolCall, key: number, working: boolean): ReactNode {
   )
 }
 
-function entry(e: TranscriptEntry, key: number, working: boolean): ReactNode {
+function entry(e: TranscriptEntry, working: boolean): ReactNode {
   const timestamp = time(e.timestamp)
   switch (e.kind) {
     case 'user':
       return (
-        <TranscriptUserTurn key={key} timestamp={timestamp} className="whitespace-pre-wrap">
+        <TranscriptUserTurn key={e.key} timestamp={timestamp} className="whitespace-pre-wrap">
           {e.text}
         </TranscriptUserTurn>
       )
     case 'text':
       return (
-        <TranscriptText key={key} timestamp={timestamp} className="whitespace-pre-wrap">
+        <TranscriptText key={e.key} timestamp={timestamp} className="whitespace-pre-wrap">
           {e.text}
         </TranscriptText>
       )
     case 'thinking':
       return (
-        <TranscriptThinking key={key} timestamp={timestamp} className="whitespace-pre-wrap">
+        <TranscriptThinking key={e.key} timestamp={timestamp} className="whitespace-pre-wrap">
           {e.text}
         </TranscriptThinking>
       )
     case 'tool_call':
-      return toolCall(e, key, working)
+      return toolCall(e, working)
   }
+}
+
+/** What the console has read of an agent's transcript, and where its next read starts. */
+interface Read {
+  cursor: number | null
+  entries: TranscriptEntry[]
+}
+
+const UNREAD: Read = { cursor: null, entries: [] }
+
+/**
+ * `read` with `page` added: each update completes the last call with its id (one it never saw
+ * completes none), then the new entries follow. The same entries when the page changes none of
+ * them, and the same read when its cursor did not move either, so nothing redraws.
+ */
+function merged(read: Read, page: TranscriptPage): Read {
+  let entries = read.entries
+  for (const done of page.updates) {
+    const at = entries.reduce(
+      (found, e, i) => (e.kind === 'tool_call' && e.id === done.id ? i : found),
+      -1,
+    )
+    if (at === -1) continue
+    if (entries === read.entries) entries = [...entries]
+    entries[at] = {
+      ...(entries[at] as ToolCall),
+      status: done.status,
+      result: done.result,
+      resultTruncated: done.resultTruncated,
+      resultAt: done.resultAt,
+    }
+  }
+  if (page.entries.length > 0) entries = [...entries, ...page.entries]
+  if (entries === read.entries && page.cursor === read.cursor) return read
+  return { cursor: page.cursor, entries }
 }
 
 interface AgentTranscriptProps {
@@ -115,15 +156,26 @@ interface AgentTranscriptProps {
   agent: number
   /** Whether the agent is at work now: its unanswered calls run, else they wait. */
   working: boolean
-  /** The store version; each bump rereads. */
+  /** The store version; each bump reads what followed the last read. */
   version: number
   /** The id of the visible heading that names the scroll region. */
   labelledBy: string
 }
 
 export function AgentTranscript({ agent, working, version, labelledBy }: AgentTranscriptProps) {
-  const loaded = useLoad(String(agent), version, () => agentTranscript(agent))
-  const entries = loaded && 'value' in loaded ? loaded.value : null
+  const target = String(agent)
+  const loaded = useLoad(target, version, async (last: Read | undefined) => {
+    const read = last ?? UNREAD
+    return merged(read, await agentTranscript(agent, read.cursor))
+  })
+  // Another agent's read never shows under this one, even for the moment before its own lands.
+  const shown = loaded?.target === target ? loaded : null
+  const entries = shown && 'value' in shown ? shown.value.entries : null
+  // Drawn again only when an entry changed: a read that added nothing leaves the list be.
+  const list = useMemo(
+    () => entries && <Transcript>{entries.map((e) => entry(e, working))}</Transcript>,
+    [entries, working],
+  )
   const box = useRef<HTMLDivElement>(null)
   const follow = useRef(true)
   // Each new read lands at the bottom while the reader is there.
@@ -132,10 +184,10 @@ export function AgentTranscript({ agent, working, version, labelledBy }: AgentTr
     if (el && follow.current) el.scrollTop = el.scrollHeight
   }, [entries])
 
-  if (loaded === null) return <EmptyState message="Reading the transcript…" />
-  if ('error' in loaded)
-    return <EmptyState message={`Couldn't read the transcript: ${loaded.error}`} />
-  if (loaded.value.length === 0) return <EmptyState message="No transcript records yet." />
+  if (shown === null) return <EmptyState message="Reading the transcript…" />
+  if ('error' in shown)
+    return <EmptyState message={`Couldn't read the transcript: ${shown.error}`} />
+  if (shown.value.entries.length === 0) return <EmptyState message="No transcript records yet." />
   return (
     // A stop of its own, so the keyboard can scroll it too; the console's heading names it and
     // the list inside carries a name of its own.
@@ -150,8 +202,8 @@ export function AgentTranscript({ agent, working, version, labelledBy }: AgentTr
       }}
       className="relative min-h-0 flex-1 overflow-y-auto p-3"
     >
-      {/* Records are only ever appended, so an index keys each one for good. */}
-      <Transcript>{loaded.value.map((e, i) => entry(e, i, working))}</Transcript>
+      {/* Each entry keeps its record's key for good, so a completed call updates in place. */}
+      {list}
     </div>
   )
 }

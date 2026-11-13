@@ -74,8 +74,8 @@ pub use super::audit::{
 pub use super::model::{ChargeSource, Lane, ModelAgent, agent_model};
 use super::model::{FINISHED_SQL, effective_charge, lane};
 pub use super::transcript::{
-    ARGS_MAX, RESULT_MAX, TranscriptBody, TranscriptEntry, TranscriptTodo, TranscriptTodoStatus,
-    TranscriptToolStatus, agent_transcript,
+    ARGS_MAX, RESULT_MAX, TranscriptBody, TranscriptEntry, TranscriptPage, TranscriptResult,
+    TranscriptTodo, TranscriptTodoStatus, TranscriptToolStatus, agent_transcript,
 };
 use crate::charge::Charge;
 use crate::time::parse_timestamp;

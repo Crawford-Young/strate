@@ -22,6 +22,7 @@ import {
   type Performance,
   type TimelineDay,
   type TranscriptEntry,
+  type TranscriptPage,
 } from './api'
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
@@ -82,11 +83,12 @@ describe('commands', () => {
     expect(invokeMock).toHaveBeenCalledWith('live_graph', { workstream: 7 })
   })
 
-  it('agent_transcript passes the agent row id and returns its entries in order', async () => {
+  it('agent_transcript passes the agent row id and cursor and returns the page after it', async () => {
     const entries: TranscriptEntry[] = [
-      { kind: 'user', text: 'lorem', timestamp: '2026-10-30T10:00:00Z' },
-      { kind: 'thinking', text: 'ipsum', timestamp: null },
+      { key: '4:0', kind: 'user', text: 'lorem', timestamp: '2026-10-30T10:00:00Z' },
+      { key: '5:0', kind: 'thinking', text: 'ipsum', timestamp: null },
       {
+        key: '5:1',
         kind: 'tool_call',
         id: 'toolu_1',
         name: 'TodoWrite',
@@ -98,11 +100,27 @@ describe('commands', () => {
         todos: [{ content: 'dolor', status: 'in_progress' }],
         timestamp: '2026-10-30T10:00:01Z',
       },
-      { kind: 'text', text: 'sit amet', timestamp: '2026-10-30T10:00:03Z' },
+      { key: '6:0', kind: 'text', text: 'sit amet', timestamp: '2026-10-30T10:00:03Z' },
     ]
-    invokeMock.mockResolvedValueOnce(entries)
-    await expect(agentTranscript(12)).resolves.toEqual(entries)
-    expect(invokeMock).toHaveBeenCalledWith('agent_transcript', { agent: 12 })
+    const page: TranscriptPage = {
+      entries,
+      updates: [
+        {
+          id: 'toolu_0',
+          status: 'error',
+          result: 'exit 1',
+          resultTruncated: false,
+          resultAt: '2026-10-30T10:00:00Z',
+        },
+      ],
+      cursor: 6,
+    }
+    invokeMock.mockResolvedValueOnce(page)
+    await expect(agentTranscript(12, 3)).resolves.toEqual(page)
+    expect(invokeMock).toHaveBeenCalledWith('agent_transcript', { agent: 12, cursor: 3 })
+    invokeMock.mockResolvedValueOnce({ entries: [], updates: [], cursor: null })
+    await agentTranscript(12, null)
+    expect(invokeMock).toHaveBeenLastCalledWith('agent_transcript', { agent: 12, cursor: null })
   })
 
   it('audit_rollup passes the filter and returns the tree', async () => {

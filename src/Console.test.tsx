@@ -1,10 +1,28 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react'
-import type { ReactElement } from 'react'
+import type { ComponentProps, ReactElement } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { agentTranscript, type TranscriptEntry } from './api'
+import {
+  agentTranscript,
+  type TranscriptEntry,
+  type TranscriptPage,
+  type TranscriptResult,
+} from './api'
 import { AgentTranscript } from './Console'
 
+const { listRenders } = vi.hoisted(() => ({ listRenders: vi.fn() }))
+
 vi.mock('./api', () => ({ agentTranscript: vi.fn() }))
+// The real list, counted: a read that adds nothing must not draw it again.
+vi.mock('@crawfordyoung/ui', async (importOriginal) => {
+  const ui = await importOriginal<typeof import('@crawfordyoung/ui')>()
+  return {
+    ...ui,
+    Transcript: (props: ComponentProps<typeof ui.Transcript>) => {
+      listRenders()
+      return <ui.Transcript {...props} />
+    },
+  }
+})
 
 const transcriptMock = vi.mocked(agentTranscript)
 
@@ -12,8 +30,41 @@ const transcriptMock = vi.mocked(agentTranscript)
 const at = (h: number, m: number, s: number) => new Date(2026, 9, 30, h, m, s).toISOString()
 
 type ToolCall = Extract<TranscriptEntry, { kind: 'tool_call' }>
+type Unkeyed = TranscriptEntry extends infer E
+  ? E extends unknown
+    ? Omit<E, 'key'>
+    : never
+  : never
 
-function call(over: Partial<ToolCall> & Pick<ToolCall, 'id'>): ToolCall {
+/** The page after which the store's cursor is `cursor`: `entries`, keyed as that record's unless they carry a key. */
+function page(
+  entries: (Unkeyed & { key?: string })[],
+  cursor: number | null,
+  updates: TranscriptResult[] = [],
+): TranscriptPage {
+  return {
+    entries: entries.map((e, i) => ({ key: `${cursor}:${i}`, ...e }) as TranscriptEntry),
+    updates,
+    cursor,
+  }
+}
+
+const text = (t: string, key?: string): Unkeyed & { key?: string } => ({
+  kind: 'text',
+  text: t,
+  timestamp: null,
+  ...(key === undefined ? {} : { key }),
+})
+
+const done = (id: string, result: string): TranscriptResult => ({
+  id,
+  status: 'success',
+  result,
+  resultTruncated: false,
+  resultAt: null,
+})
+
+function call(over: Partial<ToolCall> & Pick<ToolCall, 'id'>): Omit<ToolCall, 'key'> {
   return {
     kind: 'tool_call',
     name: 'Bash',
@@ -35,7 +86,8 @@ function deferred<T>() {
 }
 
 beforeEach(() => {
-  transcriptMock.mockReset().mockResolvedValue([])
+  transcriptMock.mockReset().mockResolvedValue(page([], null))
+  listRenders.mockClear()
 })
 
 const transcript = () => screen.getByRole('list', { name: 'Agent transcript' })
@@ -43,27 +95,37 @@ const transcript = () => screen.getByRole('list', { name: 'Agent transcript' })
 const items = () => [...transcript().children] as HTMLElement[]
 const item = (i: number) => items()[i] as HTMLElement
 
-async function show(entries: TranscriptEntry[], { agent = 7, working = false } = {}) {
-  transcriptMock.mockResolvedValue(entries)
-  const view = render(
-    <AgentTranscript agent={agent} working={working} version={0} labelledBy="heading" />,
-  )
+const view = (version: number, { agent = 7, working = false } = {}) => (
+  <AgentTranscript agent={agent} working={working} version={version} labelledBy="heading" />
+)
+
+async function show(
+  entries: (Unkeyed & { key?: string })[],
+  { agent = 7, working = false, cursor = 1 } = {},
+) {
+  transcriptMock.mockResolvedValue(page(entries, cursor))
+  const shown = render(view(0, { agent, working }))
   await screen.findByRole('list', { name: 'Agent transcript' })
-  return view
+  return shown
+}
+
+/** Bumps the store version to `version` and lets the read it starts land. */
+async function bump(rerender: (ui: ReactElement) => void, version: number, agent = 7) {
+  await act(async () => rerender(view(version, { agent })))
 }
 
 describe('reading', () => {
-  it("reads the agent's own transcript", async () => {
-    await show([{ kind: 'text', text: 'lorem', timestamp: null }], { agent: 12 })
-    expect(transcriptMock).toHaveBeenCalledWith(12)
+  it("reads the agent's own transcript from the start", async () => {
+    await show([text('lorem')], { agent: 12 })
+    expect(transcriptMock).toHaveBeenCalledWith(12, null)
   })
 
   it('says it is reading until the transcript lands', async () => {
-    const pending = deferred<TranscriptEntry[]>()
+    const pending = deferred<TranscriptPage>()
     transcriptMock.mockReturnValue(pending.promise)
-    render(<AgentTranscript agent={7} working={false} version={0} labelledBy="heading" />)
+    render(view(0))
     expect(screen.getByText('Reading the transcript…')).toBeInTheDocument()
-    await act(async () => pending.resolve([{ kind: 'text', text: 'lorem', timestamp: null }]))
+    await act(async () => pending.resolve(page([text('lorem')], 1)))
     expect(screen.queryByText('Reading the transcript…')).not.toBeInTheDocument()
     expect(transcript()).toHaveTextContent('lorem')
   })
@@ -74,7 +136,7 @@ describe('reading', () => {
   })
 
   it('scrolls in one keyboard-reachable container named once, by the list', async () => {
-    await show([{ kind: 'text', text: 'lorem', timestamp: null }])
+    await show([text('lorem')])
     expect(screen.queryByRole('region', { name: 'Transcript' })).not.toBeInTheDocument()
     const list = transcript()
     expect(list).toHaveAccessibleName('Agent transcript')
@@ -91,16 +153,133 @@ describe('reading', () => {
     ).toBeInTheDocument()
   })
 
-  it('rereads on a store change and shows what was added', async () => {
-    const { rerender } = await show([{ kind: 'text', text: 'lorem', timestamp: null }])
-    transcriptMock.mockResolvedValue([
-      { kind: 'text', text: 'lorem', timestamp: null },
-      call({ id: 'toolu_2', status: 'pending' }),
-    ])
-    rerender(<AgentTranscript agent={7} working={false} version={1} labelledBy="heading" />)
-    await screen.findByText('Bash(echo toolu_2)')
-    expect(transcriptMock).toHaveBeenCalledTimes(2)
+  it('reads only what follows its cursor on a store change and appends it', async () => {
+    const { rerender } = await show([text('lorem')], { cursor: 4 })
+    transcriptMock.mockResolvedValue(page([call({ id: 'toolu_2', status: 'pending' })], 9))
+    await bump(rerender, 1)
+    expect(transcriptMock).toHaveBeenLastCalledWith(7, 4)
     expect(items()).toHaveLength(2)
+    expect(item(0)).toHaveTextContent('lorem')
+    expect(item(1)).toHaveTextContent('Bash(echo toolu_2)')
+    transcriptMock.mockResolvedValue(page([text('ipsum')], 11))
+    await bump(rerender, 2)
+    expect(transcriptMock).toHaveBeenLastCalledWith(7, 9)
+    expect(items().map((li) => li.textContent)).toEqual([
+      expect.stringContaining('lorem'),
+      expect.stringContaining('Bash(echo toolu_2)'),
+      expect.stringContaining('ipsum'),
+    ])
+  })
+
+  it('completes a pending call in place when its result arrives in a later read', async () => {
+    const { rerender } = await show(
+      [call({ id: 'toolu_1', status: 'pending', key: '3:0' }), text('lorem', '3:1')],
+      { working: true, cursor: 3 },
+    )
+    const pendingCall = item(0)
+    expect(pendingCall).toHaveAttribute('data-status', 'running')
+    transcriptMock.mockResolvedValue(page([text('ipsum')], 5, [done('toolu_1', 'Found 3 files')]))
+    await bump(rerender, 1)
+    expect(items()).toHaveLength(3)
+    expect(item(0)).toBe(pendingCall)
+    expect(item(0)).toHaveAttribute('data-status', 'success')
+    expect(item(0)).toHaveTextContent('Found 3 files')
+    expect(item(2)).toHaveTextContent('ipsum')
+  })
+
+  it('completes the last call with the id when two share it, and nothing for an id it never saw', async () => {
+    const { rerender } = await show([
+      call({ id: 'toolu_1', result: 'first' }),
+      call({ id: 'toolu_1', status: 'pending', result: null }),
+      call({ id: 'toolu_2', status: 'pending', result: null }),
+    ])
+    transcriptMock.mockResolvedValue(
+      page([], 2, [
+        done('toolu_1', 'second'),
+        done('toolu_9', 'an orphan'),
+        { ...done('toolu_2', 'exit 1'), status: 'error' },
+      ]),
+    )
+    await bump(rerender, 1)
+    expect(item(0)).toHaveTextContent('first')
+    expect(item(1)).toHaveAttribute('data-status', 'success')
+    expect(item(1)).toHaveTextContent('second')
+    expect(item(2)).toHaveAttribute('data-status', 'error')
+    expect(item(2)).toHaveTextContent('exit 1')
+    expect(transcript()).not.toHaveTextContent('an orphan')
+  })
+
+  it('leaves the list undrawn when a store change brings nothing new for the agent', async () => {
+    const { rerender } = await show([text('lorem')], { cursor: 4 })
+    const drawn = listRenders.mock.calls.length
+    // Nothing at all, then records that make no entry, then a result for no call it shows.
+    transcriptMock.mockResolvedValueOnce(page([], 4))
+    await bump(rerender, 1)
+    transcriptMock.mockResolvedValueOnce(page([], 6))
+    await bump(rerender, 2)
+    transcriptMock.mockResolvedValueOnce(page([], 7, [done('toolu_9', 'an orphan')]))
+    await bump(rerender, 3)
+    expect(listRenders).toHaveBeenCalledTimes(drawn)
+    expect(transcriptMock.mock.calls.map(([, cursor]) => cursor)).toEqual([null, 4, 4, 6])
+    transcriptMock.mockResolvedValueOnce(page([text('ipsum')], 8))
+    await bump(rerender, 4)
+    expect(transcriptMock).toHaveBeenLastCalledWith(7, 7)
+    expect(listRenders.mock.calls.length).toBeGreaterThan(drawn)
+    expect(items()).toHaveLength(2)
+  })
+
+  it('reads a newly selected agent from the start, never landing the last one’s read', async () => {
+    const { rerender } = await show([text('seven')], { cursor: 5 })
+    const late = deferred<TranscriptPage>()
+    transcriptMock.mockReturnValueOnce(late.promise)
+    await bump(rerender, 1)
+    transcriptMock.mockResolvedValue(page([text('eight')], 3))
+    await bump(rerender, 1, 8)
+    expect(transcriptMock).toHaveBeenLastCalledWith(8, null)
+    await act(async () => late.resolve(page([text('seven again')], 6)))
+    expect(items().map((li) => li.textContent)).toEqual([expect.stringContaining('eight')])
+    transcriptMock.mockResolvedValue(page([], 3))
+    await bump(rerender, 2, 8)
+    expect(transcriptMock).toHaveBeenLastCalledWith(8, 3)
+  })
+
+  it('shows reading, not the last agent’s transcript, until the new agent’s read lands', async () => {
+    const { rerender } = await show([text('seven')])
+    const pending = deferred<TranscriptPage>()
+    transcriptMock.mockReturnValue(pending.promise)
+    await bump(rerender, 0, 8)
+    expect(screen.getByText('Reading the transcript…')).toBeInTheDocument()
+    expect(screen.queryByText('seven')).not.toBeInTheDocument()
+    await act(async () => pending.resolve(page([text('eight')], 2)))
+    expect(transcript()).toHaveTextContent('eight')
+  })
+
+  it('reads afresh from the start when closed and opened again', async () => {
+    const first = await show([text('first')], { cursor: 5 })
+    first.unmount()
+    await show([text('first', '5:0'), text('later', '6:0')], { cursor: 6 })
+    expect(transcriptMock.mock.calls).toEqual([
+      [7, null],
+      [7, null],
+    ])
+    expect(items().map((li) => li.textContent)).toEqual([
+      expect.stringContaining('first'),
+      expect.stringContaining('later'),
+    ])
+  })
+
+  it('carries on from its last good cursor after a failed read', async () => {
+    const { rerender } = await show([text('lorem')], { cursor: 3 })
+    transcriptMock.mockRejectedValueOnce('database is locked')
+    await bump(rerender, 1)
+    expect(screen.getByText("Couldn't read the transcript: database is locked")).toBeInTheDocument()
+    transcriptMock.mockResolvedValueOnce(page([text('ipsum')], 4))
+    await bump(rerender, 2)
+    expect(transcriptMock).toHaveBeenLastCalledWith(7, 3)
+    expect(items().map((li) => li.textContent)).toEqual([
+      expect.stringContaining('lorem'),
+      expect.stringContaining('ipsum'),
+    ])
   })
 })
 
@@ -312,16 +491,12 @@ describe('following the tail', () => {
   })
 
   const box = () => transcript().parentElement as HTMLElement
-  const entry = (n: number): TranscriptEntry => ({
-    kind: 'text',
-    text: `entry ${n}`,
-    timestamp: null,
-  })
+  const entry = (n: number) => text(`entry ${n}`)
 
   async function grow(rerender: (ui: ReactElement) => void, version: number) {
     metrics.content += 300
-    transcriptMock.mockResolvedValue(Array.from({ length: version + 1 }, (_, i) => entry(i)))
-    rerender(<AgentTranscript agent={7} working={false} version={version} labelledBy="heading" />)
+    transcriptMock.mockResolvedValue(page([entry(version)], version + 1))
+    rerender(view(version))
     await screen.findByText(`entry ${version}`)
   }
 

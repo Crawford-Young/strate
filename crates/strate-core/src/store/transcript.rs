@@ -17,6 +17,9 @@
 //!   call by `tool_use_id`: `error` when `is_error`, else `success`, with
 //!   the result's text capped at [`RESULT_MAX`] chars and the record's time.
 //!   A call with no result yet is `pending`.
+//! - Read by cursor (#116): a page holds the records after the last event id
+//!   the console saw, and a result whose call came in an earlier page rides
+//!   along as an update for the console to complete it in place.
 
 use std::collections::HashMap;
 
@@ -61,6 +64,8 @@ pub struct TranscriptTodo {
 /// One entry of an agent's transcript.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TranscriptEntry {
+    /// `<event id>:<n>`, the record's nth entry: the same on every read.
+    pub key: String,
     /// The record's ISO time.
     pub timestamp: Option<String>,
     #[serde(flatten)]
@@ -99,35 +104,88 @@ pub enum TranscriptBody {
     },
 }
 
+/// A tool result for a call that is not in its page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptResult {
+    /// The tool_use id it answers.
+    pub id: String,
+    /// `success` or `error`.
+    pub status: TranscriptToolStatus,
+    /// At most [`RESULT_MAX`] chars.
+    pub result: String,
+    pub result_truncated: bool,
+    /// The result record's time.
+    pub result_at: Option<String>,
+}
+
+/// What an agent's transcript gained after a cursor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TranscriptPage {
+    /// The entries of the records after the cursor, every call among them
+    /// completed by the results among them.
+    pub entries: Vec<TranscriptEntry>,
+    /// The results among them whose call is not in `entries`, in stored
+    /// order: an earlier page's call, which the reader completes in place
+    /// (the last one with that id), or an orphan, which matches none.
+    pub updates: Vec<TranscriptResult>,
+    /// The last event id read, the next read's cursor; the given cursor
+    /// when nothing was.
+    pub cursor: Option<i64>,
+}
+
 /// [`agent_transcript`]'s query: the agent row's own user and assistant
-/// records, by the `events_agent` index, in stored order.
-const TRANSCRIPT_SQL: &str = "SELECT e.raw FROM agents AS a
+/// records after a cursor, by the `events_agent` index, in stored order.
+const TRANSCRIPT_SQL: &str = "SELECT e.id, e.raw FROM agents AS a
      JOIN events AS e ON e.session_id = a.session_id AND e.agent_id IS a.agent_id
-     WHERE a.id = ?1 AND e.type IN ('user', 'assistant')
+     WHERE a.id = ?1 AND e.type IN ('user', 'assistant') AND e.id > ?2
      ORDER BY e.id";
 
-/// Agent row `agent`'s transcript; empty for an unknown agent.
-pub fn agent_transcript(conn: &Connection, agent: i64) -> Result<Vec<TranscriptEntry>> {
+/// What agent row `agent`'s transcript gained after event `cursor` (all of
+/// it with none); empty for an unknown agent. A page read from each page's
+/// cursor in turn, its updates applied before its entries are appended,
+/// adds up to the read with none: an agent's events only ever gain ids
+/// above its stored ones.
+pub fn agent_transcript(
+    conn: &Connection,
+    agent: i64,
+    cursor: Option<i64>,
+) -> Result<TranscriptPage> {
     let mut stmt = conn.prepare_cached(TRANSCRIPT_SQL)?;
-    let raws = stmt.query_map([agent], |r| r.get::<_, String>(0))?;
+    let rows = stmt.query_map((agent, cursor.unwrap_or(i64::MIN)), |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    })?;
     let mut transcript = Transcript::default();
-    for raw in raws {
-        transcript.push(&raw?);
+    let mut last = cursor;
+    for row in rows {
+        let (id, raw) = row?;
+        transcript.push(id, &raw);
+        last = Some(id);
     }
-    Ok(transcript.entries)
+    Ok(TranscriptPage {
+        entries: transcript.entries,
+        updates: transcript.updates,
+        cursor: last,
+    })
 }
 
 /// The entries so far, and where each pending call is.
 #[derive(Default)]
 struct Transcript {
     entries: Vec<TranscriptEntry>,
+    updates: Vec<TranscriptResult>,
     calls: HashMap<String, usize>,
+    /// The record being read: its event id, and how many entries it gave.
+    event: i64,
+    given: usize,
 }
 
 impl Transcript {
-    /// Adds the entries of one raw record; a record that is not JSON adds
-    /// nothing.
-    fn push(&mut self, raw: &str) {
+    /// Adds the entries of one raw record, event `event`; a record that is
+    /// not JSON adds nothing.
+    fn push(&mut self, event: i64, raw: &str) {
+        self.event = event;
+        self.given = 0;
         let Ok(record) = serde_json::from_str::<Value>(raw) else {
             return;
         };
@@ -146,9 +204,11 @@ impl Transcript {
 
     fn add(&mut self, timestamp: &Option<String>, body: TranscriptBody) {
         self.entries.push(TranscriptEntry {
+            key: format!("{}:{}", self.event, self.given),
             timestamp: timestamp.clone(),
             body,
         });
+        self.given += 1;
     }
 
     fn assistant(&mut self, content: &Value, timestamp: Option<String>) {
@@ -246,33 +306,47 @@ impl Transcript {
         }
     }
 
-    /// Completes the call `block` (a tool_result) answers, if any.
+    /// Completes the call `block` (a tool_result) answers if it is in the
+    /// page, else keeps it as an update; a result with no id answers none.
     fn result(&mut self, block: &Value, timestamp: &Option<String>) {
-        let Some(&at) = block["tool_use_id"]
-            .as_str()
-            .and_then(|id| self.calls.get(id))
-        else {
+        let Some(id) = block["tool_use_id"].as_str().filter(|id| !id.is_empty()) else {
             return;
         };
-        let TranscriptBody::ToolCall {
+        let (text, truncated) = capped(result_text(&block["content"]), RESULT_MAX);
+        let done = TranscriptResult {
+            id: id.to_string(),
+            status: if flagged(block, "is_error") {
+                TranscriptToolStatus::Error
+            } else {
+                TranscriptToolStatus::Success
+            },
+            result: text,
+            result_truncated: truncated,
+            result_at: timestamp.clone(),
+        };
+        match self.calls.get(id) {
+            Some(&at) => done.complete(&mut self.entries[at].body),
+            None => self.updates.push(done),
+        }
+    }
+}
+
+impl TranscriptResult {
+    /// Completes `body` with this result, when it is a call.
+    fn complete(self, body: &mut TranscriptBody) {
+        if let TranscriptBody::ToolCall {
             status,
             result,
             result_truncated,
             result_at,
             ..
-        } = &mut self.entries[at].body
-        else {
-            return;
-        };
-        let (text, truncated) = capped(result_text(&block["content"]), RESULT_MAX);
-        *status = if flagged(block, "is_error") {
-            TranscriptToolStatus::Error
-        } else {
-            TranscriptToolStatus::Success
-        };
-        *result = Some(text);
-        *result_truncated = truncated;
-        result_at.clone_from(timestamp);
+        } = body
+        {
+            *status = self.status;
+            *result = Some(self.result);
+            *result_truncated = self.result_truncated;
+            *result_at = self.result_at;
+        }
     }
 }
 
@@ -470,13 +544,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// The entries of `records`, each serialized as a JSON line.
+    /// The entries of `records`, each serialized as a JSON line, keys
+    /// blanked: the parsing tests compare what an entry says.
     fn entries(records: &[Value]) -> Vec<TranscriptEntry> {
         let mut t = Transcript::default();
-        for r in records {
-            t.push(&r.to_string());
+        for (i, r) in (1..).zip(records) {
+            t.push(i, &r.to_string());
         }
         t.entries
+            .into_iter()
+            .map(|e| TranscriptEntry {
+                key: String::new(),
+                ..e
+            })
+            .collect()
     }
 
     fn at(n: u32) -> String {
@@ -509,6 +590,7 @@ mod tests {
 
     fn entry(n: u32, body: TranscriptBody) -> TranscriptEntry {
         TranscriptEntry {
+            key: String::new(),
             timestamp: Some(at(n)),
             body,
         }
@@ -549,7 +631,7 @@ mod tests {
         assert_eq!(got, [said(1, "Lorem ipsum."), said(6, "Dolor\nsit.")]);
         assert!(entries(&[]).is_empty());
         let mut t = Transcript::default();
-        t.push("{not json");
+        t.push(1, "{not json");
         assert!(t.entries.is_empty());
     }
 
@@ -955,26 +1037,260 @@ mod tests {
 
     /// The shape `src/api.ts` declares.
     #[test]
-    fn entries_serialize_in_the_webview_shape() {
-        let got = entries(&[
-            tool_use(
+    fn a_page_serializes_in_the_webview_shape() {
+        let mut t = Transcript::default();
+        t.push(
+            4,
+            &tool_use(
                 1,
                 "t1",
                 "TodoWrite",
                 json!({"todos": [{"content": "Lorem", "status": "in_progress"}]}),
-            ),
-            user(2, json!("Ipsum.")),
-        ]);
-        assert_eq!(
-            serde_json::to_value(&got).expect("json"),
-            json!([
-                {"timestamp": at(1), "kind": "tool_call", "id": "t1", "name": "TodoWrite",
-                    "args": "TodoWrite(1 todos)", "status": "pending", "result": null,
-                    "resultTruncated": false, "resultAt": null,
-                    "todos": [{"content": "Lorem", "status": "in_progress"}]},
-                {"timestamp": at(2), "kind": "user", "text": "Ipsum."},
-            ])
+            )
+            .to_string(),
         );
+        t.push(5, &user(2, json!("Ipsum.")).to_string());
+        t.push(6, &result(3, "t0", json!("Dolor."), true).to_string());
+        let page = TranscriptPage {
+            entries: t.entries,
+            updates: t.updates,
+            cursor: Some(6),
+        };
+        assert_eq!(
+            serde_json::to_value(&page).expect("json"),
+            json!({
+                "entries": [
+                    {"key": "4:0", "timestamp": at(1), "kind": "tool_call", "id": "t1",
+                        "name": "TodoWrite", "args": "TodoWrite(1 todos)", "status": "pending",
+                        "result": null, "resultTruncated": false, "resultAt": null,
+                        "todos": [{"content": "Lorem", "status": "in_progress"}]},
+                    {"key": "5:0", "timestamp": at(2), "kind": "user", "text": "Ipsum."},
+                ],
+                "updates": [
+                    {"id": "t0", "status": "error", "result": "Dolor.", "resultTruncated": false,
+                        "resultAt": at(3)},
+                ],
+                "cursor": 6,
+            })
+        );
+    }
+
+    #[test]
+    fn an_entry_is_keyed_by_its_event_and_its_place_in_the_record() {
+        let mut t = Transcript::default();
+        t.push(
+            7,
+            &assistant(
+                1,
+                json!([{"type": "thinking", "thinking": "", "signature": "c2ln"},
+                {"type": "thinking", "thinking": "Lorem."}, {"type": "text", "text": "Ipsum."},
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}]),
+            )
+            .to_string(),
+        );
+        t.push(9, &user(2, json!("   ")).to_string());
+        t.push(12, &user(3, json!("Dolor.")).to_string());
+        let keys: Vec<_> = t.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["7:0", "7:1", "7:2", "12:0"],
+            "a skipped block takes no place"
+        );
+    }
+
+    #[test]
+    fn a_result_whose_call_is_not_in_the_page_is_an_update() {
+        use TranscriptToolStatus::*;
+        let long = "x".repeat(RESULT_MAX + 1);
+        let mut t = Transcript::default();
+        let records = [
+            tool_use(1, "t2", "Read", json!({"file_path": "/work/x"})),
+            result(2, "t1", json!("Lorem."), false),
+            result(3, "t2", json!("Ipsum."), true),
+            result(4, "t3", json!(long), false),
+            result(5, "", json!("No call."), false),
+            user(
+                6,
+                json!([{"type": "tool_result", "content": "No id.", "is_error": false}]),
+            ),
+        ];
+        for (i, r) in (1..).zip(&records) {
+            t.push(i, &r.to_string());
+        }
+        assert_eq!(
+            t.updates,
+            [
+                TranscriptResult {
+                    id: "t1".into(),
+                    status: Success,
+                    result: "Lorem.".into(),
+                    result_truncated: false,
+                    result_at: Some(at(2)),
+                },
+                TranscriptResult {
+                    id: "t3".into(),
+                    status: Success,
+                    result: "x".repeat(RESULT_MAX),
+                    result_truncated: true,
+                    result_at: Some(at(4)),
+                },
+            ],
+            "a result with no id answers nothing"
+        );
+        assert_eq!(
+            call(&t.entries[0]),
+            (
+                "t2",
+                "Read(/work/x)",
+                Error,
+                Some("Ipsum."),
+                false,
+                Some(at(3).as_str())
+            ),
+            "a call in the page is completed in it"
+        );
+    }
+
+    /// Stores `raw` as the next event of `session`'s agent `agent_id`, typed
+    /// by its `type` (`user` when it is no JSON).
+    fn insert(conn: &Connection, session: &str, agent_id: Option<&str>, raw: &str) {
+        let kind = serde_json::from_str::<Value>(raw)
+            .ok()
+            .and_then(|v| v["type"].as_str().map(str::to_string))
+            .unwrap_or_else(|| "user".into());
+        conn.execute(
+            "INSERT INTO events (session_id, agent_id, type, file, byte_offset, raw)
+             VALUES (?1, ?2, ?3, ?1, (SELECT count(*) FROM events), ?4)",
+            (session, agent_id, kind, raw),
+        )
+        .expect("event");
+    }
+
+    /// `page` added to `all` as the console does: each update completes the
+    /// last call with its id, if any, then the entries are appended.
+    fn accumulate(all: &mut Vec<TranscriptEntry>, page: TranscriptPage) {
+        for done in page.updates {
+            let call = all.iter_mut().rev().find_map(|e| match &mut e.body {
+                TranscriptBody::ToolCall {
+                    id,
+                    status,
+                    result,
+                    result_truncated,
+                    result_at,
+                    ..
+                } if *id == done.id => Some((status, result, result_truncated, result_at)),
+                _ => None,
+            });
+            if let Some((status, result, truncated, at)) = call {
+                *status = done.status;
+                *result = Some(done.result);
+                *truncated = done.result_truncated;
+                *at = done.result_at;
+            }
+        }
+        all.extend(page.entries);
+    }
+
+    /// Records whose calls are answered at every distance, together with the
+    /// synthetic demo session's own lines.
+    fn stepped_records() -> Vec<String> {
+        let fixture = include_str!(
+            "../../tests/fixtures/claude-home/projects/-work-demo-repo/5e55a0a0-0000-4000-8000-00000000000a.jsonl"
+        );
+        let records = [
+            user(1, json!("Lorem ipsum.")),
+            assistant(
+                2,
+                json!([{"type": "thinking", "thinking": "Dolor."}, {"type": "text", "text": "Sit."},
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}},
+                {"type": "tool_use", "id": "t2", "name": "Read", "input": {"file_path": "/work/a"}}]),
+            ),
+            result(3, "t1", json!("Amet."), false),
+            assistant(4, json!("Consectetur.")),
+            json!({"type": "user", "isMeta": true, "timestamp": at(5),
+                "message": {"role": "user", "content": "Lorem caveat."}}),
+            result(6, "t2", json!("Adipiscing."), true),
+            tool_use(
+                7,
+                "t3",
+                "TodoWrite",
+                json!({"todos": [{"content": "Elit", "status": "pending"}]}),
+            ),
+            user(
+                8,
+                json!([{"type": "tool_result", "tool_use_id": "t3", "content": "Ok."},
+                {"type": "text", "text": "Sed do."}]),
+            ),
+            result(9, "t9", json!("An orphan."), false),
+            tool_use(10, "t1", "Bash", json!({"command": "pwd"})),
+            tool_use(11, "", "Grep", json!({"pattern": "x"})),
+            result(12, "", json!("No call."), false),
+            tool_use(13, "t4", "Glob", json!({"pattern": "*.rs"})),
+            result(14, "t1", json!("/work"), false),
+        ];
+        let mut raws: Vec<String> = records.iter().map(Value::to_string).collect();
+        raws.push("{not json".into());
+        raws.extend(fixture.lines().map(str::to_string));
+        raws
+    }
+
+    #[test]
+    fn fed_in_steps_the_pages_add_up_to_the_one_shot_read() {
+        let dir = crate::tail::test_dir("transcript-steps");
+        let store = super::super::Store::open_in(dir.join("strate.db"), "UTC").expect("open");
+        let conn = super::super::Store::open_reader(dir.join("strate.db")).expect("reader");
+        let raws = stepped_records();
+        let mut updated = false;
+        // Agent row `step` reads its records `step` at a time.
+        for step in 1..=raws.len() {
+            let session = format!("s{step}");
+            store
+                .conn
+                .execute("INSERT INTO sessions (session_id) VALUES (?1)", [&session])
+                .expect("session");
+            store
+                .conn
+                .execute(
+                    "INSERT INTO agents (id, session_id, agent_id, kind)
+                     VALUES (?1, ?2, NULL, 'orchestrator')",
+                    (step as i64, &session),
+                )
+                .expect("agent");
+            let mut all = Vec::new();
+            let mut cursor = None;
+            for chunk in raws.chunks(step) {
+                for raw in chunk {
+                    insert(&store.conn, &session, None, raw);
+                }
+                // Another agent's record lands between reads.
+                insert(
+                    &store.conn,
+                    &session,
+                    Some("w"),
+                    &user(1, json!("Not its.")).to_string(),
+                );
+                let page = agent_transcript(&conn, step as i64, cursor).expect("page");
+                updated |= !page.updates.is_empty();
+                cursor = page.cursor;
+                accumulate(&mut all, page);
+                let again = agent_transcript(&conn, step as i64, cursor).expect("again");
+                assert_eq!(
+                    again,
+                    TranscriptPage {
+                        entries: vec![],
+                        updates: vec![],
+                        cursor
+                    },
+                    "nothing new is nothing"
+                );
+            }
+            let whole = agent_transcript(&conn, step as i64, None).expect("whole");
+            assert_eq!(all, whole.entries, "{step} at a time");
+            assert_eq!(cursor, whole.cursor);
+        }
+        assert!(updated, "some result completed an earlier page's call");
+        drop((conn, store));
+        std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
     /// A store holding agent rows 1 (session s's orchestrator) and 2 (its
@@ -1005,30 +1321,52 @@ mod tests {
         );
         store.conn.execute_batch(&sql).expect("seed");
         let conn = super::super::Store::open_reader(dir.join("strate.db")).expect("reader");
-        assert_eq!(
-            agent_transcript(&conn, 1).expect("orchestrator"),
-            [
-                said(1, "Lorem."),
-                entry(
-                    3,
-                    TranscriptBody::Text {
-                        text: "Dolor.".into()
-                    }
-                )
-            ]
+        let keyed = |key: &str, e: TranscriptEntry| TranscriptEntry {
+            key: key.into(),
+            ..e
+        };
+        let page = |entries, cursor| TranscriptPage {
+            entries,
+            updates: vec![],
+            cursor,
+        };
+        let dolor = entry(
+            3,
+            TranscriptBody::Text {
+                text: "Dolor.".into(),
+            },
         );
         assert_eq!(
-            agent_transcript(&conn, 2).expect("subagent"),
-            [said(2, "Ipsum.")]
+            agent_transcript(&conn, 1, None).expect("orchestrator"),
+            page(
+                vec![keyed("1:0", said(1, "Lorem.")), keyed("3:0", dolor.clone())],
+                Some(3)
+            )
         );
-        assert_eq!(agent_transcript(&conn, 99).expect("unknown"), []);
+        assert_eq!(
+            agent_transcript(&conn, 1, Some(1)).expect("after the first"),
+            page(vec![keyed("3:0", dolor)], Some(3)),
+        );
+        assert_eq!(
+            agent_transcript(&conn, 1, Some(3)).expect("after the last"),
+            page(vec![], Some(3)),
+            "nothing new keeps the cursor"
+        );
+        assert_eq!(
+            agent_transcript(&conn, 2, None).expect("subagent"),
+            page(vec![keyed("2:0", said(2, "Ipsum."))], Some(2))
+        );
+        assert_eq!(
+            agent_transcript(&conn, 99, None).expect("unknown"),
+            page(vec![], None)
+        );
         assert_eq!(
             super::super::query_plan(&conn, TRANSCRIPT_SQL),
             [
                 "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)",
-                "SEARCH e USING INDEX events_agent (session_id=? AND agent_id=?)",
+                "SEARCH e USING INDEX events_agent (session_id=? AND agent_id=? AND rowid>?)",
             ],
-            "the index yields rowid order: no sort"
+            "the index seeks past the cursor and yields rowid order: no sort"
         );
         drop((conn, store));
         std::fs::remove_dir_all(dir).expect("cleanup");
