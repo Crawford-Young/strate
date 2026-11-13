@@ -586,9 +586,9 @@ fn drawn_edges(h: &Home, session: &str) -> Vec<(String, Option<String>, Option<S
 #[test]
 fn a_nested_background_dispatch_hangs_under_its_dispatcher_before_discovery_links_it() {
     // The live sequence (#109 QA): code-20's subagent qa dispatches a
-    // background haiku. The discovery pass that links it re-reads every
-    // transcript, which took ~20 s on a real home, so the child's records
-    // land and it is drawn before any pass stores its dispatch edge.
+    // background haiku. The discovery pass that links it re-read every
+    // transcript until #121, which took ~20 s on a real home, so the child's
+    // records land and it is drawn before any pass stores its dispatch edge.
     let mut h = Home::new("lanes-nested-unlinked");
     h.store
         .apply_registry(&[background("aaaa0001", "s1", None)])
