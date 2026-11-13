@@ -286,7 +286,7 @@ describe('reading', () => {
 describe('entries', () => {
   it('shows every entry in transcript order, each at its time', async () => {
     await show([
-      { kind: 'user', text: 'Fix the build', timestamp: at(14, 2, 11) },
+      { kind: 'user', text: 'Fix the build', sender: null, timestamp: at(14, 2, 11) },
       { kind: 'thinking', text: 'consider it', timestamp: at(14, 2, 12) },
       { kind: 'text', text: 'On it.', timestamp: at(14, 2, 13) },
       call({ id: 'toolu_1', args: 'Read(src/main.ts)', timestamp: at(14, 2, 14) }),
@@ -325,13 +325,27 @@ describe('entries', () => {
   })
 
   it('marks a human prompt as the user', async () => {
-    await show([{ kind: 'user', text: 'Fix the build', timestamp: null }])
+    await show([{ kind: 'user', text: 'Fix the build', sender: null, timestamp: null }])
     expect(item(0)).toHaveTextContent('User: Fix the build')
+  })
+
+  it('names who sent a teammate or cross-session turn, inside the turn, and only then', async () => {
+    await show([
+      { kind: 'user', text: 'Fix the build', sender: null, timestamp: null },
+      { kind: 'user', text: 'Please review', sender: 'lorem-mate', timestamp: null },
+      { kind: 'user', text: 'Status?', sender: 'ipsum-lead', timestamp: null },
+    ])
+    expect(item(0)).toHaveTextContent(/User: Fix the build$/)
+    expect(item(1)).toHaveTextContent('From lorem-mate')
+    expect(item(1)).toHaveTextContent('Please review')
+    expect(item(2)).toHaveTextContent('From ipsum-lead')
+    expect(item(2)).toHaveTextContent('Status?')
+    expect(screen.getAllByText(/^From /)).toHaveLength(2)
   })
 
   it('keeps the line breaks of prompts and replies', async () => {
     await show([
-      { kind: 'user', text: 'one\ntwo', timestamp: null },
+      { kind: 'user', text: 'one\ntwo', sender: null, timestamp: null },
       { kind: 'text', text: 'three\nfour', timestamp: null },
     ])
     expect(item(0)).toHaveClass('whitespace-pre-wrap')

@@ -7,7 +7,11 @@
 //!   `<task-notification`), command noise (text opening `<command-` or
 //!   `<local-command-`) or only carries tool results. A slash command's
 //!   record reads as `/name args`. A `<teammate-message>` is the teammate's
-//!   prompt, its tags stripped, as is a `<cross-session-message>`. Every
+//!   prompt, its tags stripped, as is a `<cross-session-message>`: blocks
+//!   are found anywhere in the text, one entry per block in text order, its
+//!   `sender` the block's `teammate_id`, or `from-name` (else `from`) for a
+//!   cross-session one, none when the tag names no one; the text before,
+//!   between and after blocks is an entry of its own, no sender. Every
 //!   `<system-reminder>` and `<side-sessions-event>` block is stripped first;
 //!   a record with nothing left is none.
 //! - An `assistant` record gives one entry per text, thinking or tool_use
@@ -80,8 +84,11 @@ pub struct TranscriptEntry {
     rename_all_fields = "camelCase"
 )]
 pub enum TranscriptBody {
-    /// A prompt.
-    User { text: String },
+    /// A prompt; `sender` names who sent a teammate or cross-session one.
+    User {
+        text: String,
+        sender: Option<String>,
+    },
     /// An assistant text block.
     Text { text: String },
     /// A thinking block with text.
@@ -285,12 +292,18 @@ impl Transcript {
         );
         let trimmed = text.trim();
         if let Some(command) = slash_command(trimmed) {
-            self.add(&timestamp, TranscriptBody::User { text: command });
-        } else if let Some(inner) = tag_blocks(trimmed, "teammate-message")
-            .or_else(|| tag_blocks(trimmed, "cross-session-message"))
-        {
-            if !inner.is_empty() {
-                self.add(&timestamp, TranscriptBody::User { text: inner });
+            self.add(
+                &timestamp,
+                TranscriptBody::User {
+                    text: command,
+                    sender: None,
+                },
+            );
+        } else if let Some(blocks) = tag_blocks(trimmed) {
+            // One entry per block, each with its own sender, and one per
+            // run of text around them.
+            for (sender, text) in blocks {
+                self.add(&timestamp, TranscriptBody::User { text, sender });
             }
         } else if !trimmed.is_empty()
             && !trimmed.starts_with("<side-sessions-event")
@@ -301,6 +314,7 @@ impl Transcript {
                 &timestamp,
                 TranscriptBody::User {
                     text: trimmed.to_string(),
+                    sender: None,
                 },
             );
         }
@@ -396,36 +410,117 @@ fn slash_command(text: &str) -> Option<String> {
 }
 
 /// The index of the `>` ending an open tag's attributes in `s`, skipping any
-/// inside a double-quoted attribute value.
+/// inside a quoted (`"` or `'`) attribute value.
 fn open_end(s: &str) -> Option<usize> {
-    let mut quoted = false;
+    let mut quote = None;
     for (i, c) in s.char_indices() {
-        match c {
-            '"' => quoted = !quoted,
-            '>' if !quoted => return Some(i),
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), _) if q == c => quote = None,
+            (None, '>') => return Some(i),
             _ => {}
         }
     }
     None
 }
 
-/// The inner texts, trimmed, of the `<tag ...>` blocks `text` opens with,
-/// joined by a blank line; `None` if it opens with none.
-fn tag_blocks(text: &str, tag: &str) -> Option<String> {
+/// The first of `names` that the open tag's `attrs` gives a non-empty
+/// value, read as `name=` then a single- or double-quoted value, after any
+/// whitespace; a value's own text is never read as an attribute.
+fn attribute(attrs: &str, names: &[&str]) -> Option<String> {
+    let mut found: Vec<(&str, &str)> = Vec::new();
+    let mut rest = attrs;
+    loop {
+        rest = rest.trim_start();
+        let name_end = rest
+            .find(|c: char| c == '=' || c.is_whitespace())
+            .unwrap_or(rest.len());
+        let (name, after) = rest.split_at(name_end);
+        let Some(after) = after.trim_start().strip_prefix('=') else {
+            if name.is_empty() {
+                break;
+            }
+            rest = after;
+            continue;
+        };
+        let after = after.trim_start();
+        let Some(quote) = after.chars().next().filter(|c| matches!(c, '"' | '\'')) else {
+            break;
+        };
+        let Some((value, next)) = after[1..].split_once(quote) else {
+            break;
+        };
+        found.push((name, value));
+        rest = next;
+    }
+    names.iter().find_map(|name| {
+        found
+            .iter()
+            .find(|(n, v)| n == name && !v.is_empty())
+            .map(|(_, v)| v.to_string())
+    })
+}
+
+/// The first closed `<tag ...>…</tag>` block in `text`: where it starts and
+/// ends, its open tag's attributes and its inner text. The tag name ends at
+/// whitespace or `>`, so `<tag-s` is another tag.
+fn next_block<'a>(text: &'a str, tag: &str) -> Option<(usize, usize, &'a str, &'a str)> {
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
-    if !text.starts_with(&open) {
-        return None;
-    }
-    let mut inner = Vec::new();
-    for block in text.split(&open).skip(1) {
-        let rest = &block[open_end(block)? + 1..];
-        let body = rest.split(&close).next().unwrap_or(rest).trim();
-        if !body.is_empty() {
-            inner.push(body);
+    let mut from = 0;
+    while let Some(at) = text[from..].find(&open).map(|i| i + from) {
+        from = at + open.len();
+        let after = &text[from..];
+        if !after.starts_with(|c: char| c == '>' || c.is_whitespace()) {
+            continue;
+        }
+        let Some(end) = open_end(after) else {
+            continue;
+        };
+        let body = from + end + 1;
+        if let Some(c) = text[body..].find(&close) {
+            return Some((
+                at,
+                body + c + close.len(),
+                &after[..end],
+                &text[body..body + c],
+            ));
         }
     }
-    Some(inner.join("\n\n"))
+    None
+}
+
+/// Each prompt entry `text` holds when it has a teammate-message or
+/// cross-session-message block anywhere: a block as its sender (the first of
+/// its tag's sender attributes its open tag carries, if any) and its inner
+/// text, trimmed, and each run of text around the blocks as a sender-less
+/// one, in text order; empty ones are skipped. `None` if there is no block.
+fn tag_blocks(text: &str) -> Option<Vec<(Option<String>, String)>> {
+    const TAGS: [(&str, &[&str]); 2] = [
+        ("teammate-message", &["teammate_id"]),
+        ("cross-session-message", &["from-name", "from"]),
+    ];
+    let mut out = Vec::new();
+    let mut rest = text;
+    let mut any = false;
+    let mut keep = |sender: Option<String>, run: &str| {
+        let run = run.trim();
+        if !run.is_empty() {
+            out.push((sender, run.to_string()));
+        }
+    };
+    while let Some((senders, (start, end, attrs, body))) = TAGS
+        .iter()
+        .filter_map(|(tag, senders)| next_block(rest, tag).map(|b| (*senders, b)))
+        .min_by_key(|(_, b)| b.0)
+    {
+        any = true;
+        keep(None, &rest[..start]);
+        keep(attribute(attrs, senders), body);
+        rest = &rest[end..];
+    }
+    keep(None, rest);
+    any.then_some(out)
 }
 
 /// `text` without its closed `<tag ...>…</tag>` blocks, wherever they sit.
@@ -597,7 +692,24 @@ mod tests {
     }
 
     fn said(n: u32, text: &str) -> TranscriptEntry {
-        entry(n, TranscriptBody::User { text: text.into() })
+        entry(
+            n,
+            TranscriptBody::User {
+                text: text.into(),
+                sender: None,
+            },
+        )
+    }
+
+    /// A prompt entry whose sender is `sender`.
+    fn sent(n: u32, text: &str, sender: &str) -> TranscriptEntry {
+        entry(
+            n,
+            TranscriptBody::User {
+                text: text.into(),
+                sender: Some(sender.into()),
+            },
+        )
     }
 
     #[test]
@@ -708,8 +820,173 @@ mod tests {
         assert_eq!(
             got,
             [
-                said(1, "Lorem ipsum."),
-                said(2, "Lorem ipsum.\n\nDolor sit.")
+                sent(1, "Lorem ipsum.", "team-lead"),
+                sent(2, "Lorem ipsum.", "team-lead"),
+                sent(2, "Dolor sit.", "team-lead"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_sender_is_the_teammate_id_else_the_cross_session_from_name_else_from() {
+        let cross = |attrs: &str| {
+            json!(format!(
+                "<cross-session-message {attrs}>\nLorem.\n</cross-session-message>"
+            ))
+        };
+        let got = entries(&[
+            user(1, cross("from=\"a\" from-name=\"\"")),
+            user(2, cross("from-name=\"b\"")),
+            user(3, cross("summary=\"x\"")),
+            user(
+                4,
+                json!(
+                    "<teammate-message teammate_id=\"\" from=\"z\">\nLorem.\n</teammate-message>"
+                ),
+            ),
+        ]);
+        let sender: Vec<_> = got
+            .iter()
+            .map(|e| match &e.body {
+                TranscriptBody::User { sender, .. } => sender.as_deref(),
+                _ => unreachable!("prompts only"),
+            })
+            .collect();
+        assert_eq!(
+            sender,
+            [Some("a"), Some("b"), None, None],
+            "an empty or missing attribute names no one; a teammate has no `from`"
+        );
+    }
+
+    fn tm(attrs: &str, inner: &str) -> String {
+        format!("<teammate-message{attrs}>\n{inner}\n</teammate-message>")
+    }
+
+    #[test]
+    fn blocks_are_found_anywhere_and_the_text_around_them_is_kept_in_order() {
+        let pre = format!(
+            "Lorem ipsum:\n\n{}\n\n{}",
+            tm(" teammate_id=\"a\"", "One."),
+            tm(" teammate_id=\"b\"", "Two.")
+        );
+        let post = format!("{}\n\nDolor sit.\n", tm(" teammate_id=\"a\"", "One."));
+        let mid = format!(
+            "{} between {}",
+            tm(" teammate_id=\"a\"", "One."),
+            tm(" teammate_id=\"b\"", "Two.")
+        );
+        let mixed = format!(
+            "{}\n\n<cross-session-message from=\"uds:x\" from-name=\"xx\">\nTwo.\n</cross-session-message>",
+            tm(" teammate_id=\"a\"", "One.")
+        );
+        let got = entries(&[
+            user(1, json!(pre)),
+            user(2, json!(post)),
+            user(3, json!(mid)),
+            user(4, json!(mixed)),
+        ]);
+        assert_eq!(
+            got,
+            [
+                said(1, "Lorem ipsum:"),
+                sent(1, "One.", "a"),
+                sent(1, "Two.", "b"),
+                sent(2, "One.", "a"),
+                said(2, "Dolor sit."),
+                sent(3, "One.", "a"),
+                said(3, "between"),
+                sent(3, "Two.", "b"),
+                sent(4, "One.", "a"),
+                sent(4, "Two.", "xx"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_attribute_may_follow_any_whitespace_and_be_single_quoted() {
+        let got = entries(&[
+            user(1, json!(tm("\n  teammate_id='a'", "One."))),
+            user(2, json!(tm(" summary=\"it's\" teammate_id=\"b\"", "Two."))),
+            user(
+                3,
+                json!(tm(
+                    " summary=\"say teammate_id=\" teammate_id=\"c\"",
+                    "Three."
+                )),
+            ),
+            user(4, json!(tm(" teammate_id=''", "Four."))),
+        ]);
+        let senders: Vec<_> = got
+            .iter()
+            .map(|e| match &e.body {
+                TranscriptBody::User { sender, .. } => sender.clone(),
+                _ => unreachable!("prompts only"),
+            })
+            .collect();
+        assert_eq!(
+            senders,
+            [Some("a".into()), Some("b".into()), Some("c".into()), None]
+        );
+    }
+
+    #[test]
+    fn a_tag_name_needs_a_boundary_and_a_quoted_open_tag_splits_nothing() {
+        let quoted = tm(
+            " teammate_id=\"a\"",
+            "Quoting <teammate-message teammate_id=\"z\"> here",
+        );
+        let longer = "<teammate-messages teammate_id=\"a\">\nLorem.\n</teammate-messages>";
+        let got = entries(&[user(1, json!(quoted)), user(2, json!(longer))]);
+        assert_eq!(
+            got,
+            [
+                sent(1, "Quoting <teammate-message teammate_id=\"z\"> here", "a"),
+                said(2, longer),
+            ]
+        );
+    }
+
+    /// The synthetic sender session (`generate.sh`): `(key, text, sender)` of
+    /// each prompt entry.
+    #[test]
+    fn the_sender_fixture_gives_one_entry_per_tagged_block_each_with_its_sender() {
+        let fixture = include_str!(
+            "../../tests/fixtures/sender-home/projects/-work-sender/5e55c1c1-0000-4000-8000-0000000000f1.jsonl"
+        );
+        let mut t = Transcript::default();
+        for (i, line) in (1..).zip(fixture.lines()) {
+            t.push(i, line);
+        }
+        let got: Vec<_> = t
+            .entries
+            .iter()
+            .map(|e| match &e.body {
+                TranscriptBody::User { text, sender } => {
+                    (e.key.as_str(), text.as_str(), sender.as_deref())
+                }
+                _ => unreachable!("prompts only"),
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("1:0", "Lorem ipsum dolor.", None),
+                ("2:0", "Lorem ipsum.", Some("lorem-mate")),
+                ("3:0", "Dolor sit.", Some("ipsum-lead")),
+                ("4:0", "Amet elit.", Some("uds:amet")),
+                ("5:0", "First.", Some("lorem-mate")),
+                ("5:1", "Second.", Some("ipsum-mate")),
+                ("6:0", "Third.", Some("one")),
+                ("6:1", "Fourth.", Some("uds:b")),
+                ("7:0", "Nameless.", None),
+                ("8:0", "Lorem preamble:", None),
+                ("8:1", "Pre one.", Some("lorem-mate")),
+                ("8:2", "Pre two.", Some("ipsum-mate")),
+                ("9:0", "Body.", Some("lorem-mate")),
+                ("9:1", "Trailing text.", None),
+                ("10:0", "Mate.", Some("lorem-mate")),
+                ("10:1", "Cross.", Some("sit-lead")),
             ]
         );
     }
@@ -769,8 +1046,9 @@ mod tests {
             got,
             [
                 said(1, "Consectetur."),
-                said(3, "Dolor sit.\n\nAmet."),
-                said(5, "Elit."),
+                sent(3, "Dolor sit.", "b"),
+                sent(3, "Amet.", "a"),
+                sent(5, "Elit.", "a"),
                 said(6, "Adipiscing."),
             ]
         );
@@ -1051,10 +1329,12 @@ mod tests {
         );
         t.push(5, &user(2, json!("Ipsum.")).to_string());
         t.push(6, &result(3, "t0", json!("Dolor."), true).to_string());
+        let tagged = "<teammate-message teammate_id=\"lorem-mate\">\nSit.\n</teammate-message>";
+        t.push(7, &user(4, json!(tagged)).to_string());
         let page = TranscriptPage {
             entries: t.entries,
             updates: t.updates,
-            cursor: Some(6),
+            cursor: Some(7),
         };
         assert_eq!(
             serde_json::to_value(&page).expect("json"),
@@ -1064,13 +1344,16 @@ mod tests {
                         "name": "TodoWrite", "args": "TodoWrite(1 todos)", "status": "pending",
                         "result": null, "resultTruncated": false, "resultAt": null,
                         "todos": [{"content": "Lorem", "status": "in_progress"}]},
-                    {"key": "5:0", "timestamp": at(2), "kind": "user", "text": "Ipsum."},
+                    {"key": "5:0", "timestamp": at(2), "kind": "user", "text": "Ipsum.",
+                        "sender": null},
+                    {"key": "7:0", "timestamp": at(4), "kind": "user", "text": "Sit.",
+                        "sender": "lorem-mate"},
                 ],
                 "updates": [
                     {"id": "t0", "status": "error", "result": "Dolor.", "resultTruncated": false,
                         "resultAt": at(3)},
                 ],
-                "cursor": 6,
+                "cursor": 7,
             })
         );
     }
@@ -1231,6 +1514,7 @@ mod tests {
         let mut raws: Vec<String> = records.iter().map(Value::to_string).collect();
         raws.push("{not json".into());
         raws.extend(fixture.lines().map(str::to_string));
+        raws.extend(include_str!("../../tests/fixtures/sender-home/projects/-work-sender/5e55c1c1-0000-4000-8000-0000000000f1.jsonl").lines().map(str::to_string));
         raws
     }
 

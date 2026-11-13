@@ -86,7 +86,7 @@ describe('commands', () => {
 
   it('agent_transcript passes the agent row id and cursor and returns the page after it', async () => {
     const entries: TranscriptEntry[] = [
-      { key: '4:0', kind: 'user', text: 'lorem', timestamp: '2026-10-30T10:00:00Z' },
+      { key: '4:0', kind: 'user', text: 'lorem', sender: null, timestamp: '2026-10-30T10:00:00Z' },
       { key: '5:0', kind: 'thinking', text: 'ipsum', timestamp: null },
       {
         key: '5:1',
