@@ -57,6 +57,8 @@ const ws: Workstream = {
   director: null,
   pid: 4242,
   startedAtMs: 1_700_000_000_000,
+  kind: null,
+  bgId: null,
 }
 
 describe('money', () => {

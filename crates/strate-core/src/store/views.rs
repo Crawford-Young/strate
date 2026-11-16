@@ -127,6 +127,12 @@ pub struct Workstream {
     pub pid: Option<i64>,
     /// That row's process start, ms since the epoch; `None` with no row.
     pub started_at_ms: Option<i64>,
+    /// That row's `kind` as the CLI spells it (`interactive`,
+    /// `background`, ...); `None` with no row.
+    pub kind: Option<String>,
+    /// That row's background short id, what `claude attach` takes; `None`
+    /// with no row or none given.
+    pub bg_id: Option<String>,
 }
 
 /// One tab's $.
@@ -278,18 +284,34 @@ fn listings(conn: &Connection) -> Result<HashMap<String, Listing>> {
     Ok(out)
 }
 
-/// The `(pid, started_at_ms)` of the registry row naming `session_id`
-/// itself: a live row first, then the latest seen. `(None, None)` with no
-/// row.
-fn process_of(conn: &Connection, session_id: &str) -> Result<(Option<i64>, Option<i64>)> {
+/// The registry row naming a session itself (see [`process_of`]).
+#[derive(Default)]
+struct Process {
+    pid: Option<i64>,
+    started_at_ms: Option<i64>,
+    kind: Option<String>,
+    bg_id: Option<String>,
+}
+
+/// The [`Process`] of the registry row naming `session_id` itself: a live
+/// row first, then the latest seen. All `None` with no row; `bg_id` is
+/// `None` too when the row stores none (an empty string).
+fn process_of(conn: &Connection, session_id: &str) -> Result<Process> {
     let row = conn
         .prepare_cached(
-            "SELECT pid, started_at_ms FROM registry WHERE session_id = ?1
-             ORDER BY gone, last_seen_ms DESC, id DESC LIMIT 1",
+            "SELECT pid, started_at_ms, kind, nullif(bg_id, '') FROM registry
+             WHERE session_id = ?1 ORDER BY gone, last_seen_ms DESC, id DESC LIMIT 1",
         )?
-        .query_row([session_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_row([session_id], |r| {
+            Ok(Process {
+                pid: r.get(0)?,
+                started_at_ms: r.get(1)?,
+                kind: r.get(2)?,
+                bg_id: r.get(3)?,
+            })
+        })
         .optional()?;
-    Ok(row.unwrap_or((None, None)))
+    Ok(row.unwrap_or_default())
 }
 
 /// Whether `session_id` is live (see [`listings`]).
@@ -711,10 +733,12 @@ pub fn workstreams(conn: &Connection) -> Result<Vec<Workstream>> {
         let (name, fallback) = tab_name(conn, link, listing)?;
         let (cost_usd, unpriced) = costs.get(&id).copied().unwrap_or((None, 0));
         let needs_you = needs.get(&id).copied().unwrap_or(0);
-        let (pid, started_at_ms) = process_of(conn, &link.session_id)?;
+        let process = process_of(conn, &link.session_id)?;
         out.push(Workstream {
-            pid,
-            started_at_ms,
+            pid: process.pid,
+            started_at_ms: process.started_at_ms,
+            kind: process.kind,
+            bg_id: process.bg_id,
             id,
             name,
             fallback,
@@ -1168,10 +1192,10 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
         agent.links = links.remove(&agent.id).unwrap_or_default();
         agents.push(agent);
     }
-    let (pid, started_at_ms) = process_of(conn, &shown.session_id)?;
+    let process = process_of(conn, &shown.session_id)?;
     Ok(Some(LiveGraph {
-        pid,
-        started_at_ms,
+        pid: process.pid,
+        started_at_ms: process.started_at_ms,
         live,
         session_id: shown.session_id.clone(),
         session_cost_usd,
@@ -2170,6 +2194,42 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_reports_the_kind_and_short_id_of_its_registry_row() {
+        // b: a running background job. e: one with no short id. i: an
+        // interactive session. n: a session with no registry row.
+        let sql = format!(
+            "INSERT INTO sessions (session_id, process_root, started_at) VALUES
+                 ('b', 'b', '2026-10-07T10:00:00.000Z'), ('e', 'e', '2026-10-07T10:00:00.000Z'),
+                 ('i', 'i', '2026-10-07T10:00:00.000Z'), ('n', 'n', '2026-10-07T10:00:00.000Z');
+             INSERT INTO agents (id, session_id, kind) VALUES
+                 (1, 'b', 'orchestrator'), (2, 'e', 'orchestrator'),
+                 (3, 'i', 'orchestrator'), (4, 'n', 'orchestrator');
+             INSERT INTO registry (key, kind, session_id, bg_id, cwd, started_at_ms, status,
+                 state, waiting_for, first_seen_ms, last_seen_ms, gone, waiting_since_ms) VALUES
+                 ('b', 'background', 'b', 'abcd1234', '/w', 1, NULL, 'running', NULL, 1, 9, 0, NULL),
+                 ('e', 'background', 'e', '', '/w', 1, NULL, 'running', NULL, 1, 9, 0, NULL),
+                 ('i', 'interactive', 'i', NULL, '/w', 1, 'busy', NULL, NULL, 1, 9, 0, NULL);{}",
+            records(&["b", "e", "i", "n"])
+        );
+        let (dir, store) = seeded("views-tab-kind-bg-id", &sql);
+        let rows = workstreams(&store.conn).expect("workstreams");
+        let of = |s: &str| {
+            let w = rows
+                .iter()
+                .find(|w| w.session_id.as_deref() == Some(s))
+                .expect("tab");
+            (w.kind.clone(), w.bg_id.clone())
+        };
+        let some = |k: &str, b: Option<&str>| (Some(k.to_string()), b.map(String::from));
+        assert_eq!(of("b"), some("background", Some("abcd1234")));
+        assert_eq!(of("e"), some("background", None));
+        assert_eq!(of("i"), some("interactive", None));
+        assert_eq!(of("n"), (None, None));
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
     fn a_v17_registry_wait_starts_at_its_last_change() {
         let dir = crate::tail::test_dir("views-v17-wait-start");
         let db = dir.join("strate.db");
@@ -2354,15 +2414,19 @@ mod tests {
             director: None,
             pid: None,
             started_at_ms: None,
+            kind: None,
+            bg_id: None,
         });
         got.sort();
         assert_eq!(
             got,
             [
+                "bgId",
                 "costUsd",
                 "director",
                 "fallback",
                 "id",
+                "kind",
                 "live",
                 "name",
                 "needsYou",
