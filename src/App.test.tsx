@@ -71,6 +71,8 @@ function ws(over: Partial<Workstream> & Pick<Workstream, 'id' | 'name'>): Workst
     director: null,
     pid: null,
     startedAtMs: null,
+    kind: null,
+    bgId: null,
     ...over,
   }
 }

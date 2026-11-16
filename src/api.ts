@@ -35,6 +35,10 @@ export interface Workstream {
   pid: number | null
   /** That registry row's process start (ms since the epoch); null with no row. */
   startedAtMs: number | null
+  /** That row's kind as the CLI spells it (`interactive`, `background`, ...); null with no row. */
+  kind: string | null
+  /** That row's background short id, what `claude attach` takes; null with no row or none given. */
+  bgId: string | null
 }
 
 export interface WorkstreamCost {

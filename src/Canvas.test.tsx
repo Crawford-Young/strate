@@ -39,6 +39,8 @@ const ws = (id: number): Workstream => ({
   director: null,
   pid: null,
   startedAtMs: null,
+  kind: null,
+  bgId: null,
 })
 
 function agent(over: Partial<GraphAgent> & Pick<GraphAgent, 'id'>): GraphAgent {
