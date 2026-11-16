@@ -440,6 +440,7 @@ mod tests {
 
     #[test]
     fn context_pct_divides_by_the_model_window_and_never_guesses() {
+        assert_eq!(context_window("claude-fable-5-2"), Some(1_000_000));
         assert_eq!(context_window("claude-opus-5-5"), Some(1_000_000));
         assert_eq!(context_window("claude-haiku-5-5"), Some(1_000_000));
         assert_eq!(context_window("claude-haiku-5-5-20261001"), Some(1_000_000));
@@ -454,14 +455,36 @@ mod tests {
         // 250010 / 1000000 = 25.001%
         let pct = context_pct(250_010, "claude-haiku-5-5").expect("known");
         assert!((pct - 25.001).abs() < 1e-9, "{pct}");
+        // 100000 / 1000000 = 10%
+        let pct = context_pct(100_000, "claude-fable-5-2").expect("known");
+        assert!((pct - 10.0).abs() < 1e-9, "{pct}");
         assert_eq!(context_pct(1000, "claude-lorem-1"), None);
         assert_eq!(context_pct(1000, SYNTHETIC), None);
     }
 
     #[test]
+    fn every_priced_model_has_a_context_window() {
+        let table: Value = serde_json::from_str(PRICES_JSON).expect("json");
+        let ids: Vec<&String> = table["models"]
+            .as_object()
+            .expect("models")
+            .keys()
+            .collect();
+        assert!(!ids.is_empty());
+        let missing: Vec<&&String> = ids
+            .iter()
+            .filter(|id| context_window(id).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "priced but no context window: {missing:?}"
+        );
+    }
+
+    #[test]
     fn the_windows_table_carries_its_verification() {
         let table: Value = serde_json::from_str(WINDOWS_JSON).expect("json");
-        assert_eq!(table["verified"], "2026-10-19");
+        assert_eq!(table["verified"], "2026-11-16");
         let source = table["source"].as_str().expect("a source");
         assert!(source.contains("max_input_tokens"), "{source}");
         assert!(
