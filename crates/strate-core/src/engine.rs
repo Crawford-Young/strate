@@ -3,10 +3,11 @@
 //! fetches and, when opted in, the hook receiver.
 //!
 //! rusqlite connections are not `Sync`, so the writer never leaves this
-//! thread; commands read through their own read-only connection, which WAL
-//! lets query the last commit while a write is open. Nothing here runs on
-//! the UI thread: [`Engine::start`] only opens the store, starts the
-//! sources and spawns the thread.
+//! thread; a host reads through its own read-only connection
+//! ([`Store::open_reader`]), which WAL lets query the last commit while a
+//! write is open. Nothing here runs on the host's UI thread:
+//! [`Engine::start`] only opens the store, starts the sources and spawns
+//! the thread.
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -18,14 +19,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::discovery::{Link, discover};
+use crate::github::{self, Fetched, Target};
+use crate::hooks::{Hook, HookOptions, HookReceiver};
+use crate::registry::{PollOptions, RegistryEvent, RegistryPoller, Runner};
+use crate::store::Store;
+use crate::tail::{Batch, TailEvent, TailOptions, Tailer};
 use crossbeam_channel::{Receiver, Sender, bounded, never, select, unbounded};
 use serde::Serialize;
-use strate_core::discovery::{Link, discover};
-use strate_core::github::{self, Fetched, Target};
-use strate_core::hooks::{Hook, HookOptions, HookReceiver};
-use strate_core::registry::{PollOptions, RegistryEvent, RegistryPoller, Runner};
-use strate_core::store::Store;
-use strate_core::tail::{Batch, TailEvent, TailOptions, Tailer};
+
+/// At most four change notifications a second.
+pub const DEBOUNCE: Duration = Duration::from_millis(250);
+/// Shortest gap between discovery passes for new subagents.
+pub const REDISCOVER_AFTER: Duration = Duration::from_secs(2);
 
 /// Discovery passes a subagent transcript may ask for before its link is
 /// given up on (no `.meta.json`, or a `toolUseId` with no `tool_use`).
@@ -34,6 +40,8 @@ const DISCOVERY_TRIES: u8 = 3;
 /// Longest the thread sleeps with nothing pending.
 const IDLE: Duration = Duration::from_secs(3600);
 
+/// What [`Engine::start`] runs. [`Config::new`] gives the host defaults; a
+/// host then sets what it needs, e.g. `registry` and `poll.every`.
 pub struct Config {
     /// The Claude Code config dir.
     pub root: PathBuf,
@@ -52,6 +60,25 @@ pub struct Config {
     pub debounce: Duration,
     /// Shortest gap between two discovery passes.
     pub rediscover_after: Duration,
+}
+
+impl Config {
+    /// The config dir at `root` and the store at `db`, with the registry,
+    /// GitHub and hooks off, the default poll and tail options, and the
+    /// [`DEBOUNCE`] and [`REDISCOVER_AFTER`] gaps.
+    pub fn new(root: PathBuf, db: PathBuf) -> Self {
+        Self {
+            root,
+            db,
+            registry: None,
+            github: None,
+            poll: PollOptions::default(),
+            hooks: None,
+            tail: TailOptions::default(),
+            debounce: DEBOUNCE,
+            rediscover_after: REDISCOVER_AFTER,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

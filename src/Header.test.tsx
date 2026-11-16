@@ -17,6 +17,8 @@ const tabs: Workstream[] = [1, 2, 3, 4, 5].map((id) => ({
   live: true,
   startedAt: null,
   director: null,
+  pid: null,
+  startedAtMs: null,
 }))
 
 const waits: NeedsYou[] = [1, 2, 3].map((id) => ({

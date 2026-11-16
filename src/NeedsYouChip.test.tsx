@@ -14,6 +14,8 @@ function ws(over: Partial<Workstream> & Pick<Workstream, 'id' | 'name'>): Workst
     live: false,
     startedAt: null,
     director: null,
+    pid: null,
+    startedAtMs: null,
     ...over,
   }
 }

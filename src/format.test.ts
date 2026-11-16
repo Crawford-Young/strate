@@ -34,6 +34,8 @@ function graph(over: Partial<LiveGraph> = {}): LiveGraph {
     sessionId: 's',
     live: true,
     sessionCostUsd: 0.42,
+    pid: 4242,
+    startedAtMs: 1_700_000_000_000,
     runMs: 62 * MIN,
     agents: [agent(0.3)],
     edges: [],
@@ -53,6 +55,8 @@ const ws: Workstream = {
   live: true,
   startedAt: '2026-10-12T10:00:00Z',
   director: null,
+  pid: 4242,
+  startedAtMs: 1_700_000_000_000,
 }
 
 describe('money', () => {

@@ -1,14 +1,16 @@
 pub mod commands;
 pub mod config;
-pub mod engine;
+
+/// The ingest engine this app hosts, from strate-core.
+pub use strate_core::engine;
 
 use std::sync::{Mutex, PoisonError};
 
+use strate_core::engine::Engine;
 use tauri::{Emitter, Manager, RunEvent};
 
 use crate::commands::{Reader, STORE_CHANGED};
 use crate::config::{DB_PATH, Settings, resolve_db};
-use crate::engine::Engine;
 
 /// The engine, taken and stopped on exit.
 struct Running(Mutex<Option<Engine>>);

@@ -9,24 +9,16 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use strate_core::discovery::resolve_config_dir;
+use strate_core::engine::Config;
 use strate_core::github::{self, resolve_gh};
 use strate_core::hooks::HookOptions;
-use strate_core::registry::{PollOptions, cli_runner, resolve_claude};
-use strate_core::tail::TailOptions;
-
-use crate::engine::Config;
+use strate_core::registry::{cli_runner, resolve_claude};
 
 pub const HOOK_PORT: &str = "STRATE_HOOK_PORT";
 pub const HOOK_TOKEN: &str = "STRATE_HOOK_TOKEN";
 pub const DB_PATH: &str = "STRATE_DB";
-
-/// At most four `store-changed` events a second.
-pub const DEBOUNCE: Duration = Duration::from_millis(250);
-/// Shortest gap between discovery passes for new subagents.
-pub const REDISCOVER_AFTER: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -58,15 +50,10 @@ impl Settings {
     /// The engine config for these settings with the store at `db`.
     pub fn engine(self, db: PathBuf) -> Config {
         Config {
-            root: self.root,
-            db,
             registry: self.claude.map(cli_runner),
             github: Some(self.gh.map_or_else(missing_gh, github::cli_runner)),
-            poll: PollOptions::default(),
             hooks: self.hooks,
-            tail: TailOptions::default(),
-            debounce: DEBOUNCE,
-            rediscover_after: REDISCOVER_AFTER,
+            ..Config::new(self.root, db)
         }
     }
 }
@@ -131,6 +118,7 @@ fn hook_options(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::time::Duration;
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let map: HashMap<String, OsString> = pairs

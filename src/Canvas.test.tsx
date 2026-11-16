@@ -37,6 +37,8 @@ const ws = (id: number): Workstream => ({
   live: true,
   startedAt: null,
   director: null,
+  pid: null,
+  startedAtMs: null,
 })
 
 function agent(over: Partial<GraphAgent> & Pick<GraphAgent, 'id'>): GraphAgent {
@@ -70,6 +72,8 @@ const tiered: LiveGraph = {
   sessionId: 's-1',
   live: true,
   sessionCostUsd: null,
+  pid: null,
+  startedAtMs: null,
   runMs: null,
   agents: [
     agent({ id: 1, kind: 'orchestrator', agentId: null, name: 'lead' }),

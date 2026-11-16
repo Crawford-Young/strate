@@ -43,7 +43,16 @@ function agent(id: number, parent: number | null = null): GraphAgent {
 const dispatch = (parent: number, child: number): GraphEdge => ({ kind: 'dispatch', parent, child })
 
 function graph(agents: GraphAgent[], edges: GraphEdge[]): LiveGraph {
-  return { sessionId: 's', live: true, sessionCostUsd: null, runMs: null, agents, edges }
+  return {
+    sessionId: 's',
+    live: true,
+    sessionCostUsd: null,
+    pid: null,
+    startedAtMs: null,
+    runMs: null,
+    agents,
+    edges,
+  }
 }
 
 // Orchestrator 1 → subagents 2 and 3, teammate 4; subagent 2 → its own dispatch 5.

@@ -64,7 +64,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 use super::Result;
@@ -122,6 +122,11 @@ pub struct Workstream {
     /// Its root: the topmost live tab of its spawn ancestry, which it nests
     /// under; `None` on a root or a tab with no live ancestor.
     pub director: Option<i64>,
+    /// The drawn session's registry row's process id (a live row first,
+    /// then the latest seen); `None` with no row or a background session.
+    pub pid: Option<i64>,
+    /// That row's process start, ms since the epoch; `None` with no row.
+    pub started_at_ms: Option<i64>,
 }
 
 /// One tab's $.
@@ -166,6 +171,11 @@ pub struct LiveGraph {
     pub run_ms: Option<i64>,
     pub agents: Vec<GraphAgent>,
     pub edges: Vec<GraphEdge>,
+    /// The drawn session's registry row's process id; see
+    /// [`Workstream::pid`].
+    pub pid: Option<i64>,
+    /// That row's process start; see [`Workstream::started_at_ms`].
+    pub started_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -266,6 +276,20 @@ fn listings(conn: &Connection) -> Result<HashMap<String, Listing>> {
         out.entry(session_id).or_insert(listing);
     }
     Ok(out)
+}
+
+/// The `(pid, started_at_ms)` of the registry row naming `session_id`
+/// itself: a live row first, then the latest seen. `(None, None)` with no
+/// row.
+fn process_of(conn: &Connection, session_id: &str) -> Result<(Option<i64>, Option<i64>)> {
+    let row = conn
+        .prepare_cached(
+            "SELECT pid, started_at_ms FROM registry WHERE session_id = ?1
+             ORDER BY gone, last_seen_ms DESC, id DESC LIMIT 1",
+        )?
+        .query_row([session_id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    Ok(row.unwrap_or((None, None)))
 }
 
 /// Whether `session_id` is live (see [`listings`]).
@@ -687,7 +711,10 @@ pub fn workstreams(conn: &Connection) -> Result<Vec<Workstream>> {
         let (name, fallback) = tab_name(conn, link, listing)?;
         let (cost_usd, unpriced) = costs.get(&id).copied().unwrap_or((None, 0));
         let needs_you = needs.get(&id).copied().unwrap_or(0);
+        let (pid, started_at_ms) = process_of(conn, &link.session_id)?;
         out.push(Workstream {
+            pid,
+            started_at_ms,
             id,
             name,
             fallback,
@@ -704,6 +731,36 @@ pub fn workstreams(conn: &Connection) -> Result<Vec<Workstream>> {
     fold_nested(&mut out, &tree.nest);
     out.sort_by(|a, b| (b.live, &b.started_at, a.id).cmp(&(a.live, &a.started_at, b.id)));
     Ok(out)
+}
+
+/// One local day's spend, from the audit rollup.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DaySpend {
+    /// The local calendar day, `YYYY-MM-DD`, in the zone under `meta` `tz`.
+    pub day: String,
+    /// Sum of that day's priced cells; `None` with none.
+    pub cost_usd: Option<f64>,
+    /// That day's requests with no price (an unknown model), left out of
+    /// `cost_usd` rather than counted as $0.
+    pub unpriced: i64,
+}
+
+/// Today's spend: the `audit_cells` of the local day `now_ms` falls on.
+/// `Ingest::batch` rolls the cells up per live batch, so this is current
+/// on the live path.
+pub fn spend_today(conn: &Connection, now_ms: i64) -> Result<DaySpend> {
+    let day = crate::time::local_day(&super::account::zone(conn)?, now_ms).unwrap_or_default();
+    let (cost_usd, unpriced) = conn
+        .prepare_cached(
+            "SELECT sum(cost_usd), ifnull(sum(unpriced), 0) FROM audit_cells WHERE day = ?1",
+        )?
+        .query_row([&day], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(DaySpend {
+        day,
+        cost_usd,
+        unpriced,
+    })
 }
 
 /// $ per tab, by tab id; a tab with no request has no row.
@@ -1111,7 +1168,10 @@ pub fn live_graph(conn: &Connection, workstream: i64) -> Result<Option<LiveGraph
         agent.links = links.remove(&agent.id).unwrap_or_default();
         agents.push(agent);
     }
+    let (pid, started_at_ms) = process_of(conn, &shown.session_id)?;
     Ok(Some(LiveGraph {
+        pid,
+        started_at_ms,
         live,
         session_id: shown.session_id.clone(),
         session_cost_usd,
@@ -1613,6 +1673,172 @@ mod tests {
             ('e', 'background', 'e', '/work/x', 1, NULL, 'done', 1, 1, 1),
             ('f', 'background', 'f', '/work/x', 1, NULL, 'running', 1, 1, 0);";
 
+    /// Four lone sessions, each its own orchestrator (agent ids 1-4):
+    /// `a` has a live row between a newer gone row and an older live one,
+    /// `b` only gone rows, `c` a background row with no pid, `d` no row.
+    const PIDS: &str = "
+        INSERT INTO sessions (session_id, process_root, started_at) VALUES
+            ('a', 'a', '2026-10-07T10:00:00.000Z'), ('b', 'b', '2026-10-07T10:00:00.000Z'),
+            ('c', 'c', '2026-10-07T10:00:00.000Z'), ('d', 'd', '2026-10-07T10:00:00.000Z');
+        INSERT INTO agents (id, session_id, kind) VALUES
+            (1, 'a', 'orchestrator'), (2, 'b', 'orchestrator'),
+            (3, 'c', 'orchestrator'), (4, 'd', 'orchestrator');
+        INSERT INTO registry (key, kind, session_id, pid, cwd, started_at_ms, status,
+            first_seen_ms, last_seen_ms, gone) VALUES
+            ('a-gone-new', 'interactive', 'a', 11, '/work/x', 1100, 'busy', 1, 90, 1),
+            ('a-live', 'interactive', 'a', 22, '/work/x', 2200, 'busy', 1, 50, 0),
+            ('a-live-old', 'interactive', 'a', 33, '/work/x', 3300, 'busy', 1, 30, 0),
+            ('b-gone-old', 'interactive', 'b', 44, '/work/x', 4400, 'busy', 1, 20, 1),
+            ('b-gone-new', 'interactive', 'b', 55, '/work/x', 5500, 'busy', 1, 80, 1),
+            ('c-bg', 'background', 'c', NULL, '/work/x', 6600, NULL, 1, 10, 0);";
+
+    #[test]
+    fn a_workstream_carries_its_sessions_registry_pid_and_start() {
+        let sql = format!("{PIDS}{}", records(&["a", "b", "c", "d"]));
+        let (dir, store) = seeded("views-pids", &sql);
+        let rows = workstreams(&store.conn).expect("workstreams");
+        let of = |session: &str| {
+            let w = rows
+                .iter()
+                .find(|w| w.session_id.as_deref() == Some(session))
+                .unwrap_or_else(|| panic!("a tab for {session}: {rows:?}"));
+            (w.pid, w.started_at_ms)
+        };
+        assert_eq!(
+            of("a"),
+            (Some(22), Some(2200)),
+            "a live row beats a newer gone one"
+        );
+        assert_eq!(
+            of("b"),
+            (Some(55), Some(5500)),
+            "gone rows: the latest last_seen_ms"
+        );
+        assert_eq!(of("c"), (None, Some(6600)), "a NULL pid keeps its start");
+        assert_eq!(of("d"), (None, None), "no registry row");
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_live_graph_carries_its_sessions_registry_pid_and_start() {
+        let sql = format!("{PIDS}{}", records(&["a", "b", "c", "d"]));
+        let (dir, store) = seeded("views-graph-pids", &sql);
+        let of = |id: i64| {
+            let g = live_graph(&store.conn, id).expect("query").expect("graph");
+            (g.pid, g.started_at_ms)
+        };
+        assert_eq!(of(1), (Some(22), Some(2200)));
+        assert_eq!(of(2), (Some(55), Some(5500)));
+        assert_eq!(of(3), (None, Some(6600)));
+        assert_eq!(of(4), (None, None));
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn the_pid_and_start_serialize_as_camel_case_keys() {
+        let sql = format!("{PIDS}{}", records(&["a", "d"]));
+        let (dir, store) = seeded("views-pid-json", &sql);
+        let w = workstreams(&store.conn)
+            .expect("workstreams")
+            .into_iter()
+            .find(|w| w.session_id.as_deref() == Some("a"))
+            .expect("tab a");
+        let json = serde_json::to_value(&w).expect("json");
+        assert_eq!(json["pid"], 22);
+        assert_eq!(json["startedAtMs"], 2200);
+        assert!(json.get("started_at_ms").is_none());
+        let g = live_graph(&store.conn, 4).expect("query").expect("graph");
+        let json = serde_json::to_value(&g).expect("json");
+        assert!(json["pid"].is_null(), "present as null, not omitted");
+        assert!(json["startedAtMs"].is_null());
+        assert!(json.as_object().expect("object").contains_key("pid"));
+        assert!(
+            json.as_object()
+                .expect("object")
+                .contains_key("startedAtMs")
+        );
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    /// Cells for one session over three local days of America/Los_Angeles;
+    /// UTC's day of the `now` the spend tests use holds its own cell.
+    const CELLS: &str = "
+        INSERT INTO sessions (session_id, process_root, started_at) VALUES
+            ('s', 's', '2026-11-09T10:00:00.000Z');
+        INSERT INTO audit_cells (session_id, day, wall_ms, active_ms, wait_ms, cost_usd,
+            unpriced, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
+        VALUES
+            ('s', '2026-11-08', 0, 0, 0, 40.0, 5, 0, 0, 0, 0),
+            ('s', '2026-11-09', 0, 0, 0, 1.5, 1, 0, 0, 0, 0),
+            ('s', '2026-11-09', 0, 0, 0, 0.25, 2, 0, 0, 0, 0),
+            ('s', '2026-11-09', 0, 0, 0, NULL, 4, 0, 0, 0, 0),
+            ('s', '2026-11-10', 0, 0, 0, 100.0, 7, 0, 0, 0, 0),
+            ('s', '2026-11-11', 0, 0, 0, NULL, 9, 0, 0, 0, 0);";
+
+    /// 23:30 on 2026-11-09 in Los Angeles (UTC-8), already 2026-11-10 in UTC.
+    fn near_la_midnight() -> i64 {
+        crate::time::parse_timestamp("2026-11-10T07:30:00.000Z").expect("stamp")
+    }
+
+    fn la_store(name: &str, sql: &str) -> (std::path::PathBuf, super::super::Store) {
+        let (dir, store) = seeded(name, sql);
+        store
+            .conn
+            .execute(
+                "UPDATE meta SET value = 'America/Los_Angeles' WHERE key = 'tz'",
+                [],
+            )
+            .expect("tz");
+        (dir, store)
+    }
+
+    #[test]
+    fn spend_today_sums_the_local_day_of_the_stored_zone() {
+        let (dir, store) = la_store("views-spend-today", CELLS);
+        let spend = spend_today(&store.conn, near_la_midnight()).expect("spend");
+        assert_eq!(spend.day, "2026-11-09", "the local day, not UTC's");
+        assert_eq!(spend.cost_usd, Some(1.75));
+        assert_eq!(spend.unpriced, 7, "1 + 2 + 4: every cell of the day");
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn spend_today_has_no_cost_with_no_priced_cell() {
+        let (dir, store) = la_store("views-spend-unpriced", CELLS);
+        // 2026-11-11 17:00 in Los Angeles: only an unpriced cell.
+        let now = crate::time::parse_timestamp("2026-11-12T01:00:00.000Z").expect("stamp");
+        let spend = spend_today(&store.conn, now).expect("spend");
+        assert_eq!(
+            spend,
+            DaySpend {
+                day: "2026-11-11".into(),
+                cost_usd: None,
+                unpriced: 9
+            }
+        );
+        // A day with no cell at all.
+        let later = crate::time::parse_timestamp("2026-12-01T20:00:00.000Z").expect("stamp");
+        let spend = spend_today(&store.conn, later).expect("spend");
+        assert_eq!(
+            spend,
+            DaySpend {
+                day: "2026-12-01".into(),
+                cost_usd: None,
+                unpriced: 0
+            }
+        );
+        let json = serde_json::to_value(&spend).expect("json");
+        assert_eq!(json["costUsd"], serde_json::Value::Null);
+        assert_eq!(json["unpriced"], 0);
+        assert_eq!(json["day"], "2026-12-01");
+        drop(store);
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
     #[test]
     fn a_live_tree_nests_under_its_root_tab_at_any_depth() {
         let sql = format!("{TREE}{}", records(&["t", "b", "c", "e", "f"]));
@@ -2096,6 +2322,8 @@ mod tests {
             run_ms: None,
             agents: vec![],
             edges: vec![],
+            pid: None,
+            started_at_ms: None,
         };
         let mut got = keys(&graph);
         got.sort();
@@ -2105,9 +2333,11 @@ mod tests {
                 "agents",
                 "edges",
                 "live",
+                "pid",
                 "runMs",
                 "sessionCostUsd",
-                "sessionId"
+                "sessionId",
+                "startedAtMs"
             ]
         );
         let mut got = keys(Workstream {
@@ -2122,6 +2352,8 @@ mod tests {
             live: false,
             started_at: None,
             director: None,
+            pid: None,
+            started_at_ms: None,
         });
         got.sort();
         assert_eq!(
@@ -2134,8 +2366,10 @@ mod tests {
                 "live",
                 "name",
                 "needsYou",
+                "pid",
                 "sessionId",
                 "startedAt",
+                "startedAtMs",
                 "state",
                 "unpriced"
             ]

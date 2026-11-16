@@ -54,6 +54,8 @@ describe('commands', () => {
       live: true,
       sessionCostUsd: 0.01,
       runMs: 40_000,
+      pid: 4242,
+      startedAtMs: 1_700_000_000_000,
       agents: [
         {
           id: 1,

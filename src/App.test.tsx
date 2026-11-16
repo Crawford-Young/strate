@@ -69,6 +69,8 @@ function ws(over: Partial<Workstream> & Pick<Workstream, 'id' | 'name'>): Workst
     live: false,
     startedAt: null,
     director: null,
+    pid: null,
+    startedAtMs: null,
     ...over,
   }
 }
@@ -113,6 +115,8 @@ const shellGraph: LiveGraph = {
   sessionId: 's-2',
   live: true,
   sessionCostUsd: 0.42,
+  pid: 4242,
+  startedAtMs: 1_700_000_000_000,
   // As read at 11:02:30, the clock the session line test starts on.
   runMs: 62 * 60_000 + 30_000,
   agents: [
@@ -144,6 +148,8 @@ const unnamedGraph: LiveGraph = {
   sessionId: 's-3',
   live: true,
   sessionCostUsd: null,
+  pid: null,
+  startedAtMs: null,
   runMs: null,
   agents: [
     agent({
