@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rusqlite::Connection;
+use strate_core::engine::{Progress, Refresher, Status};
 use strate_core::store::Store;
 use strate_core::store::views::{
     self, Audit, AuditFilter, LiveGraph, NeedsYou, NodeKind, Performance, TimelineDay,
@@ -13,8 +14,6 @@ use strate_core::store::views::{
 };
 use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
-
-use crate::engine::{Progress, Refresher, Status};
 
 /// Emitted (no payload, at most four a second) after the store changed.
 pub const STORE_CHANGED: &str = "store-changed";

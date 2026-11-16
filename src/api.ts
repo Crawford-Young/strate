@@ -31,6 +31,10 @@ export interface Workstream {
   startedAt: string | null
   /** The live workstream whose tab this one nests under; null for a top-level tab. */
   director: number | null
+  /** The drawn session's registry process id; null with no row or a background session. */
+  pid: number | null
+  /** That registry row's process start (ms since the epoch); null with no row. */
+  startedAtMs: number | null
 }
 
 export interface WorkstreamCost {
@@ -119,6 +123,10 @@ export interface LiveGraph {
   runMs: number | null
   agents: GraphAgent[]
   edges: GraphEdge[]
+  /** The drawn session's registry process id; null with no row or a background session. */
+  pid: number | null
+  /** That registry row's process start (ms since the epoch); null with no row. */
+  startedAtMs: number | null
 }
 
 export type TranscriptToolStatus = 'pending' | 'success' | 'error'
