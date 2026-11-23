@@ -31,6 +31,21 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+  # strate-core is the engine edge-deck and other hosts embed, so it must hold
+  # on every OS, not just the Windows host strate itself runs on (#21, core
+  # half). The Tauri app matrix (WebKitGTK, smoke launch) is the rest of #21.
+  core-cross-os:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p strate-core
+
   # crates/strate-core/data/prices.json is vendored byte-for-byte from claude-config.
   prices-drift:
     runs-on: ubuntu-latest

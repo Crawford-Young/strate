@@ -20,7 +20,10 @@ pub const PRICES_JSON: &str = include_str!("../data/prices.json");
 /// differently: a store accounted under an older value re-prices every
 /// stored event once on its next open. A `prices.json` change needs no bump.
 pub const PRICING_LOGIC_VERSION: &str = "1";
-const WINDOWS_JSON: &str = include_str!("../data/context-windows.json");
+/// The vendored context-window table, verbatim. Stored as meta `windows`: a
+/// store written under another table recomputes every rollup, `context_pct`
+/// included, on its next open (#156).
+pub const WINDOWS_JSON: &str = include_str!("../data/context-windows.json");
 const MTOK: f64 = 1e6;
 
 /// The model Claude Code writes on records it made up itself (an

@@ -617,3 +617,54 @@ fn a_request_replayed_into_another_session_counts_once_toward_the_larger() {
     assert_eq!(cost("s-old"), None);
     assert!((cost("s-new").expect("priced") - 0.0015).abs() < 1e-12);
 }
+
+/// #156: `context_pct` is computed at ingest, so a store written under an older
+/// context-window table kept stale (or null) percents until each agent's next
+/// record. Simulate that store: a different recorded table and nulled
+/// percents. The next open recomputes them; a store already on the current
+/// table is left alone.
+#[test]
+fn a_store_written_under_another_window_table_recomputes_context_pct_on_open() {
+    let t = Temp::new("rewindow");
+    let want = rollups(&cold(&t));
+    {
+        let db = Connection::open(t.db()).expect("writer");
+        db.execute(
+            "UPDATE meta SET value = '{\"models\":{}}' WHERE key = 'windows'",
+            [],
+        )
+        .expect("old table");
+        assert_eq!(
+            db.execute("UPDATE agents SET context_pct = NULL", [])
+                .expect("null percents"),
+            agent_count(&db),
+        );
+    }
+    drop(Store::open(t.db()).expect("reopen"));
+    let db = Store::open_reader(t.db()).expect("reader");
+    assert_eq!(rollups(&db), want, "every percent is back");
+    let pct = agent_row::<f64>(&db, "context_pct", K1, None);
+    assert!((pct - 20.0006).abs() < 1e-9, "{pct}");
+
+    // Same table now: opening changes nothing, so a nulled percent stays null.
+    {
+        let db = Connection::open(t.db()).expect("writer");
+        db.execute(
+            "UPDATE agents SET context_pct = NULL WHERE session_id = ?1",
+            [K1],
+        )
+        .expect("null one");
+    }
+    drop(Store::open(t.db()).expect("reopen same table"));
+    let db = Store::open_reader(t.db()).expect("reader");
+    assert_eq!(
+        agent_row::<Option<f64>>(&db, "context_pct", K1, None),
+        None,
+        "no recompute when the table matches"
+    );
+}
+
+fn agent_count(db: &Connection) -> usize {
+    db.query_row("SELECT count(*) FROM agents", [], |r| r.get::<_, i64>(0))
+        .expect("count") as usize
+}

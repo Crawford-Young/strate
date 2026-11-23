@@ -10,7 +10,11 @@ publish = false
 crossbeam-channel = "0.5.17"
 file-id = "0.2.3"
 # verified: 2026-10: maintained, already in the lock; tzdb-bundle-platform since Windows has no system tzdb.
-jiff = { version = "1.0.0", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform"] }
+# tzdb-bundle-platform bundles the database only where the OS has none
+# (Windows). Linux and macOS read /usr/share/zoneinfo, which needs
+# tzdb-zoneinfo: without it Store::open fails there with "no time zone
+# database configured" (found running cargo test on Linux for #21).
+jiff = { version = "1.0.0", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform", "tzdb-zoneinfo"] }
 notify = "8.2.2"
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
