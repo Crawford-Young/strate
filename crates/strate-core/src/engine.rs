@@ -196,6 +196,7 @@ impl Engine {
             fetching: false,
             pending: false,
             waiters: Vec::new(),
+            registry_error: None,
             on_change,
         };
         let sources = Sources {
@@ -241,6 +242,30 @@ impl Engine {
         self.stop.take();
         let worker = self.worker.take().expect("worker runs until stop");
         worker.join().unwrap_or_else(|panic| resume_unwind(panic));
+    }
+}
+
+/// The log line, if any, for one registry poll's events. A failed poll used
+/// to be dropped unlogged, which hid why live sessions went missing
+/// (edge-deck#16). `last` remembers the error already logged, so a failure
+/// that persists logs once, and the next poll that reports anything other
+/// than an error (a quiet poll sends no events) logs the recovery once.
+fn registry_error_line(last: &mut Option<String>, events: &[RegistryEvent]) -> Option<String> {
+    let error = events.iter().find_map(|e| match e {
+        RegistryEvent::Error { message, .. } => Some(message),
+        _ => None,
+    });
+    match (error, last.as_ref()) {
+        (Some(message), Some(seen)) if message == seen => None,
+        (Some(message), _) => {
+            *last = Some(message.clone());
+            Some(format!("strate: registry poll failed: {message}"))
+        }
+        (None, Some(_)) if !events.is_empty() => {
+            *last = None;
+            Some("strate: registry poll recovered".to_string())
+        }
+        (None, _) => None,
     }
 }
 
@@ -428,6 +453,9 @@ struct Ingest<F> {
     pending: bool,
     /// The requests not done yet; all are told once no fetch is out or due.
     waiters: Vec<Waiter>,
+    /// The last registry poll error logged, so a failure that persists logs
+    /// once, and the poll that recovers logs once (edge-deck#16).
+    registry_error: Option<String>,
     on_change: F,
 }
 
@@ -541,6 +569,9 @@ impl<F: FnMut()> Ingest<F> {
     }
 
     fn registry(&mut self, events: &[RegistryEvent]) {
+        if let Some(line) = registry_error_line(&mut self.registry_error, events) {
+            eprintln!("{line}");
+        }
         let changes = events
             .iter()
             .any(|e| !matches!(e, RegistryEvent::Error { .. }));
@@ -651,6 +682,41 @@ impl<F: FnMut()> Ingest<F> {
 
 #[cfg(test)]
 mod tests {
+
+    fn registry_error(message: &str) -> RegistryEvent {
+        RegistryEvent::Error {
+            message: message.to_string(),
+            at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn a_failed_registry_poll_logs_once_until_it_recovers() {
+        let mut last = None;
+        assert_eq!(
+            registry_error_line(&mut last, &[registry_error("exit 1")]).as_deref(),
+            Some("strate: registry poll failed: exit 1")
+        );
+        // The same failure again stays quiet.
+        assert_eq!(
+            registry_error_line(&mut last, &[registry_error("exit 1")]),
+            None
+        );
+        // A different failure is news.
+        assert_eq!(
+            registry_error_line(&mut last, &[registry_error("bad json")]).as_deref(),
+            Some("strate: registry poll failed: bad json")
+        );
+        // A quiet poll says nothing either way.
+        assert_eq!(registry_error_line(&mut last, &[]), None);
+        // A poll with real events after a failure logs the recovery once.
+        let back = [RegistryEvent::Baseline { keys: Vec::new() }];
+        assert_eq!(
+            registry_error_line(&mut last, &back).as_deref(),
+            Some("strate: registry poll recovered")
+        );
+        assert_eq!(registry_error_line(&mut last, &back), None);
+    }
     use super::*;
 
     #[test]
@@ -732,6 +798,7 @@ mod tests {
             fetching: false,
             pending: false,
             waiters: Vec::new(),
+            registry_error: None,
             on_change,
         }
     }
