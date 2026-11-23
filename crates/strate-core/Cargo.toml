@@ -10,7 +10,7 @@ publish = false
 crossbeam-channel = "0.5.17"
 file-id = "0.2.3"
 # verified: 2026-10: maintained, already in the lock; tzdb-bundle-platform since Windows has no system tzdb.
-jiff = { version = "0.2.41", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform"] }
+jiff = { version = "1.0.0", default-features = false, features = ["std", "tz-system", "tzdb-bundle-platform"] }
 notify = "8.2.2"
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
