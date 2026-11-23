@@ -16,6 +16,11 @@ use crate::time::parse_timestamp;
 
 pub(super) struct Worker {
     pub root: PathBuf,
+    /// `root` with every symlink resolved, when that differs from `root`.
+    /// macOS FSEvents reports resolved paths (`/private/var/...` for a root
+    /// under `/var/...`), so an event path is mapped back under `root` before
+    /// it is matched or tailed (#21).
+    pub real_root: Option<PathBuf>,
     /// Per transcript, the checkpoint of the last batch handed to the channel.
     pub offsets: Offsets,
     pub limits: Limits,
@@ -55,7 +60,12 @@ impl Worker {
                     let events: Vec<_> = first.into_iter().chain(self.fs_events.try_iter()).collect();
                     let mut dirty = BTreeSet::new();
                     let mut lost = false;
-                    for event in events {
+                    for mut event in events {
+                        if let Ok(event) = &mut event {
+                            for path in &mut event.paths {
+                                *path = self.under_root(std::mem::take(path));
+                            }
+                        }
                         match event {
                             // inotify (Linux) also reports opens and closes, the
                             // tailer's own reads included: tailing on those
@@ -113,6 +123,18 @@ impl Worker {
             }
         }
         Ok(())
+    }
+
+    /// `path` as a path under `root`: an event path reported through the
+    /// resolved root (see `real_root`) is rebased onto `root` as given.
+    fn under_root(&self, path: PathBuf) -> PathBuf {
+        match &self.real_root {
+            Some(real) if !path.starts_with(&self.root) => match path.strip_prefix(real) {
+                Ok(rel) => self.root.join(rel),
+                Err(_) => path,
+            },
+            _ => path,
+        }
     }
 
     fn send(&self, batch: Batch) -> Result<(), Stopped> {
