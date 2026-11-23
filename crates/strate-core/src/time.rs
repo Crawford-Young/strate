@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use jiff::{
-    Timestamp, Zoned,
+    Timestamp, ZonedDateTime,
     civil::{Date, Time},
     tz::TimeZone,
 };
@@ -243,7 +243,7 @@ pub fn local_midnights(tz: &TimeZone, first_ms: i64, last_ms: i64) -> Vec<i64> {
     while let Ok(next) = day.tomorrow() {
         day = next;
         let Some(ms) = day
-            .to_zoned(tz.clone())
+            .to_zoned_datetime(tz.clone())
             .ok()
             .and_then(|z| z.start_of_day().ok())
             .map(|z| z.timestamp().as_millisecond())
@@ -296,7 +296,7 @@ pub fn wall_clock(tz: &TimeZone, start: i64, end: i64) -> Option<Vec<(i64, i64)>
 }
 
 /// `at`'s clock time as ms from 00:00 on `day`.
-fn since_midnight(at: &Zoned, day: Date) -> i64 {
+fn since_midnight(at: &ZonedDateTime, day: Date) -> i64 {
     let ms = at
         .datetime()
         .duration_since(day.to_datetime(Time::midnight()))
@@ -304,10 +304,10 @@ fn since_midnight(at: &Zoned, day: Date) -> i64 {
     i64::try_from(ms).expect("jiff's range fits in i64 ms")
 }
 
-fn instant(tz: &TimeZone, ms: i64) -> Option<Zoned> {
+fn instant(tz: &TimeZone, ms: i64) -> Option<ZonedDateTime> {
     Timestamp::from_millisecond(ms)
         .ok()
-        .map(|t| t.to_zoned(tz.clone()))
+        .map(|t| t.to_zoned_datetime(tz.clone()))
 }
 
 /// `first`, then each cut strictly inside `(first, last)`, sorted: where
