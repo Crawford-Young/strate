@@ -57,8 +57,22 @@ impl Worker {
                     let mut lost = false;
                     for event in events {
                         match event {
+                            // inotify (Linux) also reports opens and closes, the
+                            // tailer's own reads included: tailing on those
+                            // re-opens the file and feeds itself. Only a create,
+                            // a write or a removal can move a transcript (#21).
+                            Ok(event) if event.kind.is_access() => lost |= event.need_rescan(),
                             Ok(event) => {
                                 lost |= event.need_rescan();
+                                // A recursive inotify watch on a new dir starts after
+                                // the dir exists, so files written into it straight
+                                // away (a new session's `subagents/`) raise no event
+                                // of their own. Read what a new dir already holds.
+                                if event.kind.is_create() {
+                                    for dir in event.paths.iter().filter(|p| p.is_dir()) {
+                                        dirty.extend(transcripts_under(&self.root, dir));
+                                    }
+                                }
                                 dirty.extend(event.paths.into_iter().filter(|p| is_transcript(&self.root, p)));
                             }
                             Err(_) => lost = true,
@@ -129,6 +143,31 @@ impl Worker {
         };
         Ok(())
     }
+}
+
+/// Every transcript at or under `dir`, a directory inside `projects/`. The
+/// transcript layout is at most three levels below a project dir, so this
+/// stops there.
+fn transcripts_under(root: &Path, dir: &Path) -> Vec<PathBuf> {
+    fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < 3 {
+                    walk(root, &path, depth + 1, out);
+                }
+            } else if is_transcript(root, &path) {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, dir, 0, &mut out);
+    out.sort();
+    out
 }
 
 /// The order of the first scan, which keeps a replayed uuid (a resume
