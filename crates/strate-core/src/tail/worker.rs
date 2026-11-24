@@ -16,6 +16,11 @@ use crate::time::parse_timestamp;
 
 pub(super) struct Worker {
     pub root: PathBuf,
+    /// `root` with every symlink resolved, when that differs from `root`.
+    /// macOS FSEvents reports resolved paths (`/private/var/...` for a root
+    /// under `/var/...`), so an event path is mapped back under `root` before
+    /// it is matched or tailed (#21).
+    pub real_root: Option<PathBuf>,
     /// Per transcript, the checkpoint of the last batch handed to the channel.
     pub offsets: Offsets,
     pub limits: Limits,
@@ -55,10 +60,29 @@ impl Worker {
                     let events: Vec<_> = first.into_iter().chain(self.fs_events.try_iter()).collect();
                     let mut dirty = BTreeSet::new();
                     let mut lost = false;
-                    for event in events {
+                    for mut event in events {
+                        if let Ok(event) = &mut event {
+                            for path in &mut event.paths {
+                                *path = self.under_root(std::mem::take(path));
+                            }
+                        }
                         match event {
+                            // inotify (Linux) also reports opens and closes, the
+                            // tailer's own reads included: tailing on those
+                            // re-opens the file and feeds itself. Only a create,
+                            // a write or a removal can move a transcript (#21).
+                            Ok(event) if event.kind.is_access() => lost |= event.need_rescan(),
                             Ok(event) => {
                                 lost |= event.need_rescan();
+                                // A recursive inotify watch on a new dir starts after
+                                // the dir exists, so files written into it straight
+                                // away (a new session's `subagents/`) raise no event
+                                // of their own. Read what a new dir already holds.
+                                if event.kind.is_create() {
+                                    for dir in event.paths.iter().filter(|p| p.is_dir()) {
+                                        dirty.extend(transcripts_under(&self.root, dir));
+                                    }
+                                }
                                 dirty.extend(event.paths.into_iter().filter(|p| is_transcript(&self.root, p)));
                             }
                             Err(_) => lost = true,
@@ -101,6 +125,18 @@ impl Worker {
         Ok(())
     }
 
+    /// `path` as a path under `root`: an event path reported through the
+    /// resolved root (see `real_root`) is rebased onto `root` as given.
+    fn under_root(&self, path: PathBuf) -> PathBuf {
+        match &self.real_root {
+            Some(real) if !path.starts_with(&self.root) => match path.strip_prefix(real) {
+                Ok(rel) => self.root.join(rel),
+                Err(_) => path,
+            },
+            _ => path,
+        }
+    }
+
     fn send(&self, batch: Batch) -> Result<(), Stopped> {
         select! {
             send(self.out, batch) -> sent => sent.map_err(|_| Stopped),
@@ -129,6 +165,31 @@ impl Worker {
         };
         Ok(())
     }
+}
+
+/// Every transcript at or under `dir`, a directory inside `projects/`. The
+/// transcript layout is at most three levels below a project dir, so this
+/// stops there.
+fn transcripts_under(root: &Path, dir: &Path) -> Vec<PathBuf> {
+    fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < 3 {
+                    walk(root, &path, depth + 1, out);
+                }
+            } else if is_transcript(root, &path) {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, dir, 0, &mut out);
+    out.sort();
+    out
 }
 
 /// The order of the first scan, which keeps a replayed uuid (a resume

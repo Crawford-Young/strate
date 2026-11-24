@@ -136,8 +136,12 @@ impl Tailer {
         let (out, batches) = bounded(options.channel_batches);
         let (stop, stop_rx) = bounded(0);
         let bytes_read = Arc::new(AtomicU64::new(0));
+        let real_root = std::fs::canonicalize(&root)
+            .ok()
+            .filter(|real| *real != root);
         let worker = Worker {
             root,
+            real_root,
             offsets,
             limits: Limits {
                 chunk_bytes: options.chunk_bytes,

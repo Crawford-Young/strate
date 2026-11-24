@@ -289,7 +289,8 @@ const ROLLUP_VERSION: &str = "5";
 
 /// Recomputes every rollup and audit cell unless the store was last
 /// accounted at the vendored prices, at [`cost::PRICING_LOGIC_VERSION`], in
-/// `zone` (an IANA name) and at [`ROLLUP_VERSION`]. A new price list,
+/// `zone` (an IANA name), at [`ROLLUP_VERSION`] and under the vendored
+/// context-window table ([`cost::WINDOWS_JSON`]). A new price list,
 /// pricing-logic version or rollup version also re-reads every event's
 /// accounting fields from `raw` and rebuilds the message edges from them. A store
 /// from before v3 (no prices) or v6 (no zone) is filled here too.
@@ -298,7 +299,10 @@ pub(super) fn refresh(conn: &Connection, zone: &str) -> Result<()> {
         || meta(conn, "pricing_logic")?.as_deref() != Some(cost::PRICING_LOGIC_VERSION);
     let rezoned = meta(conn, "tz")?.as_deref() != Some(zone);
     let reversioned = meta(conn, "rollup")?.as_deref() != Some(ROLLUP_VERSION);
-    if !repriced && !rezoned && !reversioned {
+    // context_pct and the context peaks divide by the window table, so a new
+    // table needs the rollups again but not a re-read of the events (#156).
+    let rewindowed = meta(conn, "windows")?.as_deref() != Some(cost::WINDOWS_JSON);
+    if !repriced && !rezoned && !reversioned && !rewindowed {
         return Ok(());
     }
     if repriced || reversioned {
@@ -313,6 +317,7 @@ pub(super) fn refresh(conn: &Connection, zone: &str) -> Result<()> {
     rollup(conn, ids.iter().map(String::as_str))?;
     set_meta(conn, "rollup", ROLLUP_VERSION)?;
     set_meta(conn, "pricing_logic", cost::PRICING_LOGIC_VERSION)?;
+    set_meta(conn, "windows", cost::WINDOWS_JSON)?;
     set_meta(conn, "prices", cost::PRICES_JSON)
 }
 
